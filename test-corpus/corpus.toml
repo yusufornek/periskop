@@ -1,0 +1,47 @@
+# Repositories the detection benchmark runs against.
+#
+# Source is never vendored into this repository. Each entry names an upstream
+# repository and a commit, and the fetch script performs a shallow clone at that
+# exact commit. Copying the trees in would bloat the repository and, worse, would
+# freeze code that the benchmark is supposed to measure against reality.
+#
+# The commit is pinned rather than tracked. A benchmark whose input moves cannot
+# tell a change in the rules from a change in the corpus.
+
+schema_version = "1.0"
+
+# The bootstrap corpus is the fixture set in this repository. It is labeled by
+# construction: a file under positive/ contains egress, one under negative/ does
+# not, and one under evasion/ contains egress the scanner is known not to see.
+#
+# It is deliberately small and it is not a substitute for real code. Fixtures are
+# written by the same people who write the rules, so they measure whether the
+# rules do what their authors intended, not whether that intent matches how
+# libraries are used in practice.
+[[corpus]]
+id = "fixtures"
+kind = "local"
+path = "crates/periskop-static-scanner/fixtures"
+languages = ["python", "typescript"]
+labels = "by-construction"
+
+# External repositories go below. None are listed yet, and the reason is a
+# process requirement rather than an oversight: labeling has to be done by
+# someone who has not seen the rule set. A person who knows which patterns the
+# rules match will, without meaning to, label the cases the rules already handle
+# and miss the ones they do not. That produces a benchmark that always scores
+# well and measures nothing.
+#
+# Format for an entry:
+#
+#   [[corpus]]
+#   id = "some-project"
+#   kind = "git"
+#   url = "https://github.com/owner/name"
+#   commit = "full 40 character sha"
+#   languages = ["python"]
+#   labels = "test-corpus/labels/some-project.jsonl"
+#
+# At least one entry should be a negative control: a repository that uses no
+# provider SDK at all. Without one, a rule set that matches too eagerly scores
+# the same as one that matches correctly.

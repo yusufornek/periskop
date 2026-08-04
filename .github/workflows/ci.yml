@@ -85,6 +85,14 @@ jobs:
             -r schemas/coverage-statement.schema.json \
             -d /tmp/report.json
 
+      # Surfaces the detection numbers in the job log. The test itself already
+      # fails on an uncatalogued miss; this is so a reviewer can see the score
+      # without digging through an artifact.
+      - name: Detection benchmark
+        run: |
+          cargo test -p periskop-cli --test benchmark
+          cat target/benchmark.json
+
       # Two builds of the same tree must agree byte for byte.
       - name: Report is reproducible
         run: |
