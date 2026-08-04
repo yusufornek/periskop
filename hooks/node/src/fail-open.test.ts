@@ -11,7 +11,7 @@ test("observation work that throws stops at the boundary", () => {
       throw new Error("patching went wrong");
     });
   });
-  assert.equal(snapshot().hook_failures, 1);
+  assert.deepEqual(snapshot().failures, ["hook.observe"]);
 });
 
 test("a thrown value that is not an Error is contained just the same", () => {
@@ -21,7 +21,7 @@ test("a thrown value that is not an Error is contained just the same", () => {
       throw "a string, because libraries do this";
     });
   });
-  assert.equal(snapshot().hook_failures, 1);
+  assert.deepEqual(snapshot().failures, ["hook.observe"]);
 });
 
 test("a value producing step falls back instead of failing", () => {
@@ -30,7 +30,7 @@ test("a value producing step falls back instead of failing", () => {
     throw new Error("shape extraction went wrong");
   }, "fallback");
   assert.equal(value, "fallback");
-  assert.equal(snapshot().hook_failures, 1);
+  assert.deepEqual(snapshot().failures, ["hook.observe"]);
 });
 
 test("a step that succeeds returns its own value and counts no failure", () => {
@@ -39,16 +39,19 @@ test("a step that succeeds returns its own value and counts no failure", () => {
     callSafely(() => "real", "fallback"),
     "real",
   );
-  assert.equal(snapshot().hook_failures, 0);
+  assert.deepEqual(snapshot().failures, []);
 });
 
-test("failures are counted, so nothing is lost quietly", () => {
+test("a swallowed failure is named, so nothing is lost quietly", () => {
   resetStatus();
   for (let i = 0; i < 5; i += 1) {
     runSafely(() => {
       throw new Error("again");
     });
   }
-  assert.equal(snapshot().hook_failures, 5);
-  assert.equal(snapshot().status, "active");
+  // Deduplicated by stage: a hot loop that fails on every call must not turn
+  // the failure list into the payload. What matters is that the stage is named,
+  // not how many times it went wrong.
+  assert.deepEqual(snapshot().failures, ["hook.observe"]);
+  assert.equal(snapshot().hook_status, "active");
 });

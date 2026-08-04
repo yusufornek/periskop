@@ -30,6 +30,18 @@ ran are different facts, and the sidecar is what keeps them apart. It ends in
 `.json` rather than `.jsonl` so the collector never reads a run's own accounting
 back as an event.
 
+`periskop-runtime-collector` reads that sidecar back into the coverage
+statement: `dropped_events_count` becomes `dropped_events`, and a hook that was
+off or that swallowed a failure becomes a diagnostic naming the process it came
+from. The node hook writes the same five properties with the same meanings,
+because a counter only one hook spells the way the reader expects is a counter
+that reaches nobody.
+
+Every path out of the ring ends in either a written line or the drop counter.
+Draining takes records off the ring before writing them, so a write that fails
+afterwards would otherwise lose events no counter ever saw: the guard around the
+drain records *which* stage failed, never *how many* events went with it.
+
 ### Identity
 
 `egress_event_id` is derived, never counted, and the derivation is fixed by

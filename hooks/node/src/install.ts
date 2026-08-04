@@ -65,9 +65,19 @@ export function install(options: InstallOptions = {}): InstallResult {
   let undo: Array<() => void> = [];
   let ownsSink = false;
 
+  let noDestination = false;
+
   runSafely(() => {
     const config = readConfig(process.env, process.argv);
     if (sink === undefined) {
+      if (config.outputDir === undefined) {
+        // Nobody named a directory, so there is nowhere the operator asked for
+        // these observations to go. Guessing one would scatter the destinations,
+        // paths and call sites of every Node process on the machine into a
+        // location nobody is watching and nobody clears. Off, and visibly off.
+        noDestination = true;
+        return;
+      }
       sink = new FileEventSink(config.outputDir, process.pid, config.maxBufferedEvents);
       ownsSink = true;
     }
@@ -81,7 +91,9 @@ export function install(options: InstallOptions = {}): InstallResult {
   if (undo.length === 0) {
     // Nothing is in place, so the hook is not in the way. Say so where an
     // operator can see it rather than leaving an empty stream to be misread.
-    markDisabled("install_failed");
+    // The two reasons are kept apart: one is a machine that could not be
+    // instrumented, the other is a deployment that was never finished.
+    markDisabled(noDestination ? "no_output_configured" : "install_failed");
     return { installed: false, uninstall: () => undefined };
   }
 

@@ -63,7 +63,14 @@ jobs:
       - name: Lints
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # PERISKOP_REQUIRE_PROOF turns a skipped F2 gate into a failure. Without it
+      # a runner with no python3 records `status: skipped` in target/f2-proof.json
+      # and still reports green, so a gate that never ran would be indistinguishable
+      # from one that passed. Continuous integration is the place that switch is
+      # meant to be on; see crates/periskop-cli/tests/proof.rs.
       - name: Tests
+        env:
+          PERISKOP_REQUIRE_PROOF: 1
         run: cargo test --workspace
 
       # periskop scans its own repository. If the tool cannot run on the codebase
@@ -100,6 +107,58 @@ jobs:
           cargo run --quiet -p periskop-cli -- scan "$FIX" --rules rules --json > /tmp/a.json
           cargo run --quiet -p periskop-cli -- scan "$FIX" --rules rules --json > /tmp/b.json
           python3 -c "import json,sys; a=json.load(open('/tmp/a.json')); b=json.load(open('/tmp/b.json')); a.pop('envelope'); b.pop('envelope'); sys.exit(0 if a==b else 'two scans of the same tree disagreed')"
+
+  # The two hooks are the second detection source, and neither is compiled by
+  # cargo. They carry their own blake3, written out because a hook may not add a
+  # dependency to somebody else's interpreter, and the whole point of that code
+  # is that python, node and the engine derive the same egress_event_id. Nothing
+  # checks that unless these suites run.
+  hooks-python:
+    name: Python runtime hook
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The hook is pure standard library, so the runner's interpreter is the
+      # dependency list. Printed because which one it was matters when a failure
+      # is version specific. The declared floor is python 3.9 and this job does
+      # not exercise it; that is a gap, not a claim.
+      - name: Show interpreter
+        run: python3 --version
+
+      - name: Tests
+        working-directory: hooks/python
+        run: python3 -m unittest discover
+
+  hooks-node:
+    name: Node runtime hook
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: hooks/node/package-lock.json
+
+      - name: Install
+        working-directory: hooks/node
+        run: npm ci
+
+      - name: Types
+        working-directory: hooks/node
+        run: npx tsc --noEmit
+
+      - name: Build
+        working-directory: hooks/node
+        run: npx tsc
+
+      # The suite runs against the emitted JavaScript rather than the sources,
+      # which is what the interpreter loads through --require at run time.
+      - name: Tests
+        working-directory: hooks/node
+        run: node --test dist/*.test.js
 
   mcp:
     name: MCP server

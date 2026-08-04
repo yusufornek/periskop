@@ -81,7 +81,19 @@ pub fn reconcile(inputs: &ReconcileInputs) -> ReconcileOutcome {
     // Ordering is applied here rather than at serialization, so a caller that
     // writes the result straight out cannot leak the order the derivers ran in.
     findings.sort_by(|a, b| a.finding_id.cmp(&b.finding_id));
+    let before_collapse = findings.len();
     findings.dedup_by(|a, b| a.finding_id == b.finding_id);
+    // Deduplication here should never have anything to do: one point cannot be
+    // both never executed and reaching another destination, so the two derivers
+    // cannot produce one identity between them. If they ever do, which record
+    // survives depends on the order they ran in, and the loss is named rather
+    // than left to be inferred from a count nobody keeps.
+    if findings.len() < before_collapse {
+        faults.push(format!(
+            "{} derived findings collapsed onto an identity another finding already held",
+            before_collapse - findings.len()
+        ));
+    }
     resolved_targets.sort();
     resolved_targets.dedup();
     faults.sort();

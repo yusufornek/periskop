@@ -9,7 +9,15 @@ backpressure inside somebody else's request handler.
 When the ring is full the oldest event is dropped, and the drop is counted. A
 dropped event that nobody counted would be a silent hole in a coverage claim,
 which the honest coverage principle forbids: the count is written to the status
-file next to the stream.
+file next to the stream, and `periskop-runtime-collector` reads that file back
+into the coverage statement.
+
+An overflowing ring is not the only way an event dies here. Draining takes
+records off the ring before writing them, so a write that fails after the ring
+has been emptied loses events that no counter would ever see: the guard around
+the drain records that *something* failed, never how much went with it. On a CI
+container with a full disk that difference is the whole report, so every path
+out of the ring below either ends in a written line or in the drop counter.
 """
 
 import atexit
@@ -76,21 +84,44 @@ class EventWriter(object):
             failopen.run("writer.drain", self._drain_once)
         failopen.run("writer.drain", self._drain_once)
 
-    def _drain_once(self):
-        if not self._queue:
-            return
+    def _serialise_batch(self):
+        """Empty the ring into lines, counting whatever cannot be serialised.
+
+        A record that fails to serialise has already left the ring, so counting
+        it here is the last moment it can be counted at all.
+        """
         lines = []
         while self._queue:
             try:
                 event = self._queue.popleft()
             except IndexError:
                 break
-            # sort_keys keeps the stream diffable across runs.
-            lines.append(json.dumps(event, sort_keys=True, separators=(",", ":")))
+            try:
+                # sort_keys keeps the stream diffable across runs.
+                lines.append(
+                    json.dumps(event, sort_keys=True, separators=(",", ":")))
+            except Exception:
+                self.dropped_events_count += 1
+        return lines
+
+    def _drain_once(self):
+        if not self._queue:
+            return
+        lines = self._serialise_batch()
         if not lines:
             return
-        with open(self._output_path, "a", encoding="utf-8") as stream:
-            stream.write("\n".join(lines) + "\n")
+        try:
+            with open(self._output_path, "a", encoding="utf-8") as stream:
+                stream.write("\n".join(lines) + "\n")
+        except Exception:
+            # ENOSPC, EACCES, EDQUOT, a revoked mount. These events are gone:
+            # they left the ring to be written and the write did not happen.
+            # Counting them here is what turns "the disk filled up" from an
+            # invisible hole in the coverage claim into a number the report
+            # carries. The re-raise is deliberate, so the guard one frame up
+            # still records *which* failure it was, next to *how many* it cost.
+            self.dropped_events_count += len(lines)
+            raise
         self.written_events_count += len(lines)
 
     def close(self):

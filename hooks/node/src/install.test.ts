@@ -3,7 +3,7 @@ import test from "node:test";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { EVENT_DIR } from "./config";
+import { EVENT_DIR, LEGACY_EVENT_DIR } from "./config";
 import { install } from "./install";
 import { resetStatus, snapshot } from "./hook-status";
 import type { EgressEvent } from "./egress-event";
@@ -115,6 +115,33 @@ test("a sink that cannot be built leaves the application unhooked and says so", 
 
   assert.equal(result.installed, false);
   assert.equal(http.request, originalRequest);
-  assert.equal(snapshot().status, "disabled");
+  assert.equal(snapshot().hook_status, "disabled");
   assert.equal(snapshot().reason, "install_failed");
+});
+
+test("with no directory named, nothing is patched and nothing is written anywhere", (t) => {
+  // The hook used to invent a destination here. Every Node process that
+  // inherited NODE_OPTIONS then wrote its observations into a shared temporary
+  // directory the operator had never named, and neither this process nor any
+  // other ever read them back. Off is the honest state, and it has a reason of
+  // its own so that an unfinished deployment is not reported as a machine that
+  // could not be instrumented.
+  resetStatus();
+  const originalRequest = http.request;
+  const previousDir = process.env[EVENT_DIR];
+  const previousLegacy = process.env[LEGACY_EVENT_DIR];
+  delete process.env[EVENT_DIR];
+  delete process.env[LEGACY_EVENT_DIR];
+  t.after(() => {
+    if (previousDir !== undefined) process.env[EVENT_DIR] = previousDir;
+    if (previousLegacy !== undefined) process.env[LEGACY_EVENT_DIR] = previousLegacy;
+  });
+
+  const result = install({});
+  if (result.installed) result.uninstall();
+
+  assert.equal(result.installed, false);
+  assert.equal(http.request, originalRequest);
+  assert.equal(snapshot().hook_status, "disabled");
+  assert.equal(snapshot().reason, "no_output_configured");
 });

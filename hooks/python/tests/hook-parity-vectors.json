@@ -1,0 +1,150 @@
+{
+  "note": "Shared between the Python and Node hooks. One file, read by both test suites, because two copies would pin nothing: the failure this guards against is precisely the two implementations drifting apart. The same call recorded by both hooks derives one egress_event_id, so the collector keeps one record and discards the other; if the shapes differ, which one reaches the report is decided by nothing more meaningful than which record sorted first. It lives under hooks/python/tests/ only because that is a directory both hooks may read from today. A request to give it a home of its own, and a schema, is filed in hub/memory/interfaces.md.",
+  "field_paths": [
+    {
+      "name": "an ordinary chat completion",
+      "payload": {
+        "model": "gpt-4o",
+        "messages": [
+          { "role": "user", "content": "merhaba" },
+          { "role": "assistant", "content": "selam" }
+        ],
+        "temperature": 0.2
+      },
+      "paths": ["messages[].content", "messages[].role", "model", "temperature"],
+      "truncated_depth": null
+    },
+    {
+      "name": "a key that carries a customer address",
+      "payload": { "customers": { "ahmet@firma.com": { "balance": 12 } } },
+      "paths": ["<dyn>.<dyn>.<dyn>"],
+      "truncated_depth": null
+    },
+    {
+      "name": "keys each hook knew and the other did not",
+      "payload": {
+        "description": "x",
+        "items": [1],
+        "params": { "model": "m" },
+        "headers": { "content": "c" },
+        "generationConfig": { "top_k": 1 },
+        "betas": ["b"],
+        "modalities": ["text"]
+      },
+      "paths": [
+        "betas[]",
+        "description",
+        "generationConfig.top_k",
+        "headers.content",
+        "items[]",
+        "modalities[]",
+        "params.model"
+      ],
+      "truncated_depth": null
+    },
+    {
+      "name": "a key with a short digit run, which one leak filter caught and the other did not",
+      "payload": { "model": "m", "hesap1234": "x", "user": "u" },
+      "paths": ["<dyn>", "model", "user"],
+      "truncated_depth": null
+    },
+    {
+      "name": "traversal deeper than the ceiling reports the deepest stop",
+      "payload": {
+        "messages": {
+          "content": { "text": { "data": { "parts": { "items": { "name": 1 } } } } }
+        }
+      },
+      "paths": ["messages.content.text.data.parts.items.name"],
+      "truncated_depth": 7
+    },
+    {
+      "name": "a sampled array declares the depth its unvisited elements sit at",
+      "payload": {
+        "messages": [
+          { "role": "user", "content": "a" },
+          { "role": "user", "content": "b" },
+          { "role": "user", "content": "c" },
+          { "role": "user", "content": "d" },
+          { "role": "user", "content": "e" },
+          { "role": "user", "content": "f" },
+          { "role": "user", "content": "g" },
+          { "role": "user", "content": "h" },
+          { "role": "user", "content": "i" },
+          { "role": "user", "content": "j" },
+          { "role": "user", "content": "k" },
+          { "role": "user", "content": "l" },
+          { "role": "user", "content": "m" },
+          { "role": "user", "content": "n" },
+          { "role": "user", "content": "o" },
+          { "role": "user", "content": "p" },
+          { "role": "user", "content": "q" }
+        ]
+      },
+      "paths": ["messages[].content", "messages[].role"],
+      "truncated_depth": 2
+    },
+    {
+      "name": "a shallow stop and a deep stop in one payload: the deep one is reported",
+      "payload": {
+        "tools": [
+          { "type": "function" },
+          { "type": "function" },
+          { "type": "function" },
+          { "type": "function" },
+          { "type": "function" },
+          { "type": "function" },
+          { "type": "function" },
+          { "type": "function" },
+          { "type": "function" },
+          { "type": "function" },
+          { "type": "function" },
+          { "type": "function" },
+          { "type": "function" },
+          { "type": "function" },
+          { "type": "function" },
+          { "type": "function" },
+          { "type": "function" }
+        ],
+        "messages": {
+          "content": { "text": { "data": { "parts": { "items": { "name": 1 } } } } }
+        }
+      },
+      "paths": ["messages.content.text.data.parts.items.name", "tools[].type"],
+      "truncated_depth": 7
+    },
+    {
+      "name": "empty containers are structure, not absence",
+      "payload": { "tools": [], "metadata": {}, "model": "m" },
+      "paths": ["metadata", "model", "tools[]"],
+      "truncated_depth": null
+    }
+  ],
+  "provider_ref": [
+    { "host": "api.openai.com", "provider": "openai" },
+    { "host": "API.OpenAI.COM", "provider": "openai" },
+    { "host": "api.anthropic.com", "provider": "anthropic" },
+    { "host": "generativelanguage.googleapis.com", "provider": "google-gemini" },
+    { "host": "api.mistral.ai", "provider": "mistral" },
+    { "host": "api.cohere.ai", "provider": "cohere" },
+    { "host": "api.cohere.com", "provider": "cohere" },
+    { "host": "api.groq.com", "provider": "groq" },
+    { "host": "api.deepseek.com", "provider": "deepseek" },
+    { "host": "api.together.xyz", "provider": "together" },
+    { "host": "openrouter.ai", "provider": "openrouter" },
+    { "host": "contoso.openai.azure.com", "provider": "azure-openai" },
+    { "host": "contoso.cognitiveservices.azure.com", "provider": "azure-cognitive" },
+    { "host": "us-central1-aiplatform.googleapis.com", "provider": "google-vertex" },
+    { "host": "api-inference.huggingface.co", "provider": "huggingface" },
+    { "host": "my-index.pinecone.io", "provider": "pinecone" },
+    { "host": "cluster.weaviate.network", "provider": "weaviate" },
+    { "host": "cluster.qdrant.io", "provider": "qdrant" },
+    { "host": "bedrock.eu-west-1.amazonaws.com", "provider": "aws-bedrock" },
+    { "host": "bedrock-runtime.eu-west-1.amazonaws.com", "provider": "aws-bedrock" },
+    { "host": "llm-gateway.internal.corp", "provider": "unknown" },
+    { "host": "notapi.openai.com.evil.test", "provider": "unknown" },
+    { "host": "bedrock-runtime.amazonaws.com.attacker.test", "provider": "unknown" },
+    { "host": "127.0.0.1", "provider": "unknown" },
+    { "host": "", "provider": "unknown" }
+  ]
+}

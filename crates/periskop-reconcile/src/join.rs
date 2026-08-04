@@ -16,19 +16,25 @@
 //! by construction, so a pair of records lands on exactly one and the result does
 //! not depend on the order the records arrived in.
 
+use std::collections::BTreeSet;
+
 use serde::Serialize;
 
-use periskop_runtime_collector::event::EgressEvent;
+use periskop_runtime_collector::event::{DegradedReason, EgressEvent};
 
 use crate::declared::DeclaredPoint;
 use crate::target::TargetId;
 
-/// A provider classification that matches nothing, including itself.
+/// The word a source writes when it could not tell.
 ///
 /// The contract requires the value to be written rather than omitted, so that an
-/// unclassified destination cannot be hidden. Letting two of them join would take
-/// that honesty and turn it into a match between any two unclassified things.
-const UNCLASSIFIED_PROVIDER: &str = "unknown";
+/// unclassified provider or an unreadable destination cannot be hidden behind a
+/// missing key. It is a sentinel and never a value, and both fields that carry
+/// it are guarded here for the same reason: letting two of them join would take
+/// that honesty and turn it into a match between any two unknown things, and
+/// letting one of them stand as a destination would turn "I could not see where
+/// this went" into "it went somewhere else".
+const UNRESOLVED: &str = "unknown";
 
 /// How a code point and an observed call were tied together.
 ///
@@ -65,6 +71,36 @@ impl MatchTier {
     pub fn is_confirmed(self) -> bool {
         !matches!(self, Self::ProviderOnly)
     }
+
+    /// Whether this rung is evidence that the code point ran.
+    ///
+    /// A different question from [`Self::is_confirmed`], and they are written
+    /// separately because a build answered them with one predicate and stopped
+    /// producing dormancy findings in every repository that made a single
+    /// working call. How well two records agree is not the same claim as where
+    /// the call came from, and a rung added later may well answer the two
+    /// differently, so the match below is exhaustive rather than delegating.
+    ///
+    /// Rung by rung. `OperationAndTarget` names both keys and needs no
+    /// argument. `OperationOnly` says the operation this point invokes was
+    /// invoked and reached somewhere else, which is the rung a target drift is
+    /// established on: one run may not call a point drifting and never executed
+    /// at the same time. `TargetOnly` is the rung that unites two hooks sitting
+    /// at different layers, and refusing it would reopen the exact trap this
+    /// module was built around and report working code as never executed.
+    ///
+    /// `ProviderOnly` is refused, and that refusal is the point of the method.
+    /// It says only that some call reached the same vendor, which every call
+    /// site for that vendor in the repository has in common; reading it as
+    /// execution lets one observed call vouch for forty untouched ones. What it
+    /// does establish is that traffic this point could have produced was seen,
+    /// so the absence is stated less firmly rather than not stated at all.
+    pub fn attributes_a_call(self) -> bool {
+        match self {
+            Self::OperationAndTarget | Self::OperationOnly | Self::TargetOnly => true,
+            Self::ProviderOnly => false,
+        }
+    }
 }
 
 /// One code point tied to one observed call.
@@ -78,6 +114,11 @@ pub struct J2Match {
 }
 
 /// Everything the join established, and everything it could not.
+///
+/// Only [`join`] builds one and both fields are private, which is what lets
+/// [`JoinResult::matches_for`] rely on `matches` being ordered by code point:
+/// the ordering is a property of the constructor rather than a hope about the
+/// caller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct JoinResult {
     matches: Vec<J2Match>,
@@ -105,17 +146,37 @@ impl JoinResult {
     }
 
     /// Every match established for one code point.
+    ///
+    /// Found by search rather than by scanning the whole list, because both
+    /// derivers call this once per code point and the list grows with the
+    /// product of the two sources. A repository with thousands of call sites
+    /// paid for that scan twice per site, and the weakest rung ties nearly
+    /// every pair, so the scan was the run rather than a detail of it.
     pub fn matches_for<'a>(
         &'a self,
         egress_point_id: &'a str,
     ) -> impl Iterator<Item = &'a J2Match> {
-        self.matches
+        let first = self
+            .matches
+            .partition_point(|m| m.egress_point_id.as_str() < egress_point_id);
+        self.matches[first..]
             .iter()
-            .filter(move |m| m.egress_point_id == egress_point_id)
+            .take_while(move |m| m.egress_point_id == egress_point_id)
     }
 
-    pub fn is_matched(&self, egress_point_id: &str) -> bool {
-        self.matches_for(egress_point_id).next().is_some()
+    /// The strongest rung any observation reached for one code point.
+    ///
+    /// `None` when nothing was tied to the point at all. [`MatchTier`] orders
+    /// itself by strength, so the strongest is the minimum.
+    ///
+    /// This replaced an `is_matched` predicate, and removing that name is part
+    /// of the fix rather than tidying: a caller asking whether a point matched
+    /// reads the answer as whether it ran, and the weakest rung answers yes to
+    /// the first while saying nothing about the second. A caller now receives
+    /// the rung and has to decide, which is the decision
+    /// [`MatchTier::attributes_a_call`] states once for everybody.
+    pub fn strongest_tier_for(&self, egress_point_id: &str) -> Option<MatchTier> {
+        self.matches_for(egress_point_id).map(|m| m.tier).min()
     }
 }
 
@@ -135,14 +196,43 @@ impl<'e> EventKey<'e> {
         Self {
             egress_event_id: &event.egress_event_id,
             operation: &event.operation,
-            target: TargetId::parse(&event.target.host_id, event.target.port),
+            target: observed_target(event),
             provider_ref: event
                 .target
                 .provider_ref
                 .as_deref()
-                .filter(|p| *p != UNCLASSIFIED_PROVIDER),
+                .filter(|p| *p != UNRESOLVED),
         }
     }
+}
+
+/// The destination an observation established, when it established one.
+///
+/// A hook that could not read where a call went still has to write the field,
+/// so the absence arrives as a word rather than as a missing key, and it says
+/// why in `degraded_reasons`. Both are read, because a hook may state one
+/// without the other and either one alone is the hook saying it did not see.
+///
+/// Accepting the sentinel as a destination is the most expensive mistake this
+/// crate can make, and it is not a hypothetical one. The word compares unequal
+/// to every real host, so a point declaring `api.openai.com` would drift
+/// against it on whichever rung the pair reached, and the report would state on
+/// confirmed evidence that a call went somewhere else when nothing was seen to
+/// go anywhere. Not knowing where a call went is a gap in observation: the run
+/// counts the call, still attributes it through the operation if it can, and
+/// never accuses the code with it.
+fn observed_target(event: &EgressEvent) -> Option<TargetId> {
+    if event.target.host_id.trim().eq_ignore_ascii_case(UNRESOLVED) {
+        return None;
+    }
+    let unresolved = event
+        .degraded_reasons
+        .as_ref()
+        .is_some_and(|reasons| reasons.contains(&DegradedReason::TargetNotResolved));
+    if unresolved {
+        return None;
+    }
+    TargetId::parse(&event.target.host_id, event.target.port)
 }
 
 /// Ties observed calls to the code points that could have made them.
@@ -152,6 +242,16 @@ impl<'e> EventKey<'e> {
 /// point legitimately matches one call through its operation and another through
 /// its destination, which is what happens when two hooks at different layers
 /// record the same request.
+///
+/// The declared cost is the product of the two source sizes, and it is declared
+/// rather than optimised away because indexing would not remove it: the weakest
+/// rung ties a call to every code point naming its vendor, so in the shape this
+/// crate has to survive, a repository using one provider from everywhere, the
+/// candidate set for each point is every observation regardless of how it is
+/// looked up. What indexing does buy is spent above, on the two lookups that
+/// were quadratic in the output rather than in the input, and no budget for the
+/// remaining product has been measured. Until one is, that is a stated gap
+/// rather than a claim that the shape is fine.
 pub fn join(points: &[DeclaredPoint], events: &[EgressEvent]) -> JoinResult {
     let keys: Vec<EventKey<'_>> = events.iter().map(EventKey::of).collect();
 
@@ -177,13 +277,14 @@ pub fn join(points: &[DeclaredPoint], events: &[EgressEvent]) -> JoinResult {
         a.egress_point_id == b.egress_point_id && a.egress_event_id == b.egress_event_id
     });
 
+    // Set membership rather than a scan per event. The scan was quadratic in
+    // the product of two numbers that both grow with the repository, and the
+    // weakest rung ties nearly every pair, so on a real monorepo the answer to
+    // "which observations reached nothing" cost more than the join itself.
+    let linked: BTreeSet<&str> = matches.iter().map(|m| m.egress_event_id.as_str()).collect();
     let mut unlinked_event_ids: Vec<String> = keys
         .iter()
-        .filter(|key| {
-            !matches
-                .iter()
-                .any(|m| m.egress_event_id == key.egress_event_id)
-        })
+        .filter(|key| !linked.contains(key.egress_event_id))
         .map(|key| key.egress_event_id.to_owned())
         .collect();
     unlinked_event_ids.sort();
@@ -212,7 +313,7 @@ fn tier_for(point: &DeclaredPoint, key: &EventKey<'_>) -> Option<MatchTier> {
 }
 
 fn provider_agrees(point: &DeclaredPoint, key: &EventKey<'_>) -> bool {
-    point.provider_ref() != UNCLASSIFIED_PROVIDER && key.provider_ref == Some(point.provider_ref())
+    point.provider_ref() != UNRESOLVED && key.provider_ref == Some(point.provider_ref())
 }
 
 #[cfg(test)]
@@ -221,7 +322,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::declared::tests::{point, point_without_operation, unresolved_point};
     use periskop_runtime_collector::event::{
-        Language, Library, Mechanism, PayloadShape, Process, Target,
+        DegradedReason, Language, Library, Mechanism, PayloadShape, Process, Target,
     };
 
     /// An event as a hook records one, at whichever layer it sits.
@@ -252,7 +353,117 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// A call a hook watched without being able to read where it went.
+    ///
+    /// Spelled the way the contract makes a hook spell it: the sentinel in the
+    /// host field, because the field may not be omitted, and the reason beside
+    /// it. `fetch(someUrlObject)` in the Node hook is exactly this record.
+    pub(crate) fn event_with_unresolved_target(operation: &str, provider: &str) -> EgressEvent {
+        event("node:https", operation, UNRESOLVED, provider)
+            .with_degraded_reasons(vec![DegradedReason::TargetNotResolved])
+    }
+
     const EP: &str = "ep_3f0a91c7d4e28b56";
+
+    #[test]
+    fn a_destination_the_hook_could_not_read_is_not_a_destination() {
+        // The sentinel compares unequal to every real host, so accepting it
+        // would put "the call went elsewhere" on the strength of an observation
+        // that saw nowhere. The operation still ties the two together, which is
+        // the honest half of what the record established.
+        let result = join(
+            &[point(EP, "api.openai.com", "chat.completions.create")],
+            &[event_with_unresolved_target(
+                "chat.completions.create",
+                "openai",
+            )],
+        );
+
+        assert_eq!(result.matches().len(), 1);
+        assert_eq!(result.matches()[0].tier, MatchTier::OperationOnly);
+        assert_eq!(result.matches()[0].observed_target, None);
+    }
+
+    #[test]
+    fn a_stated_reason_withdraws_a_destination_the_record_still_carries() {
+        // The two halves of the same statement, and a hook may write either one
+        // without the other. Here the host field looks readable and the record
+        // says the value was not resolved, so the value is not used.
+        let degraded = event(
+            "node:https",
+            "chat.completions.create",
+            "api.openai.com",
+            "openai",
+        )
+        .with_degraded_reasons(vec![DegradedReason::TargetNotResolved]);
+        let result = join(
+            &[point(EP, "api.openai.com", "chat.completions.create")],
+            &[degraded],
+        );
+
+        assert_eq!(result.matches()[0].tier, MatchTier::OperationOnly);
+        assert_eq!(result.matches()[0].observed_target, None);
+    }
+
+    #[test]
+    fn the_weakest_rung_is_not_evidence_that_a_point_ran() {
+        // The rule the whole ladder exists to keep, stated where a caller can
+        // read it: agreeing on the vendor is not agreeing on the call site.
+        assert!(MatchTier::OperationAndTarget.attributes_a_call());
+        assert!(MatchTier::OperationOnly.attributes_a_call());
+        assert!(MatchTier::TargetOnly.attributes_a_call());
+        assert!(!MatchTier::ProviderOnly.attributes_a_call());
+    }
+
+    #[test]
+    fn every_match_for_a_point_is_found_even_when_other_points_surround_it() {
+        // The lookup searches an ordered list instead of scanning it, so it is
+        // worth pinning that it finds the whole run and stops at its end. A
+        // point sorting between two others is the case that would break if the
+        // ordering assumption ever stopped holding.
+        let points = [
+            point("ep_0000000000000001", "api.openai.com", "images.generate"),
+            point(EP, "api.openai.com", "chat.completions.create"),
+            point("ep_ffffffffffffffff", "api.openai.com", "embeddings.create"),
+        ];
+        let events = [
+            event(
+                "openai",
+                "chat.completions.create",
+                "api.openai.com",
+                "openai",
+            ),
+            event("node:https", "post", "api.openai.com", "openai"),
+        ];
+        let result = join(&points, &events);
+
+        assert_eq!(result.matches_for(EP).count(), 2);
+        assert_eq!(result.matches().len(), 6);
+        assert!(result
+            .matches_for(EP)
+            .all(|m| m.egress_point_id.as_str() == EP));
+    }
+
+    #[test]
+    fn a_point_reports_the_strongest_rung_it_reached_and_not_merely_that_it_reached_one() {
+        let points = [point(EP, "api.openai.com", "chat.completions.create")];
+        let events = [
+            event("openai", "embeddings.create", "eu.api.openai.com", "openai"),
+            event(
+                "openai",
+                "chat.completions.create",
+                "api.openai.com",
+                "openai",
+            ),
+        ];
+        let result = join(&points, &events);
+
+        assert_eq!(
+            result.strongest_tier_for(EP),
+            Some(MatchTier::OperationAndTarget)
+        );
+        assert_eq!(result.strongest_tier_for("ep_0000000000000001"), None);
+    }
 
     #[test]
     fn agreement_on_both_keys_is_the_strongest_rung() {

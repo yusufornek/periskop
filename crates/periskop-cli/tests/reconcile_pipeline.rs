@@ -23,7 +23,7 @@ use periskop_report::coverage::ReconciliationMode;
 use periskop_report::report::DiagnosticComponent;
 use periskop_report::to_canonical_json;
 use periskop_runtime_collector::event::{
-    EgressEvent, Language, Library, Mechanism, PayloadShape, Process, Target,
+    DegradedReason, EgressEvent, Language, Library, Mechanism, PayloadShape, Process, Target,
 };
 
 use periskop_cli::scan;
@@ -152,6 +152,14 @@ fn call_to(host: &str) -> EgressEvent {
     event("openai", "chat.completions.create", host, "openai")
 }
 
+/// The same call as a hook records it when it could not read the destination.
+///
+/// The contract will not let the field be omitted, so the absence is written as
+/// a sentinel and the reason travels beside it.
+fn call_to_somewhere_unreadable() -> EgressEvent {
+    call_to("unknown").with_degraded_reasons(vec![DegradedReason::TargetNotResolved])
+}
+
 fn derived(outcome: &scan::ScanOutcome) -> Vec<&periskop_core::finding::Finding> {
     outcome
         .report
@@ -268,6 +276,37 @@ fn a_call_that_reached_another_host_becomes_a_target_drift_finding() {
             .any(|reference| reference.ref_type == periskop_core::finding::RefType::EgressEvent),
         "{:?}",
         drift.refs
+    );
+}
+
+#[test]
+fn a_call_whose_destination_the_hook_could_not_read_produces_no_drift() {
+    // The most expensive false positive this tool can print, run end to end.
+    // The hook watched a call it could not resolve a destination for and wrote
+    // the sentinel the contract requires. Read as a host, it differs from
+    // everything the code declares, so every such call became a confirmed
+    // `target_drift`: the report would state that code declaring
+    // api.openai.com sent data somewhere else, when nothing was seen to go
+    // anywhere at all. A security reader opens an incident on that line.
+    let fixture = Fixture::new("unreadable-target");
+    fixture.write_events("worker-1.jsonl", &[call_to_somewhere_unreadable()]);
+
+    let outcome = fixture.scan();
+
+    assert!(
+        derived(&outcome).is_empty(),
+        "not knowing where a call went is a gap in observation, never a drift: {:?}",
+        derived(&outcome)
+    );
+    // The observation is not discarded either: the operation still attributes
+    // it to the code point, so it is not counted as reaching nothing.
+    assert_eq!(outcome.report.coverage.unlinked_events, 0);
+    assert_eq!(outcome.report.coverage.dropped_events, 0);
+    // And the run reports no internal disagreement over it.
+    assert!(
+        details(&outcome, DiagnosticComponent::RuntimeHooks).is_empty(),
+        "{:?}",
+        outcome.report.diagnostics
     );
 }
 

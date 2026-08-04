@@ -88,9 +88,13 @@ def build(module, mechanism, operation, target, payload_shape, entrypoint_hint,
         "payload_shape": {
             "field_paths": list(payload_shape.field_paths),
             "byte_size_estimate": payload_shape.byte_size_estimate,
-            "truncated_depth": payload_shape.truncated_depth,
         },
     }
+    # Absent when the walk finished. Writing zero instead would say the walk
+    # stopped at the root, which is a different and much worse claim: it turns
+    # a fully described payload into one nothing is known about.
+    if payload_shape.truncated_depth is not None:
+        event["payload_shape"]["truncated_depth"] = payload_shape.truncated_depth
     if site is not None:
         event["call_site_hint"] = site
     if reasons:

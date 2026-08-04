@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import unittest
 
+from periskop_hook import failopen
 from periskop_hook.writer import EventWriter
 
 
@@ -65,6 +66,64 @@ class StreamTest(unittest.TestCase):
         self.assertEqual("active", status["hook_status"])
         self.assertEqual(0, status["dropped_events_count"])
         self.assertEqual(1, status["written_events_count"])
+
+    def test_the_status_document_is_the_one_the_collector_reads(self):
+        # Property names, not just values. The node hook writes these five and
+        # periskop-runtime-collector looks for them; a counter spelled
+        # differently in either hook is a counter that reaches nobody, which is
+        # what this whole sidecar was until the collector learned to read it.
+        writer = EventWriter(self.path, capacity=16)
+        writer.submit(_event(0))
+        writer.close()
+
+        with open(self.path + ".status.json", encoding="utf-8") as stream:
+            status = json.load(stream)
+        self.assertEqual(
+            ["dropped_events_count", "failures", "hook_status", "reason",
+             "written_events_count"],
+            sorted(status.keys()),
+        )
+        # The sidecar sits beside the stream under the suffix the collector
+        # selects on, and never under the stream's own extension: read back as
+        # an event it would be a malformed record instead of an account of one.
+        self.assertTrue(self.path.endswith(".jsonl"))
+
+    def test_a_write_that_fails_counts_every_event_it_lost(self):
+        # The failure this accounting exists for. A CI container fills its disk
+        # and the append raises. The events had already been taken off the ring
+        # to be written, so before this the status file read "nothing written,
+        # nothing dropped" and the report called the run clean. The guard around
+        # the drain only ever recorded *which* failure it was, never how many
+        # events went with it.
+        writer = EventWriter(self.path, capacity=16)
+        for index in range(5):
+            writer.submit(_event(index))
+        # A directory in place of the stream: every open for append raises, the
+        # way a revoked mount or a read only volume does.
+        os.makedirs(self.path)
+        writer.close()
+
+        self.assertEqual(5, writer.dropped_events_count)
+        self.assertEqual(0, writer.written_events_count)
+        # And the failure is still named, so a full disk is distinguishable from
+        # a hook that never started.
+        self.assertTrue(
+            any(label.startswith("writer.") for label in failopen.failures()),
+            failopen.failures(),
+        )
+
+    def test_a_record_that_cannot_be_serialised_is_counted_not_dropped_quietly(self):
+        # It has already left the ring by the time json.dumps refuses it, so
+        # this is the last moment the loss can be counted at all.
+        writer = _NoThreadWriter(self.path, capacity=16)
+        writer.submit(_event(0))
+        writer.submit({"payload": object()})
+        writer.submit(_event(1))
+
+        lines = writer._serialise_batch()
+
+        self.assertEqual(2, len(lines))
+        self.assertEqual(1, writer.dropped_events_count)
 
     def test_closing_twice_is_safe(self):
         writer = EventWriter(self.path, capacity=4)

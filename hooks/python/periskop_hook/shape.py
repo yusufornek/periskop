@@ -18,6 +18,21 @@ cannot be weighed at all without consuming it.
 request body is single use. Iterating it here would leave the application with
 an empty body, so an unmaterialised iterable is recorded as unmeasured and left
 untouched.
+
+The traversal rules are shared exactly with `hooks/node/src/payload-shape.ts`:
+the same depth ceiling counted from the same starting depth, the same sample
+size, the same path emitted where a walk stops, and the same reading of
+`truncated_depth`. Two hooks that walk differently give one call two shapes, and
+because the call has one identity the collector keeps whichever record sorted
+first. `tests/hook-parity-vectors.json` pins the two implementations against
+each other.
+
+`truncated_depth` is the *deepest* point at which the walk gave up, not the
+shallowest. The schema explains the field as present "so a shallow record is not
+mistaken for a small payload", and only the deepest stop answers that: a record
+that stopped at depth two and again at depth seven describes a payload at least
+seven levels deep. Absent means the walk finished; zero means it stopped at the
+root, which is what an already serialised body reports.
 """
 
 import collections
@@ -45,7 +60,10 @@ class _Walk(object):
     def __init__(self):
         self.paths = set()
         self.size = 0
-        self.stopped_at = 0
+        # None until something stops, so that "the walk finished" and "the walk
+        # stopped at the root" stay two different statements. Zero cannot mean
+        # both: an already serialised body reports zero and means it.
+        self.stopped_at = None
         self.reasons = set()
 
     def emit(self, path):
@@ -56,7 +74,8 @@ class _Walk(object):
         self.reasons.add(TRUNCATED)
         # The deepest stop is the honest one: a shallow record must not be read
         # as a small payload.
-        self.stopped_at = max(self.stopped_at, depth)
+        if self.stopped_at is None or depth > self.stopped_at:
+            self.stopped_at = depth
 
 
 def _is_stream(value):

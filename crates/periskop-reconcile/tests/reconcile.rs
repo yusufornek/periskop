@@ -628,12 +628,18 @@ fn escape_an_internationalised_host_is_not_folded_to_punycode() {
 }
 
 #[test]
-fn escape_a_provider_level_match_keeps_a_dormant_point_out_of_the_report() {
+fn a_provider_level_match_neither_silences_a_dormant_point_nor_accuses_it() {
     // Two call sites reaching one provider, and one call that went to neither of
-    // the destinations either of them named. Both points match it on the
-    // provider alone, so neither is reported dormant. The under claim is
-    // deliberate: this build would rather miss a dormant point than state that
-    // code never ran when something reached its provider.
+    // the destinations either of them named and invoked neither of the
+    // operations either of them invokes. The only thing joining that call to
+    // either line is the vendor name.
+    //
+    // This test used to record the opposite of what it records now, filed as a
+    // deliberate under claim, and it was the clearest evidence that the rule was
+    // wrong: the same weakest rung was silencing every dormancy finding in the
+    // repository and manufacturing a drift for every point it silenced. Neither
+    // reading survives contact with a real code base, where every call site for
+    // one vendor shares its provider with every other.
     let outcome = run(
         vec![
             point(EP_ONE, "api.openai.com", "chat.completions.create"),
@@ -648,11 +654,21 @@ fn escape_a_provider_level_match_keeps_a_dormant_point_out_of_the_report() {
         LONG_WINDOW,
     );
 
-    assert!(!kinds_of(&outcome).contains(&Kind::DormantEgressPoint));
+    // Neither line was seen to run, so both are reported, and neither is
+    // reported firmly: a call to their vendor was seen and either could have
+    // made it.
+    assert_eq!(
+        kinds_of(&outcome),
+        [Kind::DormantEgressPoint, Kind::DormantEgressPoint]
+    );
+    assert!(outcome
+        .findings
+        .iter()
+        .all(|finding| finding.confidence == Confidence::Suspect));
+    // The link is still established and still visible; what changed is what may
+    // be concluded from it.
     assert_eq!(outcome.matches.len(), 2);
-    // What the report does say instead: both points reached a destination
-    // neither of them declared.
-    assert_eq!(kinds_of(&outcome), [Kind::TargetDrift, Kind::TargetDrift]);
+    assert_eq!(outcome.unlinked_events, 0);
 }
 
 fn walk(value: &serde_json::Value, keys: &mut Vec<String>, strings: &mut Vec<String>) {

@@ -11,6 +11,20 @@ schema). An unrecognised host is reported as `unknown`, which is the same value
 the static rule set uses for an unclassified endpoint (`rules/python/
 http-literal-endpoint.toml`), so the two sources agree on the word for "we do
 not know".
+
+The classification table is identical to the one in
+`hooks/node/src/provider-ref.ts`, entry for entry. It has to be: reconciliation
+compares a declared provider against an observed one, so a table that knows
+`api.groq.com` in one language and not in the other makes "the code says OpenAI,
+the wire says Groq" a finding that appears in Node processes and never in Python
+ones. `tests/hook-parity-vectors.json` pins the two tables against each other.
+
+The table lives in each hook rather than in a shared data file because a hook
+runs inside somebody else's process, where the rules directory is not on disk
+and reading a file per request is work the performance budget does not have. The
+cost of the copy is bounded: being wrong here writes `unknown`, which loses the
+classification and never loses the call. A request for a single generated source
+is filed in `hub/memory/interfaces.md`.
 """
 
 import re
@@ -21,13 +35,38 @@ UNRESOLVED_HOST = "unknown"
 UNKNOWN_PROVIDER = "unknown"
 TARGET_NOT_RESOLVED = "target_not_resolved"
 
-# Kept deliberately small and shared with the static rule vocabulary. Inventing
-# a provider id here would put a name in reports that no other component knows.
+# Inventing a provider id here would put a name in reports that no other
+# component knows, so every value below is one the rule vocabulary also uses.
 _EXACT_HOSTS = {
     "api.openai.com": "openai",
     "api.anthropic.com": "anthropic",
     "generativelanguage.googleapis.com": "google-gemini",
+    "api.mistral.ai": "mistral",
+    "api.cohere.ai": "cohere",
+    "api.cohere.com": "cohere",
+    "api.groq.com": "groq",
+    "api.deepseek.com": "deepseek",
+    "api.together.xyz": "together",
+    "openrouter.ai": "openrouter",
 }
+
+# Tenant or index sits in front of these, so an exact match is not enough.
+_SUFFIX_HOSTS = (
+    (".openai.azure.com", "azure-openai"),
+    (".cognitiveservices.azure.com", "azure-cognitive"),
+    ("-aiplatform.googleapis.com", "google-vertex"),
+    (".huggingface.co", "huggingface"),
+    (".pinecone.io", "pinecone"),
+    (".weaviate.network", "weaviate"),
+    (".qdrant.io", "qdrant"),
+)
+
+# Region sits in the middle of these, so neither an exact nor a suffix match
+# reaches them. Anchored at both ends: a suffix test alone would classify
+# `bedrock-runtime.eu-west-1.amazonaws.com.attacker.test` as Bedrock.
+_PATTERN_HOSTS = (
+    (re.compile(r"^bedrock(-runtime)?\.[a-z0-9-]+\.amazonaws\.com$"), "aws-bedrock"),
+)
 
 _IDENTIFIER_SEGMENTS = (
     re.compile(r"^[0-9]+$"),
@@ -43,9 +82,25 @@ _DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
 def classify(host):
+    """Classify a destination host, or admit that we cannot.
+
+    README principle 3 runs the other way round from the usual scanner: every
+    call out is recorded and classification happens afterwards, so a host that
+    matches nothing here is still a call in the report.
+    """
     if not host:
         return UNKNOWN_PROVIDER
-    return _EXACT_HOSTS.get(host.lower(), UNKNOWN_PROVIDER)
+    normalised = host.lower()
+    exact = _EXACT_HOSTS.get(normalised)
+    if exact is not None:
+        return exact
+    for suffix, provider in _SUFFIX_HOSTS:
+        if normalised.endswith(suffix):
+            return provider
+    for pattern, provider in _PATTERN_HOSTS:
+        if pattern.match(normalised):
+            return provider
+    return UNKNOWN_PROVIDER
 
 
 def templatize(path):

@@ -23,6 +23,7 @@ const EXACT_HOSTS: ReadonlyMap<string, string> = new Map([
   ["openrouter.ai", "openrouter"],
 ]);
 
+// Tenant or index sits in front of these, so an exact match is not enough.
 const SUFFIX_HOSTS: ReadonlyArray<readonly [string, string]> = [
   [".openai.azure.com", "azure-openai"],
   [".cognitiveservices.azure.com", "azure-cognitive"],
@@ -33,7 +34,9 @@ const SUFFIX_HOSTS: ReadonlyArray<readonly [string, string]> = [
   [".qdrant.io", "qdrant"],
 ];
 
-// Region sits in the middle of these, so a suffix match is not enough.
+// Region sits in the middle of these, so neither an exact nor a suffix match
+// reaches them. Anchored at both ends: a suffix test alone would classify
+// `bedrock-runtime.eu-west-1.amazonaws.com.attacker.test` as Bedrock.
 const PATTERN_HOSTS: ReadonlyArray<readonly [RegExp, string]> = [
   [/^bedrock(-runtime)?\.[a-z0-9-]+\.amazonaws\.com$/, "aws-bedrock"],
 ];
@@ -41,13 +44,20 @@ const PATTERN_HOSTS: ReadonlyArray<readonly [RegExp, string]> = [
 /**
  * Classify a destination host.
  *
- * The table is a copy of the provider signatures the network sensor spec keeps
- * in rules/providers, and copies drift. It lives here because a hook runs inside
- * somebody else's process, where the rules directory is not on disk and reading
- * a file per request would be work the performance budget does not have. The
- * cost of the copy is that a provider added to the rules is not known to the
- * hook until the hook ships again; the cost is bounded because being wrong here
- * means writing "unknown", which loses classification and never loses the call.
+ * This table and the one in `hooks/python/periskop_hook/target.py` are identical
+ * entry for entry, and have to be. Reconciliation compares a declared provider
+ * against an observed one, so a table that knows `api.groq.com` in one language
+ * and not in the other makes "the code says OpenAI, the wire says Groq" a
+ * finding that appears in Node processes and never in Python ones. The two are
+ * pinned against each other by `hooks/python/tests/hook-parity-vectors.json`.
+ *
+ * The table is copied into each hook rather than read from a shared data file
+ * because a hook runs inside somebody else's process, where the rules directory
+ * is not on disk and reading a file per request would be work the performance
+ * budget does not have. There is no single source to generate it from today; a
+ * request for one is filed in `hub/memory/interfaces.md`. The cost of the copy
+ * is bounded either way: being wrong here writes "unknown", which loses the
+ * classification and never loses the call.
  */
 export function classifyHost(host: string | undefined): string {
   if (host === undefined || host.length === 0) return UNKNOWN_PROVIDER;

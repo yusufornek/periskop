@@ -12,6 +12,13 @@
 //! leaving must not become the thing that copies it. That rule is not left to
 //! the discretion of eight separate hook implementations; it is checked here, on
 //! the way in ([`EgressEvent::validate`]).
+//!
+//! Nor is the record's identity. It is derived from the call shape by a
+//! derivation the schema calls normative, and [`EgressEvent::validate`]
+//! recomputes it rather than accepting the one the hook wrote. Identity is the
+//! deduplication key, so a hook that derives it differently does not produce a
+//! wrong label: it makes two calls into one record, or one call into two, and it
+//! does so without anything downstream noticing.
 
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +71,16 @@ pub enum EventError {
         #[source]
         source: periskop_core::Error,
     },
+
+    /// The identity does not follow from the fields it claims to name.
+    ///
+    /// Well formed and still wrong, which is the dangerous shape. Identity is
+    /// the deduplication key, so an identity that does not follow from the call
+    /// shape either merges two different calls into one record or splits one
+    /// call into two observations, and both happen without a single line
+    /// appearing in a coverage statement.
+    #[error("event identity does not follow from the call shape it names")]
+    EventIdMismatch,
 }
 
 impl EventError {
@@ -80,6 +97,7 @@ impl EventError {
             Self::MalformedProviderRef => "malformed_provider_ref",
             Self::AbsoluteCallSitePath => "absolute_call_site_path",
             Self::MalformedEventId { .. } => "malformed_event_id",
+            Self::EventIdMismatch => "event_id_mismatch",
         }
     }
 }
@@ -341,6 +359,29 @@ impl EgressEvent {
             }
         }
 
+        // Last of the checks, deliberately. A record that also carries content
+        // must be rejected for the content: that rejection names a leak, this
+        // one names a hook bug, and the leak is the one an operator has to see
+        // first.
+        //
+        // The derivation is normative in the schema, which is what makes
+        // recomputing it here a check rather than an opinion. Accepting an
+        // identity because it has the right shape would trust the arithmetic of
+        // a program in another language: a hook that hashed the port instead of
+        // the path template would give every endpoint on one host the same
+        // identity, and deduplication would delete the difference without
+        // counting it.
+        let derived = derive_egress_event_id(
+            &self.library.module,
+            &self.operation,
+            &self.target.host_id,
+            self.target.path_template.as_deref(),
+        )
+        .map_err(|source| EventError::MalformedEventId { source })?;
+        if derived.as_str() != self.egress_event_id {
+            return Err(EventError::EventIdMismatch);
+        }
+
         Ok(())
     }
 }
@@ -385,11 +426,19 @@ fn is_absolute_path(path: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// The contract example, byte for byte from
-    /// `schemas/examples/egress-event.valid.json`.
+    /// The contract example from `schemas/examples/egress-event.valid.json`,
+    /// with the identity corrected.
+    ///
+    /// The example carries `ee_5b18c30af7924de6`, which is not what the
+    /// derivation the schema calls normative produces for these fields. The
+    /// example was written by hand before any implementation existed, and the
+    /// mismatch went unnoticed for as long as nothing recomputed the identity.
+    /// This crate cannot edit `schemas/`, so the correction is filed as a
+    /// contract request in `hub/memory/interfaces.md`; the value below is what
+    /// all three implementations of the derivation agree on.
     const CONTRACT_EXAMPLE: &str = r#"{
       "schema_version": "1.0",
-      "egress_event_id": "ee_5b18c30af7924de6",
+      "egress_event_id": "ee_3dfe316616cd47b4",
       "process": {
         "language": "python",
         "runtime": "cpython/3.12",
@@ -628,14 +677,11 @@ mod tests {
     }
 
     #[test]
-    fn an_identity_read_back_is_checked_for_form_and_not_re_derived() {
-        // The record was written by a hook in another language, and holding it
-        // to this crate's exact hash would mean pinning eight implementations to
-        // one hash function before any of them exists. So a read back identity
-        // is checked against the shape the contract fixes and taken at its word
-        // beyond that. The contract example is the case in point: it carries an
-        // identity this derivation does not reproduce, and it is still a valid
-        // record.
+    fn an_identity_read_back_is_re_derived_and_not_taken_on_trust() {
+        // The record was written by a hook in another language, running inside
+        // somebody else's process. The derivation is normative in the schema
+        // precisely so that this comparison is possible, and a collector that
+        // only checked the ee_ shape would accept an identity a hook invented.
         let event: EgressEvent = serde_json::from_str(CONTRACT_EXAMPLE).unwrap();
         let derived = derive_egress_event_id(
             &event.library.module,
@@ -646,7 +692,41 @@ mod tests {
         .unwrap();
 
         assert!(event.validate().is_ok());
-        assert_ne!(event.egress_event_id, derived.to_string());
+        assert_eq!(event.egress_event_id, derived.to_string());
+    }
+
+    #[test]
+    fn an_identity_that_does_not_follow_from_the_call_shape_is_rejected() {
+        // The failure this check exists for. A hook derives the identity from
+        // the port instead of the path template, so two endpoints on one host
+        // collapse to one identity. Deduplication then deletes the embeddings
+        // call, and without this rejection nothing counts the deletion: the
+        // report says the call never happened.
+        let chat = sample_with("api.openai.com", "chat.completions.create");
+        let mut embeddings = sample_with("api.openai.com", "embeddings.create");
+        embeddings.egress_event_id = chat.egress_event_id.clone();
+
+        assert!(matches!(
+            embeddings.validate(),
+            Err(EventError::EventIdMismatch)
+        ));
+        // The rejection is countable: the collector turns this label into a
+        // dropped event with a location, rather than a silent merge.
+        assert_eq!(
+            embeddings.validate().unwrap_err().reason(),
+            "event_id_mismatch"
+        );
+    }
+
+    #[test]
+    fn a_rejected_identity_never_repeats_the_record() {
+        // Same rule as the field path check: a diagnostic that quotes what it
+        // rejected moves the leak instead of stopping it.
+        let mut event = sample();
+        event.target.host_id = "internal-gateway.acme.test".to_owned();
+        let error = event.validate().unwrap_err();
+        assert!(!error.to_string().contains("acme"));
+        assert!(!error.reason().contains("acme"));
     }
 
     #[test]

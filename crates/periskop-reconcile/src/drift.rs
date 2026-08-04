@@ -7,12 +7,25 @@
 //! revealed any of them, which is the whole reason two sources are being
 //! compared.
 //!
-//! One case is explicitly not a drift. When the scanner could not resolve the
-//! destination, the code declared nothing to drift from, and reporting one would
-//! turn a gap in static analysis into a claim about the system. What that case
-//! produces instead is an enrichment: the observation supplies the destination
-//! the scanner could not read, and the run says so where the coverage statement
-//! can pick it up.
+//! Three cases are explicitly not a drift, and each is a way of not knowing
+//! that must not be spelled like knowing something else.
+//!
+//! When the scanner could not resolve the destination, the code declared
+//! nothing to drift from, and reporting one would turn a gap in static analysis
+//! into a claim about the system. What that case produces instead is an
+//! enrichment: the observation supplies the destination the scanner could not
+//! read, and the run says so where the coverage statement can pick it up.
+//!
+//! When the hook could not read where the call went, the observation side is the
+//! one that established nothing. That case is handled before this module sees
+//! it, in [`crate::join`]: such a record carries no destination at all, so there
+//! is nothing here for a comparison to differ from.
+//!
+//! And when the only thing tying an observation to a code point is that both
+//! name the same vendor, the call may have come from any other line reaching
+//! that vendor. Comparing its destination against this line's would report a
+//! drift for code that reached exactly what it declared, on the strength of
+//! traffic it never produced.
 
 use std::collections::BTreeSet;
 
@@ -112,6 +125,12 @@ fn drift_for(
 ) {
     let drifting: Vec<&J2Match> = join
         .matches_for(point.egress_point_id())
+        // Only a link that places the call at this point may accuse it. Without
+        // this, a second module calling the same vendor at a regional endpoint
+        // attaches itself to this line through the provider, and the report
+        // states that code which reached exactly what it declared drifted
+        // somewhere it never went.
+        .filter(|m| m.tier.attributes_a_call())
         .filter(|m| m.observed_target.as_ref().is_some_and(|t| t != declared))
         .collect();
     if drifting.is_empty() {
@@ -122,10 +141,8 @@ fn drift_for(
     // gateway is one drift, and §6 of the spec asks for exactly that collapse.
     let mut details: BTreeSet<String> = BTreeSet::new();
     let mut event_ids: BTreeSet<String> = BTreeSet::new();
-    let mut confirmed = false;
     for matched in &drifting {
         event_ids.insert(matched.egress_event_id.clone());
-        confirmed |= matched.tier.is_confirmed();
         if let Some(observed) = &matched.observed_target {
             details.insert(format!(
                 "J2:{} declared={declared} observed={observed} drift={}",
@@ -147,17 +164,15 @@ fn drift_for(
         return;
     };
 
-    let confidence = if confirmed {
-        Confidence::Confirmed
-    } else {
-        // Only the provider classification tied the two sides together, and a
-        // call to the same provider is not evidence that it came from this line.
-        Confidence::Suspect
-    };
-
+    // Every surviving link places the call at this point, because the filter
+    // above admitted no other kind, so the claim rests on evidence that carries
+    // it. The alternative considered and rejected was to keep the weaker links
+    // and emit them as suspected drifts: a suspected finding is still a finding
+    // in the report, and one that says a call went somewhere it did not is the
+    // most expensive thing this tool can print.
     match emit::derived_finding(
         Kind::TargetDrift,
-        confidence,
+        Confidence::Confirmed,
         point.provider_ref(),
         point.egress_point_id(),
         lead.clone(),
@@ -183,8 +198,17 @@ fn drift_for(
 }
 
 /// Records the destinations observation supplied for an unresolved point.
+///
+/// Filtered by the same rule the accusation above is, because an enrichment is
+/// a claim too: it says this line reaches that destination, and a reader who
+/// sees the point leave the unresolved list will act on it. A provider level
+/// tie would resolve every unread call site in the repository to whatever host
+/// that vendor's busiest call happened to reach.
 fn collect_resolved(point: &DeclaredPoint, join: &JoinResult, derived: &mut Derived) {
-    for matched in join.matches_for(point.egress_point_id()) {
+    for matched in join
+        .matches_for(point.egress_point_id())
+        .filter(|m| m.tier.attributes_a_call())
+    {
         if let Some(observed) = &matched.observed_target {
             derived.resolved_targets.push(ResolvedTarget {
                 egress_point_id: point.egress_point_id().to_owned(),
@@ -199,7 +223,10 @@ fn collect_resolved(point: &DeclaredPoint, join: &JoinResult, derived: &mut Deri
 mod tests {
     use super::*;
     use crate::declared::tests::{point, point_without_operation, unresolved_point};
-    use crate::join::{join, tests::event};
+    use crate::join::{
+        join,
+        tests::{event, event_with_unresolved_target},
+    };
     use periskop_runtime_collector::EgressEvent;
 
     const EP: &str = "ep_3f0a91c7d4e28b56";
@@ -291,7 +318,7 @@ mod tests {
     fn an_unresolved_declaration_is_enriched_rather_than_accused() {
         // The scanner could not read the destination. Reporting a drift here
         // would turn a gap in static analysis into a claim about the code.
-        let points = [unresolved_point(EP, "openai")];
+        let points = [unresolved_point(EP, "openai").with_operation("chat.completions.create")];
         let events = [event(
             "openai",
             "chat.completions.create",
@@ -309,9 +336,34 @@ mod tests {
     }
 
     #[test]
-    fn a_provider_level_tie_can_only_produce_a_suspected_drift() {
-        // Nothing links the call to this line except that both name the same
-        // provider. The finding stays, and it stays suspect.
+    fn a_provider_level_tie_does_not_resolve_a_destination_either() {
+        // The quiet half of the same mistake. Nothing ties this call to this
+        // line but the vendor, and letting it fill the destination in would
+        // drop the point off the unresolved list on a guess: every unread call
+        // site for that vendor would resolve to the same host.
+        let points = [unresolved_point(EP, "openai").with_operation("embeddings.create")];
+        let events = [event(
+            "openai",
+            "chat.completions.create",
+            "api.openai.com",
+            "openai",
+        )];
+        let derived = derive_with(&points, &events);
+
+        assert!(derived.findings.is_empty());
+        assert!(
+            derived.resolved_targets.is_empty(),
+            "{:?}",
+            derived.resolved_targets
+        );
+    }
+
+    #[test]
+    fn a_provider_level_tie_produces_no_drift_at_all() {
+        // Two modules, one vendor. This line calls the endpoint it declared and
+        // a different line calls a regional one; the only thing joining the
+        // second call to this point is the vendor name. Reporting it, even as a
+        // suspicion, accuses code that did exactly what it said it would.
         let points = [point(EP, "api.openai.com", "chat.completions.create")];
         let events = [event(
             "openai",
@@ -321,12 +373,75 @@ mod tests {
         )];
         let derived = derive_with(&points, &events);
 
-        assert_eq!(derived.findings[0].confidence, Confidence::Suspect);
+        assert!(derived.findings.is_empty(), "{:?}", derived.findings);
+        assert!(derived.faults.is_empty());
+    }
+
+    #[test]
+    fn escape_a_point_that_names_no_operation_cannot_establish_a_drift() {
+        // The known escape of this rule, and the price of refusing the weakest
+        // rung. The destination is the only key such a point carries, and a
+        // drift is precisely the case where the destination differs, so the
+        // pair falls to the provider rung and no drift is stated. Catalogued as
+        // KG-016 rather than closed by weakening the rule: a suspected drift
+        // for every call a vendor received would cost more readers than this
+        // silence does. The static side closes it by naming the operation,
+        // which contract 1.1 lets it do.
+        let points = [point_without_operation(EP, "api.openai.com")];
+        let events = [event(
+            "openai",
+            "chat.completions.create",
+            "llm-gateway.internal",
+            "openai",
+        )];
+        let derived = derive_with(&points, &events);
+
+        assert!(derived.findings.is_empty());
+        assert!(derived.faults.is_empty());
+    }
+
+    #[test]
+    fn a_destination_the_hook_could_not_read_is_not_a_drift() {
+        // The sentinel a hook writes when it cannot see where a call went. It
+        // is not a host, and treating it as one turns "I could not observe
+        // this" into a confirmed claim that the call reached somewhere other
+        // than the code says. A security reader opens an incident on that line.
+        let points = [point(EP, "api.openai.com", "chat.completions.create")];
+        let events = [event_with_unresolved_target(
+            "chat.completions.create",
+            "openai",
+        )];
+        let derived = derive_with(&points, &events);
+
+        assert!(
+            derived.findings.is_empty(),
+            "an unobservable destination is a gap, not a drift: {:?}",
+            derived.findings
+        );
+        assert!(derived.faults.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_destination_does_not_resolve_an_unread_declaration_either() {
+        // Neither side knows where the call went. The point stays unresolved,
+        // which is the only honest outcome, rather than being resolved to a
+        // word.
+        let points = [unresolved_point(EP, "openai").with_operation("chat.completions.create")];
+        let events = [event_with_unresolved_target(
+            "chat.completions.create",
+            "openai",
+        )];
+        let derived = derive_with(&points, &events);
+
+        assert!(derived.findings.is_empty());
+        assert!(derived.resolved_targets.is_empty());
     }
 
     #[test]
     fn one_point_reaching_several_destinations_stays_one_finding() {
-        let points = [point_without_operation(EP, "api.openai.com")];
+        // Both calls invoke the operation this point invokes, which is the rung
+        // that places them here. Two regions, one line of code, one claim.
+        let points = [point(EP, "api.openai.com", "chat.completions.create")];
         let events = [
             event(
                 "openai",
@@ -334,7 +449,12 @@ mod tests {
                 "eu.api.openai.com",
                 "openai",
             ),
-            event("openai", "embeddings.create", "us.api.openai.com", "openai"),
+            event(
+                "openai",
+                "chat.completions.create",
+                "us.api.openai.com",
+                "openai",
+            ),
         ];
         let derived = derive_with(&points, &events);
 
@@ -538,18 +658,26 @@ def summarize(record, token):
 
     #[test]
     fn the_finding_does_not_depend_on_the_order_the_calls_arrived_in() {
-        let points = [point_without_operation(EP, "api.openai.com")];
+        let points = [point(EP, "api.openai.com", "chat.completions.create")];
         let one = event(
             "openai",
             "chat.completions.create",
             "eu.api.openai.com",
             "openai",
         );
-        let other = event("openai", "embeddings.create", "us.api.openai.com", "openai");
+        let other = event(
+            "openai",
+            "chat.completions.create",
+            "us.api.openai.com",
+            "openai",
+        );
 
         let forward = derive_with(&points, &[one.clone(), other.clone()]);
         let backward = derive_with(&points, &[other, one]);
 
+        // Both orders produce the finding, so the equality below is an
+        // agreement rather than two empty lists comparing equal.
+        assert_eq!(forward.findings.len(), 1);
         assert_eq!(forward.findings, backward.findings);
     }
 }

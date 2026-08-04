@@ -19,6 +19,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use crate::event::EgressEvent;
+use crate::status::{self, STATUS_FILE_SUFFIX};
 
 /// Extension of a hook event file.
 ///
@@ -38,12 +39,18 @@ const DIRECTORY_LABEL: &str = "<event directory>";
 pub struct CollectionResult {
     /// Deduplicated, and ordered by identity.
     pub events: Vec<EgressEvent>,
-    /// Input lines that did not become events.
+    /// Events that were observed and did not survive to be read.
     ///
-    /// Feeds `dropped_events` in the coverage statement. It counts lines rather
-    /// than files, so a file that could not be opened at all adds nothing here:
-    /// how many events it held is unknowable once it is unreadable, and a
-    /// guessed number in a coverage report is worse than an absent one.
+    /// Feeds `dropped_events` in the coverage statement, and has two sources.
+    /// Input lines that did not become events are counted here, and so are the
+    /// events a hook says it lost before they ever reached a line: a ring that
+    /// overflowed, a batch whose write failed. The second source arrives through
+    /// the status sidecar ([`crate::status`]) and is the only record those
+    /// events existed at all.
+    ///
+    /// A file that could not be opened at all adds nothing here: how many events
+    /// it held is unknowable once it is unreadable, and a guessed number in a
+    /// coverage report is worse than an absent one.
     pub dropped: u64,
     /// One entry per loss, naming where it happened and why.
     ///
@@ -91,17 +98,34 @@ impl CollectionResult {
 /// the ones that were not.
 pub fn collect(dir: &Path) -> CollectionResult {
     let mut result = CollectionResult::default();
+    let listing = hook_files(dir, &mut result);
 
-    for file_name in event_file_names(dir, &mut result) {
-        read_event_file(&dir.join(&file_name), &file_name, &mut result);
+    for file_name in &listing.events {
+        read_event_file(&dir.join(file_name), file_name, &mut result);
+    }
+    for file_name in &listing.statuses {
+        read_status_file(&dir.join(file_name), file_name, &mut result);
     }
 
     result.normalize();
     result
 }
 
-/// Lists the event files, in an order that does not depend on the filesystem.
-fn event_file_names(dir: &Path, result: &mut CollectionResult) -> Vec<String> {
+/// The two kinds of file a hook leaves behind.
+///
+/// They are listed together and read separately because a status file is not a
+/// weaker event file: it describes events that never became lines, so nothing in
+/// the stream can stand in for it.
+#[derive(Default)]
+struct HookFiles {
+    events: Vec<String>,
+    statuses: Vec<String>,
+}
+
+/// Lists what the hooks wrote, in an order that does not depend on the filesystem.
+fn hook_files(dir: &Path, result: &mut CollectionResult) -> HookFiles {
+    let mut files = HookFiles::default();
+
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => {
@@ -112,11 +136,10 @@ fn event_file_names(dir: &Path, result: &mut CollectionResult) -> Vec<String> {
             result
                 .malformed
                 .push(format!("{DIRECTORY_LABEL}: unreadable"));
-            return Vec::new();
+            return files;
         }
     };
 
-    let mut names = Vec::new();
     for entry in entries {
         let Ok(entry) = entry else {
             result
@@ -125,18 +148,47 @@ fn event_file_names(dir: &Path, result: &mut CollectionResult) -> Vec<String> {
             continue;
         };
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some(EVENT_FILE_EXTENSION) {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
-        }
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            names.push(name.to_owned());
+        };
+        // The status suffix is checked first. A stream file is `<name>.jsonl`
+        // and its sidecar is `<name>.jsonl.status.json`, so the extension test
+        // alone would already separate them; naming the suffix here is what
+        // makes the pairing explicit rather than a consequence of two rules that
+        // happen not to overlap.
+        if name.ends_with(STATUS_FILE_SUFFIX) {
+            files.statuses.push(name.to_owned());
+        } else if path.extension().and_then(|e| e.to_str()) == Some(EVENT_FILE_EXTENSION) {
+            files.events.push(name.to_owned());
         }
     }
 
     // read_dir returns whatever order the filesystem keeps. Sorting here is what
     // makes two runs over the same directory produce the same bytes.
-    names.sort();
-    names
+    files.events.sort();
+    files.statuses.sort();
+    files
+}
+
+/// Folds one process's own accounting into the result.
+///
+/// The events this file describes are not in any stream: the hook counted them
+/// on the way out of a full ring, or after a write that failed. This sidecar is
+/// the only record they existed, so a collector that reads only `.jsonl` files
+/// reports the loss as a clean result.
+fn read_status_file(path: &Path, file_name: &str, result: &mut CollectionResult) {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        // Named without a count, for the reason given on `dropped`: how much a
+        // process lost is unknowable once its accounting is unreadable.
+        result.malformed.push(format!("{file_name}: unreadable"));
+        return;
+    };
+
+    let report = status::read(&contents);
+    result.dropped += report.dropped;
+    for reason in report.reasons {
+        result.malformed.push(format!("{file_name}: {reason}"));
+    }
 }
 
 fn read_event_file(path: &Path, file_name: &str, result: &mut CollectionResult) {
@@ -454,6 +506,92 @@ mod tests {
         assert!(result.events.is_empty());
         assert_eq!(result.dropped, 1);
         assert_eq!(result.malformed, ["worker-1.jsonl:1: unparsable_record"]);
+    }
+
+    #[test]
+    fn events_a_hook_dropped_reach_the_result_even_though_no_line_exists() {
+        // The regression this pair of tests exists for. A worker overflowed its
+        // ring and counted 200000 lost events into the sidecar beside its
+        // stream. Before the collector read that file, the directory answered
+        // "one event, nothing lost" and the report called the run complete.
+        let dir = TempDir::new("hook-drops");
+        dir.write("worker-1.jsonl", &line("api.openai.com"));
+        dir.write(
+            "worker-1.jsonl.status.json",
+            r#"{"hook_status":"active","reason":"","dropped_events_count":200000,
+                "written_events_count":1,"failures":[]}"#,
+        );
+
+        let result = collect(dir.path());
+
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(result.dropped, 200_000);
+        assert_eq!(
+            result.malformed,
+            ["worker-1.jsonl.status.json: hook_dropped_events: 200000"]
+        );
+    }
+
+    #[test]
+    fn a_status_file_is_never_read_back_as_an_event() {
+        // It sits in the same directory as the streams, so if the selection
+        // rule were wrong the accounting would arrive as a malformed record and
+        // the loss it reports would be replaced by a loss it caused.
+        let dir = TempDir::new("status-not-event");
+        dir.write("worker-1.jsonl", &line("api.openai.com"));
+        dir.write(
+            "worker-1.jsonl.status.json",
+            r#"{"hook_status":"active","reason":"","dropped_events_count":0,
+                "written_events_count":1,"failures":[]}"#,
+        );
+
+        let result = collect(dir.path());
+
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(result.dropped, 0);
+        assert!(result.malformed.is_empty());
+    }
+
+    #[test]
+    fn a_process_that_ran_un_hooked_is_visible_in_the_result() {
+        let dir = TempDir::new("hook-off");
+        dir.write(
+            "worker-1.jsonl.status.json",
+            r#"{"hook_status":"disabled","reason":"install_failed",
+                "dropped_events_count":0,"written_events_count":0,
+                "failures":["writer.drain:OSError"]}"#,
+        );
+
+        let result = collect(dir.path());
+
+        assert!(result.events.is_empty());
+        assert_eq!(
+            result.malformed,
+            [
+                "worker-1.jsonl.status.json: hook_failure: writer.drain:OSError",
+                "worker-1.jsonl.status.json: hook_not_active: install_failed",
+            ]
+        );
+    }
+
+    #[test]
+    fn losses_from_every_process_are_added_up() {
+        let dir = TempDir::new("hook-drops-many");
+        dir.write(
+            "a.jsonl.status.json",
+            r#"{"hook_status":"active","dropped_events_count":12,"failures":[]}"#,
+        );
+        dir.write(
+            "b.jsonl.status.json",
+            r#"{"hook_status":"active","dropped_events_count":30,"failures":[]}"#,
+        );
+
+        let result = collect(dir.path());
+
+        assert_eq!(result.dropped, 42);
+        // Each entry names its own file: a total nobody can trace to a process
+        // is a number nobody can act on.
+        assert_eq!(result.malformed.len(), 2);
     }
 
     #[test]

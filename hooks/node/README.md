@@ -53,7 +53,13 @@ One directory, two files per process:
 | File | Contents |
 |---|---|
 | `node-<pid>-<random>.jsonl` | One egress event per line, each valid against `egress-event.schema.json` |
-| `node-<pid>-<random>.jsonl.status.json` | What the hook itself did: whether it was active, how many events it recorded, how many it dropped, how many internal failures it swallowed |
+| `node-<pid>-<random>.jsonl.status.json` | What the hook itself did: `hook_status`, `reason`, `dropped_events_count`, `written_events_count`, `failures[]` |
+
+The status document is spelled exactly as the python hook spells it, and
+`periskop-runtime-collector` reads it back into the coverage statement: the drop
+count becomes `dropped_events`, and a hook that was off or failed becomes a
+diagnostic. A counter only one hook spells the way the reader expects is a
+counter that reaches nobody.
 
 The destination is a **directory**, not a file path, because that is what the
 event schema fixes and because multi process work then needs no coordination:
@@ -72,6 +78,14 @@ properties, so a status line written into the event stream would make that
 stream fail its own contract. Keeping the two apart also preserves the
 difference between "no calls were made" and "the hook never ran", which is a
 difference a coverage report has to be able to state.
+
+Neither variable has a default. Without a directory the hook stays off and says
+so, rather than choosing a destination on the operator's behalf. `NODE_OPTIONS`
+spreads down a whole process tree, so a default would mean every node process on
+a machine writing destination hosts, path templates, field paths and call sites
+into a shared directory nobody named, nobody collects and nobody clears. On a
+shared build host anyone can read those files. periskop must not itself be a
+source of egress.
 
 ## Event identity
 
@@ -97,7 +111,7 @@ itself is pinned to vectors shared with the python suite in `src/event-id.test.t
 | Variable | Default | Meaning |
 |---|---|---|
 | `PERISKOP_HOOK` | unset | Set to `0` to turn the hook off completely. Checked before anything else, so a disabled hook costs one lookup |
-| `PERISKOP_EVENT_DIR` | `<tmpdir>/periskop-events` | Directory the event stream and status file are written to, one `.jsonl` file per process |
+| `PERISKOP_EVENT_DIR` | none, and the hook stays off without it | Directory the event stream and status file are written to, one `.jsonl` file per process |
 | `PERISKOP_HOOK_DIR` | unset | Legacy name for the same directory. Kept so an existing deployment survives an upgrade; `PERISKOP_EVENT_DIR` wins when both are set |
 | `PERISKOP_HOOK_ENTRYPOINT` | basename of `argv[1]` | Name for this process in the event. Never a path; the schema rejects absolute paths in this field |
 | `PERISKOP_HOOK_BODY_LIMIT` | `65536` | Bodies larger than this are not parsed for field paths. The event declares the omission rather than reporting an empty shape |

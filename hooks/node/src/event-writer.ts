@@ -9,12 +9,23 @@
 // application, not to us. When it overflows the oldest event goes, and the count
 // of what went is reported through the status file. Dropping is acceptable;
 // dropping quietly is not.
+//
+// That last sentence is why the drain writes synchronously off the timer rather
+// than through a write stream. A stream write reports its failure later, on an
+// event, by which time the batch has already been spliced out of the buffer and
+// there is nothing left to attribute the loss to; Node's own documentation says
+// the per-write callback "may or may not" be called with the error, so the count
+// cannot be recovered there either. A container whose disk filled up would then
+// record five thousand events, write none of them, and report zero dropped. The
+// synchronous write is off the application's call path, it costs one blocking
+// append per flush interval, and it makes the outcome of every write knowable at
+// the moment it happens, which is the only way a loss can be counted at all.
 
 import { randomBytes } from "node:crypto";
-import { appendFileSync, createWriteStream, mkdirSync, type WriteStream } from "node:fs";
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { countDropped, countRecorded, snapshot } from "./hook-status";
+import { countDropped, countWritten, noteFailure, snapshot } from "./hook-status";
 import type { EgressEvent } from "./egress-event";
 
 export interface EventSink {
@@ -24,6 +35,9 @@ export interface EventSink {
 }
 
 const FLUSH_INTERVAL_MS = 200;
+
+/** Stage the sink reports failures under, matching the Python hook's spelling. */
+const STAGE_FLUSH = "writer.flush";
 
 /**
  * File this process appends to, unique among every writer in the directory.
@@ -43,7 +57,6 @@ export class FileEventSink implements EventSink {
   readonly #limit: number;
   readonly #eventPath: string;
   readonly #statusPath: string;
-  #stream: WriteStream | undefined;
   #timer: NodeJS.Timeout | undefined;
   #closed = false;
 
@@ -72,7 +85,6 @@ export class FileEventSink implements EventSink {
       countDropped();
     }
     this.#pending.push(JSON.stringify(event));
-    countRecorded();
     this.#schedule();
   }
 
@@ -86,23 +98,33 @@ export class FileEventSink implements EventSink {
     this.#timer.unref();
   }
 
+  /**
+   * Write what is buffered, and count it either way.
+   *
+   * The batch stays in the buffer across the write. Nothing is removed until its
+   * fate is known, so a failed write counts exactly the events it lost instead
+   * of losing them off the end of a splice. Nothing else runs between the write
+   * and the removal: the append is synchronous, so the buffer cannot grow under
+   * it.
+   */
   #flush(): void {
-    if (this.#pending.length === 0) return;
-    const batch = this.#pending.splice(0, this.#pending.length).join("\n");
-    if (this.#stream === undefined) {
-      this.#stream = createWriteStream(this.#eventPath, { flags: "a" });
-      // A write error here is the hook's problem and nobody else's.
-      this.#stream.on("error", () => undefined);
+    const count = this.#pending.length;
+    if (count === 0) return;
+    try {
+      appendFileSync(this.#eventPath, `${this.#pending.join("\n")}\n`);
+      countWritten(count);
+    } catch {
+      countDropped(count);
+      noteFailure(STAGE_FLUSH);
     }
-    this.#stream.write(`${batch}\n`);
+    this.#pending.length = 0;
   }
 
   /**
    * Drain on the way out.
    *
-   * This is the one synchronous write in the file, and it is deliberate: at exit
-   * there is no call path left to slow down, and the alternative is losing every
-   * event that was still in the buffer when the process ended.
+   * At exit there is no call path left to slow down, and the alternative is
+   * losing every event that was still in the buffer when the process ended.
    */
   close(): void {
     if (this.#closed) return;
@@ -111,15 +133,7 @@ export class FileEventSink implements EventSink {
       clearTimeout(this.#timer);
       this.#timer = undefined;
     }
-    try {
-      if (this.#pending.length > 0) {
-        const batch = this.#pending.splice(0, this.#pending.length).join("\n");
-        appendFileSync(this.#eventPath, `${batch}\n`);
-      }
-      this.#stream?.end();
-    } catch {
-      // Nothing left to do about it, and nothing worth failing an exit over.
-    }
+    this.#flush();
     this.#writeStatus();
   }
 
@@ -128,13 +142,19 @@ export class FileEventSink implements EventSink {
    *
    * Spec section 5 wants a disabled hook to be visible rather than indistinct
    * from a quiet one, and ADR-009 wants dropped events counted. Neither fits in
-   * the event schema, which is a closed set of properties, so both land here.
+   * the event schema, which is a closed set of properties, so both land here,
+   * where `periskop-runtime-collector` reads them back into the coverage
+   * statement.
+   *
+   * Written rather than appended: a second line would make the file two JSON
+   * documents, and the reader would take neither.
    */
   #writeStatus(): void {
     try {
-      appendFileSync(this.#statusPath, `${JSON.stringify(snapshot())}\n`);
+      writeFileSync(this.#statusPath, `${JSON.stringify(snapshot())}\n`);
     } catch {
-      // The status file is a courtesy to an operator, not a correctness concern.
+      // The one loss that cannot be reported anywhere, since this is the thing
+      // that does the reporting.
     }
   }
 }

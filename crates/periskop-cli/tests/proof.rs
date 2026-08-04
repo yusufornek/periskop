@@ -41,7 +41,9 @@ const PROVIDER_PATH: &str = "/v1/chat/completions";
 const PROVIDER_VERB: &str = "POST";
 
 /// Set this in continuous integration so a machine without python3 fails the
-/// gate rather than skipping it.
+/// gate rather than skipping it. The `rust` job in `.github/workflows/ci.yml`
+/// sets it on the `cargo test --workspace` step, which is what makes a green
+/// pipeline mean the gate ran.
 ///
 /// The default is the other way round because a developer without a Python
 /// interpreter should still be able to run `cargo test`, and a hard failure
@@ -437,10 +439,20 @@ fn f2_gate_the_hook_records_a_call_the_static_scanner_cannot_see() {
 /// provider, and none of it may reach the event stream.
 #[test]
 fn f2_gate_no_payload_content_reaches_the_event_stream() {
-    let Ok(interpreter) = python_interpreter() else {
-        // The gate test above is what records and reports a skip; duplicating
-        // that here would write the artefact twice with different contents.
-        return;
+    let interpreter = match python_interpreter() {
+        Ok(interpreter) => interpreter,
+        Err(reason) => {
+            // The gate above owns the artefact; writing it here too would leave
+            // two records of one run. What is not delegated is the switch. A
+            // variable that turned a skip into a failure in one test of this
+            // file and left the other silent would cover half the gate while
+            // reading like it covered the whole of it.
+            assert!(
+                std::env::var_os(REQUIRE_PROOF).is_none(),
+                "{REQUIRE_PROOF} is set and the F2 gate cannot run: {reason}"
+            );
+            return;
+        }
     };
 
     let tree = TempTree::new("no-content-leak");

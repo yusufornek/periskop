@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
@@ -71,8 +72,59 @@ test("the buffer is bounded, and what it drops is counted", (t) => {
   assert.equal(lines.length, 4);
   // Drop-oldest, so the events that survive are the most recent ones.
   assert.ok(lines[0]?.includes("ee_0000000000000006"));
-  assert.equal(snapshot().dropped_events, 6);
-  assert.equal(snapshot().recorded_events, 10);
+  assert.equal(snapshot().dropped_events_count, 6);
+  assert.equal(snapshot().written_events_count, 4);
+});
+
+test("a write that fails counts every event it lost", (t) => {
+  // The failure this accounting exists for. A CI container fills its disk, five
+  // thousand calls are observed, and the write fails. The batch had already
+  // left the buffer, so before this the counters read "nothing recorded, nothing
+  // dropped" and the report called the run clean. The buffer is not emptied
+  // until the write returns, so the loss is countable in every outcome.
+  resetStatus();
+  const { dir, cleanup } = sandbox();
+  t.after(cleanup);
+
+  const sink = new FileEventSink(dir, 108, 16);
+  sink.record(event("ee_0000000000000007"));
+  sink.record(event("ee_0000000000000008"));
+  // The stream's own directory is removed underneath it, which is what a
+  // revoked mount or a cleaned scratch space looks like from in here.
+  rmSync(dir, { recursive: true, force: true });
+  sink.close();
+
+  assert.equal(snapshot().dropped_events_count, 2);
+  assert.equal(snapshot().written_events_count, 0);
+  // And the failure is named, so an operator can tell a full disk from a hook
+  // that was never installed.
+  assert.deepEqual(snapshot().failures, ["writer.flush"]);
+});
+
+test("the status document is the one the collector reads", (t) => {
+  // Property names, not just values. The Python hook writes these five and
+  // periskop-runtime-collector looks for them; a counter spelled differently
+  // here is a counter that reaches nobody, which is what "dropped_events"
+  // used to be.
+  resetStatus();
+  const { dir, cleanup } = sandbox();
+  t.after(cleanup);
+
+  const sink = new FileEventSink(dir, 109, 16);
+  sink.record(event("ee_0000000000000009"));
+  sink.close();
+
+  const status = JSON.parse(readFileSync(sink.statusPath, "utf8")) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(status).sort(), [
+    "dropped_events_count",
+    "failures",
+    "hook_status",
+    "reason",
+    "written_events_count",
+  ]);
+  assert.equal(status["hook_status"], "active");
+  assert.equal(status["written_events_count"], 1);
+  assert.equal(status["dropped_events_count"], 0);
 });
 
 test("the hook's own account of itself lands beside the events, not inside them", (t) => {
@@ -89,9 +141,9 @@ test("the hook's own account of itself lands beside the events, not inside them"
   assert.ok(sink.statusPath.endsWith(".status.json"));
   assert.ok(!sink.statusPath.endsWith(".jsonl"));
   const status = JSON.parse(readFileSync(sink.statusPath, "utf8")) as Record<string, unknown>;
-  assert.equal(status["status"], "active");
-  assert.equal(status["recorded_events"], 1);
-  assert.equal(status["dropped_events"], 0);
+  assert.equal(status["hook_status"], "active");
+  assert.equal(status["written_events_count"], 1);
+  assert.equal(status["dropped_events_count"], 0);
 });
 
 test("the stream is a .jsonl file named after the process that writes it", (t) => {

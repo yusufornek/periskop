@@ -64,11 +64,44 @@ test("the leak filter still holds for a key that is also on the allow list", () 
   assert.equal(maskKey("model/2024"), "<dyn>");
 });
 
+test("a short digit run is enough to make a key suspect", () => {
+  // The threshold used to be six digits here and four in the Python hook, so a
+  // key like this was masked in one process and copied into the record in the
+  // other. Four is the stricter of the two, and the stricter one wins: a leak
+  // filter that holds in only half the deployment holds nowhere.
+  assert.equal(maskKey("hesap1234"), "<dyn>");
+  assert.equal(maskKey("model"), "model");
+});
+
+test("no entry of the allow list can be admitted by widening it carelessly", () => {
+  // Gate one applied to the allow list itself, the way the Python hook applies
+  // it at import time: every recognised key must survive the leak filter, or the
+  // filter is being routed around by the very list it protects.
+  for (const key of ["messages", "model", "generationConfig", "max_completion_tokens"]) {
+    assert.equal(maskKey(key), key);
+  }
+});
+
 test("traversal stops at depth six and says where it stopped", () => {
   const deep = { messages: { content: { text: { data: { parts: { items: { name: 1 } } } } } } };
   const { paths, truncatedDepth } = fieldPaths(deep);
   assert.equal(truncatedDepth, 7);
-  assert.ok(paths.every((path) => path.split(".").length <= 6));
+  // The path reached before the stop is still recorded. Dropping it would leave
+  // the branch looking empty, and an empty branch reads as a smaller call than
+  // the one that happened.
+  assert.deepEqual(paths, ["messages.content.text.data.parts.items.name"]);
+});
+
+test("the deepest stop is the one reported, not the first", () => {
+  // Two stops in one payload: an array sampled near the top and a walk cut off
+  // near the bottom. Reporting the shallow one would describe a seven level
+  // payload as a two level one, which is the reading the schema field exists to
+  // prevent.
+  const both = {
+    tools: Array.from({ length: 20 }, () => ({ type: "function" })),
+    messages: { content: { text: { data: { parts: { items: { name: 1 } } } } } },
+  };
+  assert.equal(fieldPaths(both).truncatedDepth, 7);
 });
 
 test("a shallow payload reports no truncation", () => {

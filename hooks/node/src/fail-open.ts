@@ -15,10 +15,15 @@
 // invoked outside these helpers so that its return value and its exceptions
 // reach the caller exactly as they would have without the hook.
 
-import { countFailure } from "./hook-status";
+import { noteFailure } from "./hook-status";
+
+// Stage these helpers report under. They wrap observation work whose caller has
+// no name for the step, so the label says where it was swallowed rather than
+// pretending to more precision than the call site gives.
+const STAGE = "hook.observe";
 
 function note(error: unknown): void {
-  countFailure();
+  noteFailure(STAGE);
   if (process.env["PERISKOP_HOOK_DEBUG"] !== "1") return;
   try {
     const detail = error instanceof Error ? error.message : String(error);

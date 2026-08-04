@@ -5,9 +5,6 @@
 // into the image. A config file would add a read, a parse and a failure mode to
 // process startup for no gain.
 
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-
 import { entrypointName } from "./process-gate";
 
 /**
@@ -17,6 +14,17 @@ import { entrypointName } from "./process-gate";
  * coordination: every process picks its own file inside it. A file path would
  * make the caller responsible for inventing a unique name per process, and two
  * processes appending to one file interleave their writes and corrupt lines.
+ *
+ * There is no default, and the absence is the decision. NODE_OPTIONS spreads
+ * down a whole process tree, so a developer who sets it in a shell profile and
+ * names no directory would have every Node process on the machine writing
+ * observations into a shared temporary directory: destination hosts, path
+ * templates, field paths, and the file and function each call came from. Nobody
+ * collects those files and nobody deletes them, and on a shared build host
+ * anyone can read them. "periskop must not itself be a source of egress" is not
+ * a rule that bends for convenience, and a directory the operator never named is
+ * exactly the case it was written for. Without one the hook stays off and says
+ * so, which is what the Python hook already did.
  */
 export const EVENT_DIR = "PERISKOP_EVENT_DIR";
 
@@ -24,8 +32,13 @@ export const EVENT_DIR = "PERISKOP_EVENT_DIR";
 export const LEGACY_EVENT_DIR = "PERISKOP_HOOK_DIR";
 
 export interface HookConfig {
-  /** Directory the event stream and the status file are written to. */
-  readonly outputDir: string;
+  /**
+   * Directory the event stream and the status file are written to.
+   *
+   * Undefined when neither variable named one, which switches the hook off
+   * rather than choosing a destination on the operator's behalf.
+   */
+  readonly outputDir: string | undefined;
   /** Name of this process as it will appear in the event, never a path. */
   readonly entrypointHint: string;
   /** Above this many bytes a body is not parsed for field paths. */
@@ -64,9 +77,8 @@ export function readConfig(
   env: NodeJS.ProcessEnv,
   argv: readonly string[],
 ): HookConfig {
-  const configuredDir = firstNonEmpty(env[EVENT_DIR], env[LEGACY_EVENT_DIR]);
   return {
-    outputDir: configuredDir ?? join(tmpdir(), "periskop-events"),
+    outputDir: firstNonEmpty(env[EVENT_DIR], env[LEGACY_EVENT_DIR]),
     // An operator can name the process; otherwise the script names itself. The
     // event schema rejects absolute paths here, so only a basename is ever used.
     entrypointHint: env["PERISKOP_HOOK_ENTRYPOINT"] ?? entrypointName(argv),
