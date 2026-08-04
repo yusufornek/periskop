@@ -1,0 +1,29 @@
+# Grammar versions the scanner is built against.
+#
+# Upgrading any entry here changes what the parser sees, which can move a finding
+# from confirmed to missing without a single rule changing. Treat a bump as a
+# behavioural change: rerun the detection benchmark before merging it.
+#
+# Exact resolution is enforced by Cargo.lock. This file exists so the grammar set
+# is reviewable on its own, without reading a lockfile that also contains every
+# transitive build dependency.
+
+[[grammar]]
+crate = "tree-sitter"
+version = "0.25.10"
+provides = "runtime"
+
+[[grammar]]
+crate = "tree-sitter-python"
+version = "0.25.0"
+provides = "python"
+
+[[grammar]]
+crate = "tree-sitter-typescript"
+version = "0.23.2"
+provides = "typescript, tsx"
+
+[[grammar]]
+crate = "tree-sitter-javascript"
+version = "0.25.0"
+provides = "javascript"
