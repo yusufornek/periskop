@@ -18,7 +18,8 @@ use periskop_core::finding::{
 use periskop_core::ids::short_hash;
 use streaming_iterator::StreamingIterator;
 
-use crate::engine::bindings::{self, BindingTable};
+use crate::engine::{bindings, bindings_ts, BindingTable};
+use crate::language::Language;
 use crate::parser::ParsedFile;
 use crate::rules::model::{Confidence as RuleConfidence, MatchSpec, RuleFile};
 use crate::rules::CompiledRules;
@@ -32,10 +33,20 @@ pub struct FileFindings {
     pub unclaimed_imports: Vec<String>,
 }
 
+/// Builds the binding table using the collector for the file's grammar.
+fn collect_bindings(parsed: &ParsedFile) -> BindingTable {
+    match parsed.language() {
+        Language::Python => bindings::collect_python(parsed.root_node(), parsed.source()),
+        Language::TypeScript | Language::Tsx | Language::JavaScript => {
+            bindings_ts::collect(parsed.root_node(), parsed.source())
+        }
+    }
+}
+
 /// Runs the compiled rule set over one parsed file.
 pub fn detect(parsed: &ParsedFile, compiled: &CompiledRules, rules: &[RuleFile]) -> FileFindings {
     let source = parsed.source();
-    let table = bindings::collect_python(parsed.root_node(), source);
+    let table = collect_bindings(parsed);
 
     let mut out = FileFindings::default();
     let mut cursor = tree_sitter::QueryCursor::new();

@@ -1,0 +1,43 @@
+# OpenAI JavaScript and TypeScript SDK.
+#
+# One rule family serves .ts, .tsx, .js and .mjs. The call shapes are identical
+# across them, and keeping two copies would let the copies drift.
+
+schema_version = "1.0"
+language = "typescript"
+provider = "openai"
+rule_id = "typescript.static.openai-client-call"
+rule_version = "1.0.0"
+
+[[match]]
+kind = "call"
+query = '''
+(call_expression
+  function: (member_expression
+    object: (_) @recv
+    property: (property_identifier) @method)
+  arguments: (arguments) @args
+  (#match? @method "^(create|parse|stream)$")) @call
+'''
+
+[match.binding]
+capture = "recv"
+resolves_to = { module = "openai", symbol_path = ["default", "OpenAI", "AzureOpenAI"] }
+
+[match.method]
+capture = "method"
+one_of = ["create", "parse", "stream"]
+
+[extract]
+model = { from = "args", keyword = "model" }
+payload_ref = { from = "args", keyword = "messages" }
+base_url = { from = "recv", constructor_keyword = "baseURL" }
+
+[classify]
+egress_kind = "llm_chat"
+default_confidence = "confirmed"
+
+[[classify.downgrade]]
+when = "base_url.unresolved"
+to = "suspect"
+coverage_note = "target_host_unresolved"

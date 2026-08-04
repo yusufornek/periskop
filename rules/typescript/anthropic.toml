@@ -1,0 +1,34 @@
+# Anthropic JavaScript and TypeScript SDK, published under a scoped name.
+
+schema_version = "1.0"
+language = "typescript"
+provider = "anthropic"
+rule_id = "typescript.static.anthropic-messages-call"
+rule_version = "1.0.0"
+
+[[match]]
+kind = "call"
+query = '''
+(call_expression
+  function: (member_expression
+    object: (_) @recv
+    property: (property_identifier) @method)
+  arguments: (arguments) @args
+  (#match? @method "^(create|stream)$")) @call
+'''
+
+[match.binding]
+capture = "recv"
+resolves_to = { module = "@anthropic-ai/sdk", symbol_path = ["default", "Anthropic"] }
+
+[match.method]
+capture = "method"
+one_of = ["create", "stream"]
+
+[extract]
+model = { from = "args", keyword = "model" }
+payload_ref = { from = "args", keyword = "messages" }
+
+[classify]
+egress_kind = "llm_chat"
+default_confidence = "confirmed"

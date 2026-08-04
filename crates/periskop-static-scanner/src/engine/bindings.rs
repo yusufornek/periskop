@@ -27,6 +27,22 @@ pub struct BindingTable {
 }
 
 impl BindingTable {
+    /// Binds a local name to a fully qualified path.
+    pub fn bind(&mut self, local: String, path: String) {
+        self.resolved.insert(local, path);
+    }
+
+    /// Records that the file imported a module, whether or not anything bound.
+    pub fn record_module(&mut self, module: &str) {
+        self.imported_modules.push(module.to_owned());
+    }
+
+    /// Normalises the module list. Called once collection is complete.
+    pub fn finish(&mut self) {
+        self.imported_modules.sort();
+        self.imported_modules.dedup();
+    }
+
     pub fn resolve(&self, name: &str) -> Option<&str> {
         self.resolved.get(name).map(String::as_str)
     }
@@ -88,8 +104,7 @@ pub fn collect_python(root: Node<'_>, source: &str) -> BindingTable {
         stack.extend(node.children(&mut cursor));
     }
 
-    table.imported_modules.sort();
-    table.imported_modules.dedup();
+    table.finish();
     table
 }
 
@@ -208,12 +223,21 @@ fn collect_assignment(node: Node<'_>, source: &str, table: &mut BindingTable) {
 }
 
 /// Leftmost identifier of an attribute chain: `a.b.c` yields `a`.
+///
+/// Node names differ per grammar, so both vocabularies are listed. Python calls
+/// the node `attribute`, JavaScript calls it `member_expression`, and a resolver
+/// that only knows one of them silently stops resolving in the other language.
 pub fn root_identifier(node: Node<'_>, source: &str) -> Option<String> {
     let mut current = node;
     loop {
         match current.kind() {
-            "identifier" => return Some(text(current, source)),
-            "attribute" | "call" => {
+            "identifier" | "shorthand_property_identifier" => return Some(text(current, source)),
+            "attribute"
+            | "call"
+            | "member_expression"
+            | "call_expression"
+            | "new_expression"
+            | "parenthesized_expression" => {
                 current = current
                     .child_by_field_name("object")
                     .or_else(|| current.child_by_field_name("function"))?;

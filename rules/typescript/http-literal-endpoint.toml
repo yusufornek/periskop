@@ -1,0 +1,48 @@
+# fetch and axios calls addressed straight at a provider endpoint.
+#
+# As on the Python side, the destination is what the rule keys on. Matching every
+# fetch in a codebase would bury the findings that matter.
+
+schema_version = "1.0"
+language = "typescript"
+provider = "unknown"
+rule_id = "typescript.static.http-provider-endpoint"
+rule_version = "1.0.0"
+
+[[match]]
+kind = "http_request"
+query = '''
+(call_expression
+  function: (identifier) @fn
+  arguments: (arguments
+    .
+    (string) @url)
+  (#eq? @fn "fetch")
+  (#match? @url "(api\\.openai\\.com|api\\.anthropic\\.com|generativelanguage\\.googleapis\\.com|openai\\.azure\\.com)")) @call
+'''
+
+[[match]]
+kind = "http_request"
+query = '''
+(call_expression
+  function: (member_expression
+    object: (identifier) @client
+    property: (property_identifier) @verb)
+  arguments: (arguments
+    .
+    (string) @url)
+  (#match? @verb "^(post|get|put|request)$")
+  (#match? @url "(api\\.openai\\.com|api\\.anthropic\\.com|generativelanguage\\.googleapis\\.com|openai\\.azure\\.com)")) @call
+'''
+
+[extract]
+target_url = { from = "url" }
+
+[classify]
+egress_kind = "llm_chat"
+default_confidence = "confirmed"
+
+[[classify.downgrade]]
+when = "target_url.unresolved"
+to = "suspect"
+coverage_note = "target_host_unresolved"

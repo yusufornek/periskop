@@ -5,6 +5,7 @@
 //! a new provider is a rule plus fixtures rather than a patch here.
 
 pub mod bindings;
+pub mod bindings_ts;
 pub mod detect;
 
 pub use bindings::BindingTable;
