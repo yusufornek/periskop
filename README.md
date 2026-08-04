@@ -10,10 +10,14 @@ unscanned file.
 There is a second source. Runtime hooks for Python and Node record the calls a
 process actually made, and reconciling the two produces findings neither yields
 alone: a call site nothing was seen to use, and a call that reached a destination
-the code does not name. A third source, a network sensor, is designed and not
-built, so periskop today compares what the code says against what the process
-observed about itself. That is not the same as what left the machine, and the
-report does not pretend otherwise.
+the code does not name.
+
+A third source reconciles both of those against the wire, and the pipeline for it
+is built: flows are recorded, scoped, joined against the other two sources and
+turned into findings, including traffic that no call site and no runtime call
+accounts for. What is not built is the part that watches a real kernel. Until it
+is, the flow records have to come from somewhere, and a run handed none says so
+instead of reporting a quiet clean.
 
 ## Status
 
@@ -25,18 +29,24 @@ Implemented:
 - Runtime hooks for Python and Node. They record the shape of an outgoing call,
   never its content, and they are fail-open: the application runs whether or not
   the hook does.
-- Reconciliation of those two sources, deriving `dormant_egress_point` and
-  `target_drift`.
+- Reconciliation across all three sources, deriving `dormant_egress_point`,
+  `target_drift`, `unmatched_wire_traffic` and `volume_anomaly`. The last two
+  need flow records, and `volume_anomaly` also needs a band declared in policy.
+  With no band declared it produces nothing rather than inventing the threshold
+  it is supposed to measure against.
+- Detached Ed25519 signing, and verification that fails closed. The signature
+  covers the bytes on disk rather than a reserialised value, so nothing a lenient
+  parser would forgive can travel between what was signed and what a reader sees.
 - A command line interface and an MCP server, both thin clients over one engine.
 
 Not implemented:
 
-- The network sensor. Nothing in this tree captures traffic. The two derived
-  finding kinds that need the wire, `unmatched_wire_traffic` and
-  `volume_anomaly`, are therefore never produced, and a run states that in its
-  diagnostics rather than leaving the absence to be inferred. The record schema
-  and its Rust data model exist ahead of the sensor itself; no component reads
-  them yet.
+- Kernel capture. Nothing in this tree attaches to a kernel and watches traffic.
+  The DNS and TLS parsers, the scoping rules, the record decoder and the
+  privilege gate are written and tested; the eBPF program they would read from is
+  not, and the loader crate carries no kernel dependency yet (ADR-014). Asked to
+  observe, `periskop sensor` reports what it could not do and why, rather than
+  returning an empty result that reads like a quiet network.
 - The masking proxy. Nothing here intercepts, rewrites or masks a request.
 
 See "Scope" below for what the implemented half does not cover.
@@ -186,6 +196,62 @@ The directory is also read from `PERISKOP_EVENT_DIR`, which is what `hook
 install` prints, so a hooked project need not repeat it. With events the report
 declares itself reconciled rather than static only, and a path that does not
 resolve stops the run instead of being read as a stream with nothing in it.
+
+### Watching the wire
+
+Both sources above look out from inside the process. The third looks in from
+outside, and it is the only one that can see a connection neither the code nor a
+hooked call accounts for.
+
+```bash
+periskop sensor --out .periskop/flows --scope-process ./my-service
+```
+
+Naming the processes that belong to the codebase is what makes attribution
+possible. With none named, every flow lands in `out_of_scope_process` and no
+unmatched traffic finding can come out of the pass. That is still a legitimate
+way to run it, so the flag is not required, but the status document says what it
+cost rather than leaving an empty result to be read as a quiet machine.
+
+This wants `CAP_BPF` and `CAP_PERFMON` on a Linux host with BTF, and the kernel
+side is not written yet. Anywhere else it writes an empty record set, says why,
+and exits non zero.
+
+```bash
+periskop scan . --events .periskop/events --flows .periskop/flows
+```
+
+With three sources the report says `full` and can derive traffic nothing in the
+codebase explains. `volume_anomaly` additionally needs a band, which is the one
+threshold with no engine default:
+
+```toml
+[reconciliation.volume_band]
+min_basis_points = 5000
+max_basis_points = 30000
+```
+
+That goes in `periskop-policy.toml` at the project root, or a file named with
+`--policy`. Undeclared, the rule reports as suppressed rather than measuring
+against a number periskop made up.
+
+### Signing a report
+
+```bash
+periskop key generate --secret-key signing.key --public-key signing.pub
+periskop sign --report report.json --key signing.key
+periskop verify --report report.json --public-key signing.pub
+```
+
+Both paths are required and there is no default location, because a key written
+somewhere you did not name is a key you will not think to protect. `verify` exits
+non zero for every outcome but one: an unsigned report, an altered one, a key
+that was not named and an envelope that fails its schema are all refusals, and
+none of them can be mistaken for a pass.
+
+The signature says the report came from the named key unaltered. It says nothing
+about whether the scan was complete or correct, which is what the coverage block
+is for.
 
 ### Editor integration
 
