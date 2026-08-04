@@ -153,34 +153,38 @@ impl ChainMac {
     /// removes the length signal: a claim of the wrong length produces a digest
     /// of the same width rather than an early exit.
     pub(super) fn verify(&self, computed: &ChainTag, claimed: &[u8]) -> bool {
-        let Some(blinded_claim) = self.blind(claimed) else {
+        // Both sides fail only on an HMAC key of an unacceptable length, and this
+        // key is a constant 32 bytes. The reason is collapsed here rather than in
+        // two separate places, and it is collapsed to `false` rather than carried
+        // out: this method answers a security question, and a `Result` would hand
+        // a caller somewhere to write `unwrap_or(true)`.
+        let (Ok(blinded_claim), Ok(mut mac)) = (self.blind(claimed), self.keyed()) else {
             return false;
         };
-        match Hmac::<Sha256>::new_from_slice(self.key.as_bytes()) {
-            Ok(mut mac) => {
-                mac.update(computed.as_bytes());
-                mac.verify_slice(&blinded_claim).is_ok()
-            }
-            // A 32 byte key is always an acceptable HMAC key, so this arm is
-            // unreachable. It answers "no match" rather than panicking, because a
-            // panic inside the vault is an outage with no diagnosis.
-            Err(_) => false,
-        }
+        mac.update(computed.as_bytes());
+        mac.verify_slice(&blinded_claim).is_ok()
     }
 
     /// One side of the comparison above.
-    fn blind(&self, bytes: &[u8]) -> Option<Vec<u8>> {
-        let mut mac = Hmac::<Sha256>::new_from_slice(self.key.as_bytes()).ok()?;
+    fn blind(&self, bytes: &[u8]) -> Result<Vec<u8>, VaultError> {
+        let mut mac = self.keyed()?;
         mac.update(bytes);
-        Some(mac.finalize().into_bytes().to_vec())
+        Ok(mac.finalize().into_bytes().to_vec())
+    }
+
+    /// The one place this module builds an HMAC under the chain key.
+    ///
+    /// HMAC accepts a key of any length and this one is a constant 32 bytes, so
+    /// the error cannot fire. It is mapped rather than unwrapped because a panic
+    /// inside the vault is an outage with no diagnosis, and it is mapped **once**
+    /// so that there is a single sentence explaining it instead of one per call.
+    fn keyed(&self) -> Result<Hmac<Sha256>, VaultError> {
+        Hmac::<Sha256>::new_from_slice(self.key.as_bytes())
+            .map_err(|_| VaultError::KeyDerivationFailed)
     }
 
     fn tag(&self, domain: &[u8], parts: &[&[u8]]) -> Result<ChainTag, VaultError> {
-        let mut mac = Hmac::<Sha256>::new_from_slice(self.key.as_bytes())
-            // HMAC accepts a key of any length and this one is a constant 32
-            // bytes, so this cannot fire. Mapped rather than unwrapped for the
-            // same reason as everywhere else in this module.
-            .map_err(|_| VaultError::KeyDerivationFailed)?;
+        let mut mac = self.keyed()?;
         mac.update(domain);
         for part in parts {
             mac.update(part);

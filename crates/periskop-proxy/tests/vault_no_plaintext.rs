@@ -16,6 +16,16 @@
 //! | `TRACE` level output | every `Debug` and `Display` rendering of every vault type a caller can reach, plus every refusal message |
 //! | `/admin/*` responses | the body of `GET /admin/vault/status` |
 //! | the `ProxyEvent` record | the counters the vault contributes to it |
+//! | `stdout` and `stderr` | everything a real child process that opens, loads and compacts a vault wrote to either stream |
+//!
+//! The last row was missing, and its absence was a hole in this gate rather than a
+//! narrower claim: a single `dbg!(plaintext)` added to `record::seal` writes every
+//! masked value to `stderr`, and none of the five surfaces above would have seen a
+//! byte of it. The stream is captured from the child that leaves the compaction
+//! candidate, so it is a real process's real output rather than a description of
+//! one, and it is backed by `no_vault_source_writes_to_a_process_stream` plus the
+//! crate level `deny` in `src/lib.rs`, because a leak on a code path this lifecycle
+//! does not reach would still be a leak.
 //!
 //! # Two profiles, because one would prove something narrower
 //!
@@ -37,7 +47,7 @@
 //! serialisation derive appears on a vault type. Whoever adds either has to widen
 //! the surface list here in the same change.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -58,6 +68,8 @@ const CHILD_DELAY_US: &str = "PERISKOP_NO_PLAINTEXT_CHILD_DELAY_US";
 /// Which Argon2id profile the child opens under.
 const CHILD_PROFILE: &str = "PERISKOP_NO_PLAINTEXT_CHILD_PROFILE";
 const KILLED: i32 = 70;
+/// What the child prints once it has run every path that handles a plaintext.
+const CHILD_MARK: &str = "periskop-child-sealed-unsealed-and-projected";
 
 /// The values planted in the vault, and hunted for afterwards.
 ///
@@ -119,6 +131,36 @@ fn compaction_child_terminates_itself_mid_run() {
     let mut vault = open_vault(&directory, profile).expect("the parent wrote a vault");
     let at = NOW + vault.limits().ttl_ms + 2;
 
+    // The child runs the whole lifecycle and not only the compaction, because the
+    // stream it is spawned to produce is a surface: sealing and unsealing are where
+    // a plaintext would be printed, and output captured from a process that never
+    // sealed anything would cover neither. Found by mutation, and by nothing else:
+    // an `eprintln!` of the plaintext in `record::seal` left this gate green while
+    // the child only opened and compacted.
+    //
+    // Before the killer thread starts, so the delay below is still measured against
+    // the compaction and this cannot fail part way.
+    for (kind, value) in PLANTED {
+        let alias = format!("PSK_{kind}_3");
+        vault
+            .store_alias(
+                &LIVE,
+                AliasSeed::from_bytes(seed_for(kind, 3)),
+                &alias,
+                value.as_bytes(),
+                at,
+            )
+            .expect("the child can seal a record");
+        let restored = vault.restore(&LIVE, &alias, at).expect("and open it again");
+        assert!(matches!(restored, Restored::Value(_)));
+    }
+    let status = vault.status().to_json();
+    assert!(status.contains("\"backend\":\"file\""), "{status}");
+    // The positive control for the stream surface, written by this process after it
+    // has sealed, unsealed and projected. If this line is missing from what the
+    // parent captured, the capture is not working and the search proves nothing.
+    eprintln!("{CHILD_MARK}");
+
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_micros(delay_us));
         std::process::exit(KILLED);
@@ -166,6 +208,7 @@ fn f4_gate_no_planted_value_reaches_any_surface_outside_this_process() {
     // a profile.
     no_logging_dependency_has_appeared();
     no_vault_type_can_serialise_itself();
+    no_vault_source_writes_to_a_process_stream();
 
     record_outcome(&covered, &skipped);
     assert!(
@@ -237,14 +280,22 @@ fn sweep(profile: ProfileName) -> Result<BTreeMap<String, Vec<u8>>, String> {
 
     // And a compaction that was killed, so that a real leftover candidate is on
     // the disk when the directory is read.
-    let candidate = leave_a_candidate(&scratch, profile)?;
+    let Killed { candidate, output } = leave_a_candidate(&scratch, profile)?;
     for (name, bytes) in scratch.files() {
         surfaces.insert(format!("file:{name}"), bytes);
     }
-    assert!(
-        surfaces.contains_key(&format!("file:{candidate}")),
-        "the killed compaction left no candidate to search"
-    );
+    let candidate_bytes = scratch
+        .files()
+        .remove(&candidate)
+        .ok_or_else(|| "the killed compaction left no candidate to search".to_owned())?;
+    // Named separately from the `file:` sweep above so that `check` can apply the
+    // positive control to this surface specifically. It is the file most likely to
+    // hold a leak and the one whose contents this test controls least.
+    surfaces.insert("candidate_file".to_owned(), candidate_bytes);
+
+    // Everything that child wrote to either stream while it opened a vault, loaded
+    // every record out of it and rebuilt the file from `M_0`.
+    surfaces.insert("process_output".to_owned(), output);
 
     Ok(surfaces)
 }
@@ -304,6 +355,32 @@ fn check(profile: ProfileName, surfaces: &BTreeMap<String, Vec<u8>>) {
             b"<redacted>"
         ),
         "the renderings surface is not what it claims to be"
+    );
+
+    // The temporary file surface, controlled the same way as the vault file. A
+    // candidate holding only its 128 byte header is a file the kill landed before
+    // any record reached it, and searching it proves nothing about the surface it
+    // stands for; requiring an alias in it is what makes the search meaningful.
+    let candidate = surfaces
+        .get("candidate_file")
+        .expect("the killed compaction's candidate is a surface");
+    assert!(
+        contains(candidate, alias_for("PERSON").as_bytes()),
+        "{} profile: the compaction candidate carries no record, so scanning it proves nothing",
+        profile.as_str()
+    );
+
+    // And the process output surface: the child's own harness line proves the
+    // stream was captured rather than lost to an inherited descriptor.
+    let output = surfaces
+        .get("process_output")
+        .expect("the child's output is a surface");
+    assert!(
+        contains(output, CHILD_MARK.as_bytes()),
+        "{} profile: the child's own output was not captured, so scanning it proves \
+         nothing. The harness buffers a test's output and `process::exit` discards \
+         the buffer, so the child has to be run with --nocapture.",
+        profile.as_str()
     );
 
     // The claim.
@@ -427,16 +504,16 @@ fn no_logging_dependency_has_appeared() {
     let manifest =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
             .expect("this crate has a manifest");
+    let named = dependency_names(&manifest);
 
-    // Dependency lines only. Matching anywhere in the file would make a comment
-    // containing the word "log" fail the gate, and a guard that cries wolf is a
-    // guard somebody deletes.
-    let named: Vec<&str> = manifest
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with('#'))
-        .filter_map(|line| line.split_once('=').map(|(name, _)| name.trim()))
-        .collect();
+    // A parser that read nothing would pass this guard for every logger ever
+    // added, so first: it reads this manifest. `zeroize` is declared here in the
+    // `name = { workspace = true }` form, and the two forms the previous reading
+    // missed are covered by `the_manifest_reader_sees_every_form_a_dependency_is_written_in`.
+    assert!(
+        named.contains("zeroize"),
+        "the manifest reader found no dependency it should have: {named:?}"
+    );
 
     for logger in [
         "tracing",
@@ -447,11 +524,151 @@ fn no_logging_dependency_has_appeared() {
         "tracing-subscriber",
     ] {
         assert!(
-            !named.contains(&logger),
+            !named.contains(logger),
             "`{logger}` is a dependency of this crate now, so TRACE output is a real \
              surface. Add its sink to the sweep in this test before removing this check."
         );
     }
+}
+
+/// The names of the crates a manifest depends on, in every form Cargo accepts.
+///
+/// This used to be `line.split_once('=')` over every line, and that reading was
+/// wrong in the two ways this repository actually writes manifests. `tracing.workspace
+/// = true` produced the name `"tracing.workspace"`, which matches no entry in the
+/// list above; and `[dependencies.tracing]` contains no `=` at all, so the line was
+/// discarded before it was compared. Both are idiomatic Cargo and the first is the
+/// form `periskop-proxy/Cargo.toml` already uses for every one of its dependencies,
+/// so the way past the gate was the ordinary way to add a dependency.
+///
+/// Renames are read too: `quiet = { package = "tracing" }` declares `tracing` under
+/// another name, and a guard that missed that would be asking the next person to
+/// pick a different key rather than to widen the sweep.
+fn dependency_names(manifest: &str) -> BTreeSet<String> {
+    /// The table headers under which a name is a crate this build links.
+    const KINDS: &[&str] = &["dependencies", "dev-dependencies", "build-dependencies"];
+
+    let mut names = BTreeSet::new();
+    let mut inside_a_dependency_table = false;
+
+    for line in manifest.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(header) = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            let segments: Vec<&str> = header
+                .trim_matches('[')
+                .trim_matches(']')
+                .split('.')
+                .collect();
+            let last = segments.last().copied().unwrap_or_default();
+            let second_last = segments.iter().rev().nth(1).copied().unwrap_or_default();
+
+            // `[dependencies]`, `[dev-dependencies]`, `[target.'cfg(unix)'.dependencies]`:
+            // what follows is one key per crate.
+            inside_a_dependency_table = KINDS.contains(&last);
+            // `[dependencies.tracing]`: the header itself names the crate, and what
+            // follows are that crate's own settings rather than more crates.
+            if KINDS.contains(&second_last) {
+                names.insert(unquote(last).to_owned());
+            }
+            continue;
+        }
+
+        if !inside_a_dependency_table {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        // `tracing.workspace = true` is a key path, and the crate is its first
+        // segment. `"tracing" = "0.1"` is the quoted form of the same thing.
+        let name = unquote(key.trim().split('.').next().unwrap_or_default());
+        if !name.is_empty() {
+            names.insert(name.to_owned());
+        }
+        if let Some(renamed) = package_name(value) {
+            names.insert(renamed.to_owned());
+        }
+    }
+    names
+}
+
+/// The crate a `package = "..."` key inside an inline table renames.
+fn package_name(value: &str) -> Option<&str> {
+    let after = value.split_once("package")?.1;
+    let quoted = after.split_once('"')?.1;
+    quoted.split_once('"').map(|(name, _)| name)
+}
+
+fn unquote(text: &str) -> &str {
+    text.trim().trim_matches('"').trim_matches('\'')
+}
+
+/// Nothing under `src/vault/` writes to a process stream.
+///
+/// This is the guard the `stdout` and `stderr` row of the table above stands on.
+/// The sweep can only search the output of the paths it happens to run, and a
+/// `dbg!` left in a branch this lifecycle does not reach would leak on somebody
+/// else's request while every surface here stayed clean. `src/lib.rs` denies these
+/// lints for the whole crate, which is the enforcement; this scan is what catches
+/// the `#[allow]` that would turn the denial off again, and it reads the same
+/// sources the vault's other boundary test reads.
+fn no_vault_source_writes_to_a_process_stream() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vault");
+    let mut sources = Vec::new();
+    collect_sources(&root, &mut sources);
+    assert!(
+        sources.len() >= 8,
+        "only {} vault sources found under {}",
+        sources.len(),
+        root.display()
+    );
+
+    // `panic!` is absent from this list because the workspace already denies
+    // `clippy::panic` outside test modules, which is a stronger check than a name
+    // scan. Everything here is a macro or a call clippy does not deny by default.
+    const STREAMS: &[&str] = &[
+        "println!",
+        "print!",
+        "eprintln!",
+        "eprint!",
+        "dbg!",
+        "io::stdout",
+        "io::stderr",
+        "allow(clippy::print_stdout",
+        "allow(clippy::print_stderr",
+        "allow(clippy::dbg_macro",
+    ];
+
+    let mut offences = Vec::new();
+    for source in &sources {
+        let text = std::fs::read_to_string(source).expect("a vault source");
+        for (number, line) in text.lines().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            for stream in STREAMS {
+                if code.contains(stream) {
+                    offences.push(format!(
+                        "{}:{} names {stream}",
+                        source.file_name().unwrap_or_default().to_string_lossy(),
+                        number + 1
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        offences.is_empty(),
+        "a vault source writes to a process stream, which is a surface this gate \
+         searches only where the lifecycle above happens to reach: {offences:#?}"
+    );
 }
 
 /// The `ProxyEvent` surface is a projection, and it stays one only while no vault
@@ -519,19 +736,43 @@ fn seed_for(kind: &str, salt: u8) -> [u8; 32] {
     seed
 }
 
-/// Kills a compaction until a candidate is left behind, and returns its name.
+/// What a killed compaction run left behind.
+struct Killed {
+    /// The name of the candidate file it did not get to rename.
+    candidate: String,
+    /// Everything it wrote to `stdout` and `stderr`, in that order.
+    output: Vec<u8>,
+}
+
+/// Kills a compaction until a usable candidate is left behind.
 ///
 /// Retried rather than timed: the window is short and a machine under load may
 /// miss it, and a gate that skipped a surface because the timing did not work out
 /// would be a gate that covers less on a busy day than on a quiet one.
-fn leave_a_candidate(scratch: &Scratch, profile: ProfileName) -> Result<String, String> {
+///
+/// "Usable" is the load bearing word. A candidate is only accepted once it carries
+/// a record, because the surface this produces is searched for planted values and
+/// a file holding nothing but a header would make that search pass while covering
+/// no record at all. `LOOKED_FOR` is an alias, which is in the candidate in the
+/// clear by design and is therefore the positive control the caller re-checks.
+fn leave_a_candidate(scratch: &Scratch, profile: ProfileName) -> Result<Killed, String> {
+    // The alias of a record that survives compaction, so it has to be in any
+    // candidate that got as far as writing records at all.
+    let looked_for = alias_for("PERSON");
     let before: Vec<String> = scratch.files().into_keys().collect();
-    for delay_us in [100u64, 250, 500, 900, 1_400, 2_200, 3_500, 5_000] {
-        let status = Command::new(std::env::current_exe().unwrap())
+
+    for delay_us in [100u64, 250, 500, 900, 1_400, 2_200, 3_500, 5_000, 8_000] {
+        let run = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "compaction_child_terminates_itself_mid_run",
                 "--ignored",
+                // Without this the harness buffers the child's own output and
+                // `process::exit` throws the buffer away, so the stream this test
+                // captures would be the harness's summary and never a line the
+                // vault wrote. Found by mutation: an `eprintln!` of the plaintext
+                // in `record::seal` went straight past a capture without it.
+                "--nocapture",
                 "--test-threads=1",
             ])
             .env(CHILD_DIRECTORY, scratch.directory())
@@ -540,31 +781,36 @@ fn leave_a_candidate(scratch: &Scratch, profile: ProfileName) -> Result<String, 
             .output()
             .map_err(|cause| format!("{cause}"))?;
         assert_eq!(
-            status.status.code(),
+            run.status.code(),
             Some(KILLED),
             "the child ended some other way: {}",
-            String::from_utf8_lossy(&status.stderr)
+            String::from_utf8_lossy(&run.stderr)
         );
 
-        // A candidate with nothing in it is a file the kill landed before the
-        // first write reached; it is a real outcome and a useless surface, so the
-        // search keeps going until there are bytes to look through.
-        if let Some((candidate, _)) = scratch
+        // A candidate that holds no record is a file the kill landed before the
+        // records reached it. It is a real outcome and a useless surface, so the
+        // search keeps going until there is a record to look through.
+        let found = scratch
             .files()
             .into_iter()
-            .find(|(name, bytes)| !before.contains(name) && !bytes.is_empty())
-        {
-            return Ok(candidate);
+            .find(|(name, bytes)| !before.contains(name) && contains(bytes, looked_for.as_bytes()));
+        if let Some((candidate, _)) = found {
+            let mut output = run.stdout;
+            output.extend_from_slice(&run.stderr);
+            return Ok(Killed { candidate, output });
         }
+
         // Whatever this run left is not a surface; clear it so the next attempt
         // starts from the same place.
-        for (name, bytes) in scratch.files() {
-            if !before.contains(&name) && bytes.is_empty() {
-                let _ = std::fs::remove_file(scratch.directory().join(name));
+        for name in scratch.files().into_keys() {
+            if !before.contains(&name) {
+                std::fs::remove_file(scratch.directory().join(&name)).map_err(|cause| {
+                    format!("a stale candidate {name} could not be cleared: {cause}")
+                })?;
             }
         }
     }
-    Err("no run of the killed compaction left a candidate with bytes in it".to_owned())
+    Err("no run of the killed compaction left a candidate holding a record".to_owned())
 }
 
 struct Scratch {
@@ -666,7 +912,8 @@ fn record_outcome(covered: &[&str], skipped: &[&str]) {
         "{{\n  \"gate\": \"F4-73\",\n  \"criterion\": \"roadmap.md F4 exit criterion 3\",\n  \
          \"status\": \"{status}\",\n  \"profiles_covered\": [{}],\n  \"profiles_skipped\": [{}],\n  \
          \"planted_values\": {},\n  \"surfaces\": [\"vault_file\",\"temporary_files\",\
-         \"renderings\",\"admin_vault_status\",\"proxy_event_counters\"],\n  \
+         \"renderings\",\"admin_vault_status\",\"proxy_event_counters\",\
+         \"process_stdout_and_stderr\"],\n  \
          \"caveat\": \"There is no logging framework and no ProxyEvent type in this crate yet. \
          The TRACE surface is approximated by every Debug and Display rendering a log line could \
          contain, and the event surface by the counters the vault contributes. Both are held in \
@@ -679,7 +926,55 @@ fn record_outcome(covered: &[&str], skipped: &[&str]) {
     let out =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/f4-vault-no-plaintext-proof.json");
     if let Some(parent) = out.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)
+            .unwrap_or_else(|cause| panic!("{} could not be created: {cause}", parent.display()));
     }
-    let _ = std::fs::write(&out, record);
+    // Not a discarded result. The whole reason this file exists is that a run
+    // covering one profile and a run covering both leave the same green line in
+    // the output, so a write that failed and said nothing would put the gate back
+    // exactly where it was before the artefact was added.
+    std::fs::write(&out, record)
+        .unwrap_or_else(|cause| panic!("{} could not be written: {cause}", out.display()));
+}
+
+/// The control for the reader above: every way this workspace writes a dependency
+/// is a way it is seen.
+///
+/// Each of these is a manifest that declares `tracing`, and each of the last three
+/// went straight past the previous reading. The first two are the forms
+/// `periskop-proxy/Cargo.toml` and the workspace root already use, which is what
+/// made the escape route the idiomatic route rather than an exotic one.
+#[test]
+fn the_manifest_reader_sees_every_form_a_dependency_is_written_in() {
+    for manifest in [
+        "[dependencies]\ntracing = \"0.1\"\n",
+        "[dependencies]\ntracing = { workspace = true }\n",
+        "[dependencies]\ntracing.workspace = true\n",
+        "[dependencies]\ntracing.version = \"0.1\"\ntracing.features = []\n",
+        "[dependencies.tracing]\nworkspace = true\n",
+        "[dev-dependencies.tracing]\nversion = \"0.1\"\n",
+        "[target.'cfg(unix)'.dependencies]\ntracing.workspace = true\n",
+        "[target.'cfg(unix)'.dependencies.tracing]\nworkspace = true\n",
+        "[dependencies]\nquiet = { package = \"tracing\", version = \"0.1\" }\n",
+    ] {
+        assert!(
+            dependency_names(manifest).contains("tracing"),
+            "this manifest declares tracing and the reader did not see it:\n{manifest}"
+        );
+    }
+
+    // And it does not invent one. A guard that answered yes to everything would
+    // fail the moment anybody touched the manifest, and a guard that cries wolf is
+    // a guard somebody deletes.
+    for manifest in [
+        "# tracing would be a dependency here\n[dependencies]\nzeroize.workspace = true\n",
+        "[package]\nname = \"tracing\"\n",
+        "[features]\ntracing = []\n",
+        "[dependencies.zeroize]\nworkspace = true\n",
+    ] {
+        assert!(
+            !dependency_names(manifest).contains("tracing"),
+            "the reader invented a dependency:\n{manifest}"
+        );
+    }
 }

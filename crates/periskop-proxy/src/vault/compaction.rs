@@ -89,9 +89,17 @@ pub(super) fn compact(file: &mut VaultFile, frames: &[Frame]) -> Result<Compacte
         // The old vault is untouched, so the honest thing is to leave it in place
         // and say the compaction did not happen. The candidate goes away with it;
         // leaving one behind would make the next run's cleanup look like a repair.
-        let _ = std::fs::remove_file(&candidate);
+        //
+        // If it cannot be removed, the operator hears that too. A discarded result
+        // here would leave a file beside the vault that nobody was told about, and
+        // the next compaction would silently clear it: the one place a leftover
+        // candidate is visible is this message.
+        let operation = match std::fs::remove_file(&candidate) {
+            Ok(()) => "swapped in",
+            Err(_) => "swapped in, and its candidate could not be removed either",
+        };
         return Err(VaultError::VaultFileUnavailable {
-            operation: "swapped in",
+            operation,
             cause: format!("{:?}", cause.kind()),
         });
     }
@@ -212,14 +220,15 @@ mod tests {
         }
     }
 
+    /// Every open in these tests goes through here, so no two Argon2id
+    /// derivations run at once; see [`crate::vault::key::one_derivation_at_a_time`].
+    fn open_here(path: &Path, floor: CounterFloor) -> Result<file::Loaded, VaultError> {
+        let _permit = crate::vault::key::one_derivation_at_a_time();
+        file::open(path, &passphrase(), ProfileName::Ci, floor)
+    }
+
     fn seeded(scratch: &Scratch, count: u8) -> (file::Loaded, Vec<Frame>) {
-        let mut loaded = file::open(
-            &scratch.vault(),
-            &passphrase(),
-            ProfileName::Ci,
-            CounterFloor::Unknown,
-        )
-        .unwrap();
+        let mut loaded = open_here(&scratch.vault(), CounterFloor::Unknown).unwrap();
         let mut frames = Vec::new();
         for byte in 1..=count {
             let frame = frame(byte, byte % 2);
@@ -246,13 +255,7 @@ mod tests {
         assert_eq!(outcome.dropped(), 2);
         drop(loaded);
 
-        let reloaded = file::open(
-            &scratch.vault(),
-            &passphrase(),
-            ProfileName::Ci,
-            CounterFloor::Unknown,
-        )
-        .unwrap();
+        let reloaded = open_here(&scratch.vault(), CounterFloor::Unknown).unwrap();
         assert_eq!(reloaded.frames.len(), 2);
         assert_eq!(reloaded.frames[0].alias, "PSK_PERSON_1");
         assert_eq!(reloaded.frames[1].alias, "PSK_PERSON_3");
@@ -272,13 +275,7 @@ mod tests {
 
         let after = std::fs::read(scratch.vault()).unwrap();
         assert_ne!(&after[64..96], tail_before.as_slice(), "the tail moved");
-        assert!(file::open(
-            &scratch.vault(),
-            &passphrase(),
-            ProfileName::Ci,
-            CounterFloor::Unknown
-        )
-        .is_ok());
+        assert!(open_here(&scratch.vault(), CounterFloor::Unknown).is_ok());
     }
 
     /// A compaction that lowered the counter would be indistinguishable from an
@@ -297,13 +294,7 @@ mod tests {
 
         // The floor from before the compaction still opens the compacted file,
         // which is the property that matters.
-        let reloaded = file::open(
-            &scratch.vault(),
-            &passphrase(),
-            ProfileName::Ci,
-            CounterFloor::AtLeast(5),
-        )
-        .unwrap();
+        let reloaded = open_here(&scratch.vault(), CounterFloor::AtLeast(5)).unwrap();
         assert_eq!(reloaded.file.record_counter(), 5);
         assert!(reloaded.frames.is_empty());
     }
@@ -318,13 +309,7 @@ mod tests {
         assert_eq!(loaded.file.record_counter(), 4);
         drop(loaded);
 
-        let reloaded = file::open(
-            &scratch.vault(),
-            &passphrase(),
-            ProfileName::Ci,
-            CounterFloor::Unknown,
-        )
-        .unwrap();
+        let reloaded = open_here(&scratch.vault(), CounterFloor::Unknown).unwrap();
         assert_eq!(reloaded.frames.len(), 2);
         assert_eq!(reloaded.frames[1].alias, "PSK_PERSON_9");
     }
@@ -342,14 +327,20 @@ mod tests {
         );
     }
 
-    /// The interruption test, injected as a write failure.
+    /// The interruption test, injected at the first step that touches a disk.
     ///
-    /// The candidate path is made impossible to create by putting a directory
-    /// where the file has to go: the compaction fails somewhere between "started"
-    /// and "renamed", which is the whole window this module claims to survive. The
-    /// old vault has to come out of it byte for byte identical and still openable.
+    /// A directory at the candidate path makes the compaction fail while it is
+    /// *clearing a stale candidate*, one step before it writes one. The name used
+    /// to say "cannot write its candidate", which is a different step and one this
+    /// test never reached: `remove_stale` refuses a directory and returns before
+    /// `write_candidate` is called at all. The `operation` field is asserted here so
+    /// that the name and the step it describes cannot drift apart again.
+    ///
+    /// What is proved is the same either way and it is the part that matters: a
+    /// compaction that fails anywhere before its rename leaves the old vault byte
+    /// for byte identical and still openable.
     #[test]
-    fn a_compaction_that_cannot_write_its_candidate_leaves_the_old_vault_intact() {
+    fn a_compaction_that_cannot_clear_a_stale_candidate_leaves_the_old_vault_intact() {
         let scratch = Scratch::new("write-fault");
         let (mut loaded, frames) = seeded(&scratch, 3);
         let before = std::fs::read(scratch.vault()).unwrap();
@@ -358,7 +349,12 @@ mod tests {
         std::fs::create_dir(&blocked).unwrap();
 
         let refusal = compact(&mut loaded.file, &frames[..1]).unwrap_err();
-        assert!(matches!(refusal, VaultError::VaultFileUnavailable { .. }));
+        match &refusal {
+            VaultError::VaultFileUnavailable { operation, .. } => {
+                assert_eq!(*operation, "cleared of a stale candidate");
+            }
+            other => panic!("expected the file to be unavailable, got {other:?}"),
+        }
         assert_eq!(refusal.http_status(), 503);
 
         // Not truncated, not partly rewritten, not replaced.
@@ -366,13 +362,7 @@ mod tests {
         std::fs::remove_dir(&blocked).unwrap();
         drop(loaded);
 
-        let reloaded = file::open(
-            &scratch.vault(),
-            &passphrase(),
-            ProfileName::Ci,
-            CounterFloor::Unknown,
-        )
-        .unwrap();
+        let reloaded = open_here(&scratch.vault(), CounterFloor::Unknown).unwrap();
         assert_eq!(reloaded.frames.len(), 3);
         assert_eq!(reloaded.file.record_counter(), 3);
     }
@@ -396,13 +386,7 @@ mod tests {
         drop(loaded);
 
         // The vault is unaware of it.
-        let mut reloaded = file::open(
-            &scratch.vault(),
-            &passphrase(),
-            ProfileName::Ci,
-            CounterFloor::Unknown,
-        )
-        .unwrap();
+        let mut reloaded = open_here(&scratch.vault(), CounterFloor::Unknown).unwrap();
         assert_eq!(std::fs::read(scratch.vault()).unwrap(), before);
         assert_eq!(reloaded.frames.len(), 3);
 
@@ -411,13 +395,7 @@ mod tests {
         assert_eq!(scratch.names(), BTreeSet::from(["vault.psk".to_owned()]));
         drop(reloaded);
 
-        let after = file::open(
-            &scratch.vault(),
-            &passphrase(),
-            ProfileName::Ci,
-            CounterFloor::Unknown,
-        )
-        .unwrap();
+        let after = open_here(&scratch.vault(), CounterFloor::Unknown).unwrap();
         assert_eq!(after.frames.len(), 2);
     }
 

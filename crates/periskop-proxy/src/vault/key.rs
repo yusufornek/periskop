@@ -378,6 +378,28 @@ fn expand<P: DerivedPurpose>(
     Ok(Key::from_bytes(*material))
 }
 
+/// One Argon2id derivation at a time, across the threads of one test binary.
+///
+/// The shipped profile asks Argon2id for 256 MiB and the harness runs tests in
+/// parallel, so four derivations at once is a gigabyte of transient allocation on
+/// a machine that may have sixteen. Unbounded parallelism here locked a developer
+/// machine once, which is why this is a permit rather than a comment.
+///
+/// It serialises the **derivations** rather than the tests: everything a test does
+/// around one still runs beside the other tests, and the peak stays at one
+/// profile's worth. Held for the whole of a test body rather than per call, so it
+/// can never be taken twice on one thread.
+#[cfg(test)]
+pub(crate) fn one_derivation_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static PERMIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A test that panicked while holding the permit poisons it. What it protects
+    // is memory rather than state, so the next caller takes it anyway instead of
+    // turning one failure into every failure.
+    PERMIT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -409,6 +431,16 @@ mod tests {
     }
 
     /// The `ci` profile, for tests that need a real derivation but not a slow one.
+    /// Every derivation in this module's tests goes through here.
+    fn derived(
+        profile: &KdfProfile,
+        passphrase: &Passphrase,
+        salt: &Salt,
+    ) -> Result<MasterKey, VaultError> {
+        let _permit = one_derivation_at_a_time();
+        derive_master_key(profile, passphrase, salt)
+    }
+
     fn ci() -> KdfProfile {
         KdfProfile::named(ProfileName::Ci)
     }
@@ -539,7 +571,7 @@ mod tests {
     #[test]
     fn an_empty_passphrase_refuses_before_argon2_is_called() {
         let started = Instant::now();
-        let refusal = derive_master_key(
+        let refusal = derived(
             &KdfProfile::named(ProfileName::Standard),
             &Passphrase::new(Vec::new()),
             &salt(),
@@ -552,23 +584,23 @@ mod tests {
 
     #[test]
     fn the_same_passphrase_and_salt_derive_the_same_key() {
-        let first = derive_master_key(&ci(), &passphrase(), &salt()).unwrap();
-        let second = derive_master_key(&ci(), &passphrase(), &salt()).unwrap();
+        let first = derived(&ci(), &passphrase(), &salt()).unwrap();
+        let second = derived(&ci(), &passphrase(), &salt()).unwrap();
         assert_eq!(first.as_bytes(), second.as_bytes());
     }
 
     #[test]
     fn a_different_salt_or_profile_derives_a_different_key() {
-        let base = derive_master_key(&ci(), &passphrase(), &salt()).unwrap();
+        let base = derived(&ci(), &passphrase(), &salt()).unwrap();
 
         let other_salt =
-            derive_master_key(&ci(), &passphrase(), &Salt::from_bytes([0x22; SALT_BYTES])).unwrap();
+            derived(&ci(), &passphrase(), &Salt::from_bytes([0x22; SALT_BYTES])).unwrap();
         assert_ne!(base.as_bytes(), other_salt.as_bytes());
 
         // Not a security property in itself, but it pins that the parameters
         // reach Argon2id rather than being carried and ignored.
         let stronger = KdfProfile::validate(&claim(MEMORY_FLOOR_KIB, 4, 4)).unwrap();
-        let other_profile = derive_master_key(&stronger, &passphrase(), &salt()).unwrap();
+        let other_profile = derived(&stronger, &passphrase(), &salt()).unwrap();
         assert_ne!(base.as_bytes(), other_profile.as_bytes());
     }
 
@@ -579,7 +611,7 @@ mod tests {
     /// finds that out from the operator.
     #[test]
     fn the_shipped_default_profile_derives_a_key() {
-        let key = derive_master_key(
+        let key = derived(
             &KdfProfile::named(ProfileName::Standard),
             &passphrase(),
             &salt(),
@@ -590,7 +622,7 @@ mod tests {
 
     #[test]
     fn session_keys_repeat_for_one_session_id_and_differ_between_two() {
-        let master = derive_master_key(&ci(), &passphrase(), &salt()).unwrap();
+        let master = derived(&ci(), &passphrase(), &salt()).unwrap();
         let first = SessionId::from_bytes([1u8; 16]);
         let second = SessionId::from_bytes([2u8; 16]);
 
@@ -608,7 +640,7 @@ mod tests {
 
     #[test]
     fn the_record_key_is_neither_the_master_key_nor_a_session_key() {
-        let master = derive_master_key(&ci(), &passphrase(), &salt()).unwrap();
+        let master = derived(&ci(), &passphrase(), &salt()).unwrap();
         let record = derive_record_key(&master).unwrap();
         let session = derive_session_key(&master, &SessionId::from_bytes([3u8; 16])).unwrap();
 
@@ -629,7 +661,7 @@ mod tests {
     /// one would let an attacker write a vault file this process opens.
     #[test]
     fn the_chain_key_is_separate_from_the_record_key_and_stable() {
-        let master = derive_master_key(&ci(), &passphrase(), &salt()).unwrap();
+        let master = derived(&ci(), &passphrase(), &salt()).unwrap();
         let chain = derive_chain_key(&master).unwrap();
 
         assert_ne!(chain.as_bytes(), master.as_bytes());
@@ -644,7 +676,7 @@ mod tests {
 
         // And it follows the master key: a different passphrase cannot verify a
         // header this one wrote.
-        let elsewhere = derive_master_key(
+        let elsewhere = derived(
             &ci(),
             &Passphrase::new(b"a different operator".to_vec()),
             &salt(),

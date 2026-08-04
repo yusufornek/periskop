@@ -14,6 +14,7 @@
 //! and no recovery is attempted.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use periskop_proxy::vault::{
     AliasSeed, Backing, CounterFloor, Integrity, OpenRequest, Passphrase, ProfileName, Restored,
@@ -71,11 +72,26 @@ fn passphrase() -> Passphrase {
 /// and not about how long Argon2id takes. The shipped profile is exercised by
 /// `vault_no_plaintext.rs`, which runs under both.
 fn on_file(path: &Path, floor: CounterFloor) -> Result<Vault, VaultError> {
+    // One derivation at a time. Argon2id is asked for its profile's whole memory
+    // and this binary runs its tests in parallel, so several at once is several
+    // times that allocated together; unbounded parallelism here locked a machine
+    // once. Taken and released around the one call that derives, which is the only
+    // place in this file that does, so it cannot nest.
+    let _permit = one_derivation_at_a_time();
     Vault::open(&OpenRequest {
         passphrase: &passphrase(),
         profile: ProfileName::Ci,
         backing: Backing::File { path, floor },
     })
+}
+
+fn one_derivation_at_a_time() -> MutexGuard<'static, ()> {
+    static PERMIT: Mutex<()> = Mutex::new(());
+    // What the permit protects is memory rather than state, so a poisoning left by
+    // a failed test does not turn one failure into every failure.
+    PERMIT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn seed(byte: u8) -> AliasSeed {
@@ -212,7 +228,7 @@ fn chain_mismatch_does_not_open_the_vault_and_repairs_nothing() {
     let refusal = on_file(&scratch.vault(), CounterFloor::Unknown).unwrap_err();
     assert_eq!(refusal.integrity(), Some(Integrity::ChainMismatch));
     assert_eq!(refusal.http_status(), 503);
-    no_recovery_was_attempted(&scratch, &truncated);
+    no_recovery_was_attempted(&scratch, &truncated, CounterFloor::Unknown);
 
     // Shape two: one byte inside the first record's sealed body, same length,
     // same frame count, same structure.
@@ -229,7 +245,7 @@ fn chain_mismatch_does_not_open_the_vault_and_repairs_nothing() {
         "a same length edit inside a record has to be caught at open, not at restore"
     );
     assert_eq!(refusal.http_status(), 503);
-    no_recovery_was_attempted(&scratch, &edited);
+    no_recovery_was_attempted(&scratch, &edited, CounterFloor::Unknown);
 
     // Shape three: two records exchanged. Same bytes, same length, different
     // order, and nothing but the chain can tell.
@@ -243,7 +259,7 @@ fn chain_mismatch_does_not_open_the_vault_and_repairs_nothing() {
 
     let refusal = on_file(&scratch.vault(), CounterFloor::Unknown).unwrap_err();
     assert_eq!(refusal.integrity(), Some(Integrity::ChainMismatch));
-    no_recovery_was_attempted(&scratch, &swapped);
+    no_recovery_was_attempted(&scratch, &swapped, CounterFloor::Unknown);
 }
 
 /// The scenario the acceptance criterion names in as many words: a record is cut
@@ -277,7 +293,7 @@ fn chain_mismatch_a_record_removed_from_the_middle_does_not_open_the_vault() {
     let refusal = on_file(&scratch.vault(), CounterFloor::Unknown).unwrap_err();
     assert_eq!(refusal.integrity(), Some(Integrity::ChainMismatch));
     assert_eq!(refusal.http_status(), 503);
-    no_recovery_was_attempted(&scratch, &without_the_middle);
+    no_recovery_was_attempted(&scratch, &without_the_middle, CounterFloor::Unknown);
 }
 
 /// Violation two of three: an older copy of the file is put back.
@@ -303,7 +319,7 @@ fn counter_rollback_does_not_open_the_vault_and_repairs_nothing() {
     let refusal = on_file(&scratch.vault(), CounterFloor::AtLeast(reached)).unwrap_err();
     assert_eq!(refusal.integrity(), Some(Integrity::CounterRollback));
     assert_eq!(refusal.http_status(), 503);
-    no_recovery_was_attempted(&scratch, &old);
+    no_recovery_was_attempted(&scratch, &old, CounterFloor::AtLeast(reached));
 }
 
 /// Violation three of three: the Argon2id parameters in the header are weakened.
@@ -326,7 +342,7 @@ fn header_mac_failed_does_not_open_the_vault_and_repairs_nothing() {
     let refusal = on_file(&scratch.vault(), CounterFloor::Unknown).unwrap_err();
     assert_eq!(refusal.integrity(), Some(Integrity::HeaderMacFailed));
     assert_eq!(refusal.http_status(), 503);
-    no_recovery_was_attempted(&scratch, &weakened);
+    no_recovery_was_attempted(&scratch, &weakened, CounterFloor::Unknown);
 }
 
 /// The other half of every violation test: nothing was repaired.
@@ -336,7 +352,7 @@ fn header_mac_failed_does_not_open_the_vault_and_repairs_nothing() {
 /// bytes rather than by reading the code, because a truncation, a rewritten
 /// header or a quarantine copy beside the file would each be a repair, and each
 /// would leave a green test behind if only the refusal were asserted.
-fn no_recovery_was_attempted(scratch: &Scratch, expected: &[u8]) {
+fn no_recovery_was_attempted(scratch: &Scratch, expected: &[u8], floor: CounterFloor) {
     assert_eq!(
         std::fs::read(scratch.vault()).unwrap(),
         expected,
@@ -350,9 +366,107 @@ fn no_recovery_was_attempted(scratch: &Scratch, expected: &[u8]) {
 
     // And a second attempt does not heal what the first refused, which is what a
     // retry loop in the request path would look like.
-    assert!(on_file(&scratch.vault(), CounterFloor::AtLeast(u64::MAX)).is_err());
-    assert!(on_file(&scratch.vault(), CounterFloor::AtLeast(u64::MAX)).is_err());
+    //
+    // Under the caller's own floor, not `AtLeast(u64::MAX)`. That value refuses
+    // every file there is, healthy ones included, so the two assertions below held
+    // whatever the bytes were and measured nothing at all;
+    // `the_retry_check_can_tell_a_healthy_vault_apart` is the control that says
+    // this version does not have that problem.
+    let first = on_file(&scratch.vault(), floor).unwrap_err();
+    let second = on_file(&scratch.vault(), floor).unwrap_err();
+    assert_eq!(
+        first.integrity(),
+        second.integrity(),
+        "a second attempt answered differently from the first"
+    );
     assert_eq!(std::fs::read(scratch.vault()).unwrap(), expected);
+}
+
+/// The control for the helper above: a healthy vault opens under the same call.
+#[test]
+fn the_retry_check_can_tell_a_healthy_vault_apart() {
+    let scratch = Scratch::new("retry-control");
+    let session = SessionId::from_bytes([0x77; 16]);
+    let honest = seeded(&scratch, &session);
+
+    assert!(on_file(&scratch.vault(), CounterFloor::AtLeast(2)).is_ok());
+    assert!(on_file(&scratch.vault(), CounterFloor::Unknown).is_ok());
+    assert_eq!(std::fs::read(scratch.vault()).unwrap(), honest);
+}
+
+/// The rollback that needs no forgery at all: the file is deleted.
+///
+/// A missing vault has a record counter of zero, so a proxy that reached three and
+/// finds nothing is looking at a vault that went backwards. Creating a fresh one
+/// here would make `rm vault.psk` succeed where restoring an older copy is refused,
+/// and every mapping the proxy was serving would quietly become
+/// `masking_unresolved` with no 503 and no `integrity` value to explain it.
+#[test]
+fn counter_rollback_a_deleted_vault_file_does_not_open_a_new_one() {
+    let scratch = Scratch::new("deleted");
+    let session = SessionId::from_bytes([0x88; 16]);
+    seeded(&scratch, &session);
+    std::fs::remove_file(scratch.vault()).unwrap();
+
+    let refusal = on_file(&scratch.vault(), CounterFloor::AtLeast(2)).unwrap_err();
+    assert_eq!(refusal.integrity(), Some(Integrity::CounterRollback));
+    assert_eq!(refusal.http_status(), 503);
+
+    // Nothing was created on the way to that refusal. A vault left here would be
+    // adopted by the next caller that passes `Unknown`, which is the rollback
+    // completing one restart later.
+    assert!(scratch.names().is_empty(), "{:?}", scratch.names());
+
+    // And the caller that knows nothing still gets its new vault, or the rule above
+    // would just be a broken create.
+    assert!(on_file(&scratch.vault(), CounterFloor::Unknown).is_ok());
+}
+
+/// Sessions read out of a file are subject to the time to live like any other.
+///
+/// A vault file records when each session was last used, and a file that sat on a
+/// disk over a weekend is mostly expired sessions. Loading them and keeping them
+/// is two failures at once: `/admin/vault/status` reports live mappings that are
+/// not live, and each one holds a session key in memory for the life of the
+/// process, which is the opposite of what a time to live is for.
+#[test]
+fn a_restart_does_not_resurrect_sessions_whose_time_to_live_has_run_out() {
+    let scratch = Scratch::new("expired-restart");
+    let stale = SessionId::from_bytes([0xA1; 16]);
+    let fresh = SessionId::from_bytes([0xA2; 16]);
+
+    let mut vault = on_file(&scratch.vault(), CounterFloor::Unknown).unwrap();
+    let ttl = vault.limits().ttl_ms;
+    vault
+        .store_alias(&stale, seed(1), "PSK_PERSON_1", AHMET, NOW)
+        .unwrap();
+    vault
+        .store_alias(&fresh, seed(2), "PSK_PERSON_2", AYSE, NOW + ttl)
+        .unwrap();
+    drop(vault);
+
+    let mut restarted = on_file(&scratch.vault(), CounterFloor::AtLeast(2)).unwrap();
+    // Both are on the disk, so both are loaded: the file cannot apply a time to
+    // live, because opening it happens before any request supplies a clock.
+    assert_eq!(restarted.status().entries(), 2);
+
+    // The first request that does supply one sweeps. The stale session is a full
+    // time to live past its last use by then; the fresh one is not.
+    let now = NOW + ttl + 1;
+    assert!(matches!(
+        restarted.restore(&fresh, "PSK_PERSON_2", now).unwrap(),
+        Restored::Value(_)
+    ));
+    assert_eq!(
+        restarted.session_count(),
+        1,
+        "an expired session survived the first request after a restart"
+    );
+    assert_eq!(restarted.status().entries(), 1);
+    assert!(matches!(
+        restarted.restore(&stale, "PSK_PERSON_1", now).unwrap(),
+        Restored::Unresolved(UnresolvedReason::SessionUnknown)
+    ));
 }
 
 /// A file the operator points at that is not a vault at all.

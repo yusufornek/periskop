@@ -25,16 +25,21 @@
 //! The cost is written down rather than worked around: when the vault is
 //! unreachable, access to the model stops too.
 
-pub mod chain;
-pub mod compaction;
-pub mod error;
-pub mod file;
-pub mod key;
-pub mod layout;
-pub mod record;
-pub mod secret;
-pub mod session;
-pub mod status;
+// Private by default, as CLAUDE.md's visibility rule asks: the public API of this
+// crate is the list of re-exports below, decided item by item, rather than every
+// module that happens to exist. `pub(crate)` rather than fully private because
+// `alias` derives seeds against `record`'s widths, and because the two boundary
+// tests read these modules by path.
+pub(crate) mod chain;
+pub(crate) mod compaction;
+pub(crate) mod error;
+pub(crate) mod file;
+pub(crate) mod key;
+pub(crate) mod layout;
+pub(crate) mod record;
+pub(crate) mod secret;
+pub(crate) mod session;
+pub(crate) mod status;
 
 use std::fmt;
 use std::path::Path;
@@ -43,7 +48,7 @@ pub use compaction::Compacted;
 pub use error::{Integrity, VaultError, VaultField};
 pub use file::{CounterFloor, VaultFile};
 pub use key::{ClaimedKdfParameters, KdfProfile, ProfileName, Salt, VaultNote};
-pub use record::{AliasSeed, RecordCounters, RecordType, SealedRecord};
+pub use record::{AliasSeed, RecordCounters, RecordType, SealedRecord, ALIAS_SEED_BYTES};
 pub use secret::{MasterKey, Passphrase, SecretValue, SessionKey};
 pub use session::{Restored, Session, SessionId, SessionLimits, UnresolvedReason};
 pub use status::{VaultState, VaultStatus};
@@ -122,6 +127,16 @@ pub struct Vault {
     sessions: SessionStore,
     counters: RecordCounters,
     notes: Vec<VaultNote>,
+    /// Whether sessions read out of a file are still waiting for a clock.
+    ///
+    /// A vault file records when each session was last used, but opening one
+    /// happens before any request supplies a "now", so [`session::SessionStore::load`]
+    /// cannot apply the time to live and deliberately does not try. Something has
+    /// to, though: without this flag a restart resurrects every expired
+    /// conversation, keeps its session key in memory for the life of the process
+    /// and counts it in `/admin/vault/status`. The first call that carries a clock
+    /// sweeps, and the flag is what makes that happen once rather than never.
+    awaiting_first_clock: bool,
 }
 
 /// Says what the vault is doing and nothing about what it holds.
@@ -185,8 +200,30 @@ impl Vault {
         // the difference between the two may not be invisible (README principle 4).
         vault.notes.extend(note_for(&effective));
         vault.load_frames(&loaded.frames)?;
+        // Only when there was something to load. A vault opened on a file that did
+        // not exist yet holds nothing, and arming the sweep for it would be a flag
+        // set for a state that cannot occur.
+        vault.awaiting_first_clock = !loaded.frames.is_empty();
         vault.file = Some(loaded.file);
         Ok(vault)
+    }
+
+    /// Applies the time to live to sessions that were read off a disk.
+    ///
+    /// Called by every entry point that carries a clock. Sessions restored from a
+    /// file arrive with the deadline they had when they were written; if the file
+    /// sat on the disk over a weekend, most of them are already over it, and each
+    /// one that survives holds a session key. Sweeping at the first clock rather
+    /// than at open is what lets the vault be loaded before any request exists
+    /// without the time to live becoming optional.
+    fn sweep_sessions_loaded_from_a_file(&mut self, now_ms: u64) {
+        if !self.awaiting_first_clock {
+            return;
+        }
+        // Cleared before the sweep, not after: the sweep is a one off, and a
+        // panic inside it must not leave the flag armed for every later call.
+        self.awaiting_first_clock = false;
+        self.sessions.purge_expired(now_ms);
     }
 
     fn load_frames(&mut self, frames: &[Frame]) -> Result<(), VaultError> {
@@ -222,6 +259,7 @@ impl Vault {
             sessions: SessionStore::new(limits),
             counters: RecordCounters::default(),
             notes: Vec::new(),
+            awaiting_first_clock: false,
         })
     }
 
@@ -282,6 +320,7 @@ impl Vault {
         session: &SessionId,
         now_ms: u64,
     ) -> Result<&Session, VaultError> {
+        self.sweep_sessions_loaded_from_a_file(now_ms);
         let master = &self.master;
         self.sessions
             .ensure(session, now_ms, || key::derive_session_key(master, session))
@@ -306,6 +345,7 @@ impl Vault {
         value: &[u8],
         now_ms: u64,
     ) -> Result<(), VaultError> {
+        self.sweep_sessions_loaded_from_a_file(now_ms);
         let sealed = record::seal(
             &self.record_key,
             &RecordIdentity {
@@ -396,6 +436,7 @@ impl Vault {
         alias: &str,
         now_ms: u64,
     ) -> Result<Restored, VaultError> {
+        self.sweep_sessions_loaded_from_a_file(now_ms);
         let mut tampered = false;
 
         let answer = match self.sessions.lookup(session, now_ms) {
@@ -433,6 +474,9 @@ impl Vault {
     /// Returns how many were forgotten, because a sweep that reports nothing is a
     /// sweep nobody can tell ran.
     pub fn purge_expired(&mut self, now_ms: u64) -> usize {
+        // The one place the flag is cleared without its own sweep mattering: this
+        // call is the sweep.
+        self.awaiting_first_clock = false;
         self.sessions.purge_expired(now_ms)
     }
 
@@ -501,8 +545,11 @@ mod tests {
         let json = vault.status().to_json();
         assert!(json.contains("\"backend\":\"memory\""), "{json}");
         assert!(json.contains("\"integrity\":\"ok\""), "{json}");
-        // `proxy-api.md`: the path is only meaningful in `file` mode.
-        assert!(!json.contains("path"), "{json}");
+        // `proxy-api.md`'s normative table: the path is only meaningful in `file`
+        // mode and is `null` here. This assertion used to pin the opposite, that
+        // the field was absent, which made the divergence from the contract a
+        // property the suite defended.
+        assert!(json.contains("\"path\":null"), "{json}");
     }
 
     #[test]

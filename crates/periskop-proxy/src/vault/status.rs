@@ -91,19 +91,44 @@ impl VaultStatus {
     /// Rendered here rather than by whatever serves it, so that the one place a
     /// vault turns into bytes for a client is a place with no access to a record.
     pub fn to_json(&self) -> String {
-        let mut fields = vec![
+        let fields = [
             format!("\"vault_state\":\"{}\"", self.state.as_str()),
             format!("\"backend\":\"{}\"", self.backend.as_str()),
+            // Present and `null` in `memory` mode rather than absent. The
+            // normative table in `proxy-api.md` spells that out, and a client
+            // written against it tests `body.path === null`; an omitted field
+            // hands that client `undefined` instead, which is a different answer
+            // to a question about where the vault is.
+            match &self.path {
+                Some(path) => format!("\"path\":{}", quote(path)),
+                None => "\"path\":null".to_owned(),
+            },
+            format!("\"aead\":\"{AEAD}\""),
+            format!("\"integrity\":\"{}\"", self.integrity.as_str()),
+            format!("\"memory_locked\":{}", self.memory_locked),
+            format!("\"entries_count\":{}", self.entries),
         ];
-        if let Some(path) = &self.path {
-            fields.push(format!("\"path\":{}", quote(path)));
-        }
-        fields.push(format!("\"aead\":\"{AEAD}\""));
-        fields.push(format!("\"integrity\":\"{}\"", self.integrity.as_str()));
-        fields.push(format!("\"memory_locked\":{}", self.memory_locked));
-        fields.push(format!("\"entries_count\":{}", self.entries));
         format!("{{{}}}", fields.join(","))
     }
+
+    /// Every key this object can ever carry, in the order [`Self::to_json`] writes
+    /// them.
+    ///
+    /// Named here so that the projection's promise can be asserted as "these and
+    /// nothing else" rather than as "none of the words somebody thought of". A
+    /// field added to the renderer without being added here fails
+    /// `every_field_this_object_can_carry_is_one_of_these`, which is the review
+    /// this list exists to force.
+    #[cfg(test)]
+    const FIELDS: &'static [&'static str] = &[
+        "vault_state",
+        "backend",
+        "path",
+        "aead",
+        "integrity",
+        "memory_locked",
+        "entries_count",
+    ];
 }
 
 /// Escapes the one field that is not drawn from a closed vocabulary.
@@ -152,8 +177,10 @@ mod tests {
         assert!(json.contains("\"integrity\":\"ok\""), "{json}");
         assert!(json.contains("\"entries_count\":3"), "{json}");
         assert!(json.contains("\"aead\":\"xchacha20poly1305\""), "{json}");
-        // `proxy-api.md`: the field is only meaningful in `file` mode.
-        assert!(!json.contains("\"path\""), "{json}");
+        // `proxy-api.md`'s normative table: the field is only meaningful in `file`
+        // mode, and in `memory` mode it is `null`. Present rather than omitted, so
+        // that a client can tell "there is no file" from "this build did not say".
+        assert!(json.contains("\"path\":null"), "{json}");
     }
 
     #[test]
@@ -196,11 +223,13 @@ mod tests {
     }
 
     /// The endpoint's whole promise, as a property of the type.
+    ///
+    /// Checked as a closed set rather than as a list of forbidden words. Scanning
+    /// for `"alias"` and `"value"` passes a field called `"context"` or `"extra"`
+    /// carrying exactly the mapping this endpoint may never return, so what is
+    /// asserted is that the object holds **these seven keys and no eighth**.
     #[test]
-    fn there_is_no_field_that_could_carry_a_mapping() {
-        // Every accessor on this type returns an enum, a number or the path the
-        // operator asked for. If a future field carried an alias or a value, this
-        // list would have to grow, which is the review this test is here to force.
+    fn every_field_this_object_can_carry_is_one_of_these() {
         let status = VaultStatus::new(
             VaultState::Unsealed,
             Storage::File,
@@ -208,13 +237,68 @@ mod tests {
             Integrity::Ok,
             10_000,
         );
-        let json = status.to_json();
-        for field in ["alias", "value", "session", "seed", "record", "nonce"] {
-            assert!(!json.contains(field), "{json} names {field}");
+
+        for rendered in [status.to_json(), memory_status().to_json()] {
+            let keys = keys_of(&rendered);
+            assert_eq!(
+                keys,
+                VaultStatus::FIELDS,
+                "the status object grew or lost a field: {rendered}"
+            );
         }
+
         assert_eq!(status.entries(), 10_000);
         assert_eq!(status.state(), VaultState::Unsealed);
         assert_eq!(status.backend(), Storage::File);
         assert_eq!(status.integrity(), Integrity::Ok);
+    }
+
+    fn memory_status() -> VaultStatus {
+        VaultStatus::new(VaultState::Sealed, Storage::Memory, None, Integrity::Ok, 0)
+    }
+
+    /// The top level keys of a flat JSON object, in the order they were written.
+    ///
+    /// Deliberately small and deliberately strict: the object this reads is one
+    /// this module produced a line above, so a parser that handles nesting would
+    /// be answering a question nothing asks. A value containing a quoted comma or
+    /// colon is handled because the path is escaped by [`quote`] before it gets
+    /// here, and `a_path_with_a_quote_in_it_does_not_break_the_response` is what
+    /// keeps that true.
+    fn keys_of(json: &str) -> Vec<&str> {
+        let body = json
+            .strip_prefix('{')
+            .and_then(|rest| rest.strip_suffix('}'))
+            .unwrap_or_else(|| panic!("not a JSON object: {json}"));
+
+        let mut keys = Vec::new();
+        let mut inside_a_string = false;
+        let mut escaped = false;
+        let mut field_starts_at = 0usize;
+        for (at, character) in body.char_indices() {
+            match character {
+                _ if escaped => escaped = false,
+                '\\' if inside_a_string => escaped = true,
+                '"' => inside_a_string = !inside_a_string,
+                ',' if !inside_a_string => {
+                    keys.push(key_of(&body[field_starts_at..at]));
+                    field_starts_at = at + 1;
+                }
+                _ => {}
+            }
+        }
+        keys.push(key_of(&body[field_starts_at..]));
+        keys
+    }
+
+    fn key_of(field: &str) -> &str {
+        let name = field
+            .split_once(':')
+            .map(|(name, _)| name)
+            .unwrap_or_else(|| panic!("a field with no value: {field}"));
+        name.trim()
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("an unquoted field name: {field}"))
     }
 }

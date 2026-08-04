@@ -31,9 +31,9 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use periskop_proxy::vault::record::ALIAS_SEED_BYTES;
 use periskop_proxy::vault::{
     AliasSeed, Backing, OpenRequest, Passphrase, ProfileName, Restored, SessionId, Storage, Vault,
+    ALIAS_SEED_BYTES,
 };
 
 /// Vault modules allowed to name a filesystem API.
@@ -77,7 +77,12 @@ const FILESYSTEM_APIS: &[&str] = &[
 fn a_whole_vault_lifetime_leaves_the_filesystem_as_it_found_it() {
     let working = std::env::current_dir().unwrap();
     let home_vault = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".periskop"));
-    let before = listing(&working, home_vault.as_deref());
+    let watched = Watched {
+        working: &working,
+        home_vault: home_vault.as_deref(),
+        temporary: &std::env::temp_dir(),
+    };
+    let before = listing(&watched);
 
     let now = 1_700_000_000_000;
     // The real opening path, key derivation included. A vault that cached a salt,
@@ -121,7 +126,7 @@ fn a_whole_vault_lifetime_leaves_the_filesystem_as_it_found_it() {
     vault.purge_expired(now + vault.limits().ttl_ms + 1);
     drop(vault);
 
-    let after = listing(&working, home_vault.as_deref());
+    let after = listing(&watched);
     assert_eq!(
         after,
         before,
@@ -202,15 +207,56 @@ fn names_a_filesystem_api(source: &Path) -> bool {
         .any(|code| FILESYSTEM_APIS.iter().any(|api| code.contains(api)))
 }
 
+/// The three places a vault would leave something behind.
+struct Watched<'a> {
+    working: &'a Path,
+    home_vault: Option<&'a Path>,
+    /// `$TMPDIR`, which was missing and is where a scratch file lands by default.
+    ///
+    /// A vault that wrote a temporary copy while it worked would put it here and
+    /// neither of the other two roots would notice, which made "nothing was
+    /// written" a claim about two of the three plausible destinations.
+    temporary: &'a Path,
+}
+
 /// Every path under the watched roots, with the size that would change if a file
 /// were rewritten where it stands.
-fn listing(working: &Path, home_vault: Option<&Path>) -> BTreeSet<(PathBuf, u64)> {
+fn listing(watched: &Watched<'_>) -> BTreeSet<(PathBuf, u64)> {
     let mut seen = BTreeSet::new();
-    list_into(working, &mut seen);
-    if let Some(home_vault) = home_vault {
+    list_into(watched.working, &mut seen);
+    if let Some(home_vault) = watched.home_vault {
         list_into(home_vault, &mut seen);
     }
+    list_named_into(watched.temporary, &mut seen);
     seen
+}
+
+/// The entries of `$TMPDIR` this product could have written, and only those.
+///
+/// The whole directory is shared with the rest of the machine, so a full listing
+/// would fail whenever anything else on the system happened to write a file during
+/// the lifetime above, and a test that fails for reasons outside its subject is a
+/// test people learn to rerun. Screening by name keeps the check pointed at what it
+/// is about: nothing carrying this product's or this vault's name appeared. That is
+/// a screen and not a proof, exactly as the source scan below is.
+fn list_named_into(root: &Path, seen: &mut BTreeSet<(PathBuf, u64)>) {
+    const OURS: &[&str] = &["periskop", "vault", "psk"];
+
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if !OURS.iter().any(|ours| name.contains(ours)) {
+            continue;
+        }
+        let path = entry.path();
+        let size = entry.metadata().map(|data| data.len()).unwrap_or_default();
+        seen.insert((path.clone(), size));
+        if path.is_dir() {
+            list_into(&path, seen);
+        }
+    }
 }
 
 fn list_into(root: &Path, seen: &mut BTreeSet<(PathBuf, u64)>) {

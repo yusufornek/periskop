@@ -30,14 +30,31 @@
 //! # What the counter can and cannot see
 //!
 //! `record_counter` only detects a rollback against a value known from somewhere
-//! other than the file. Inside one process that is free: the vault remembers the
-//! highest counter it has seen and refuses anything below it, which covers the
-//! file being swapped underneath a running proxy. Across a restart the caller has
-//! to supply the floor, and if it cannot, an older self consistent copy of the
-//! vault is indistinguishable from the current one. That limit is arithmetic
-//! rather than an omission, and it is written down in `known-gaps.md` KG-022
-//! instead of being papered over with a second state file that would roll back
-//! in exactly the same way.
+//! other than the file, and that value is always supplied by the caller as
+//! [`CounterFloor`]. A caller that has one passes [`CounterFloor::AtLeast`] (the
+//! counter its last open reached, from [`super::Vault::record_counter`]); a caller
+//! that has none passes [`CounterFloor::Unknown`] and an older self consistent copy
+//! of the vault is then indistinguishable from the current one. That limit is
+//! arithmetic rather than an omission, and it is written down in `known-gaps.md`
+//! KG-022 instead of being papered over with a second state file that would roll
+//! back in exactly the same way.
+//!
+//! **A file that is not there is a counter of zero.** Deleting `vault.psk` is a
+//! rollback all the way to the beginning, and it is the cheapest one an attacker
+//! with write access has: no bytes to forge, no header to keep authentic. So the
+//! floor is checked against the absence too, before anything is created. Only a
+//! caller who says it knows nothing (`Unknown`, or `AtLeast(0)`) gets a new vault
+//! out of this module.
+//!
+//! # Reading a file nobody has authenticated yet
+//!
+//! Everything above happens after the bytes are in memory, which makes the read
+//! itself the one step that runs on an attacker's terms. Two bounds are therefore
+//! applied before it: the path must be a regular file that no symbolic link
+//! redirects, and the read stops at [`MAX_VAULT_BYTES`]. Without them, appending
+//! 64 GiB of zeroes to `vault.psk` or pointing it at `/dev/zero` exhausts this
+//! process at startup, and a fail closed component that cannot run does not return
+//! 503, it returns nothing at all (ADR-016 section 1).
 //!
 //! # Bytes after the authenticated region
 //!
@@ -48,7 +65,7 @@
 //! touched by either. The record in a torn append was never committed, so a vault
 //! that opens without it is telling the truth.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{File, Metadata, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -57,6 +74,17 @@ use super::error::{Integrity, VaultError};
 use super::key::{self, KdfProfile, ProfileName, Salt};
 use super::layout::{Frame, Header, HEADER_BYTES, PREFIX_BYTES};
 use super::secret::{MasterKey, Passphrase};
+
+/// The most `vault.psk` this process will read into memory before anything in it
+/// has been authenticated.
+///
+/// The number is a ceiling rather than an estimate: a frame is at most
+/// `96 + 512 + 64 KiB` bytes ([`super::layout`]), so this admits tens of thousands
+/// of records at their largest and millions at the size a masked name actually
+/// takes. What it refuses is the file an attacker grew, and it refuses it in
+/// constant memory because the read stops rather than the check running afterwards
+/// on bytes already allocated.
+const MAX_VAULT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The lowest record counter this vault will accept from a file.
 ///
@@ -131,8 +159,13 @@ pub struct VaultFile {
     /// Where the authenticated region ends, and therefore where the next frame is
     /// written. Tracked rather than taken from the file length so that bytes left
     /// by a torn append are overwritten instead of appended after.
+    ///
+    /// There is deliberately no `floor` field beside it. The floor this vault was
+    /// opened against is enforced once, in [`open`], and afterwards it is exactly
+    /// `record_counter`: a load below the floor is refused and an append only ever
+    /// raises the counter. A second copy would have been a field that is written,
+    /// never read, and describes a protection nothing performs.
     end_of_records: u64,
-    floor: u64,
 }
 
 /// Counts and paths, never content.
@@ -192,7 +225,6 @@ impl VaultFile {
         self.frame_count = frame_count;
         self.chain_tail = tail;
         self.end_of_records += bytes.len() as u64;
-        self.floor = self.floor.max(record_counter);
         Ok(())
     }
 
@@ -277,6 +309,14 @@ pub(super) fn open(
 ) -> Result<Loaded, VaultError> {
     match read_all(path)? {
         Some(bytes) => load(path, &bytes, passphrase, floor),
+        // A missing file is a record counter of zero. Creating a fresh vault here
+        // for a caller that knows the old one had reached a higher counter would
+        // make deletion succeed where restoring an older copy is refused, and
+        // deletion is the stronger attack of the two: it needs no valid header at
+        // all. Same violation, same refusal, and nothing is created.
+        None if floor.value() > 0 => Err(VaultError::IntegrityFailed {
+            integrity: Integrity::CounterRollback,
+        }),
         None => create(path, passphrase, profile),
     }
 }
@@ -285,19 +325,81 @@ pub(super) fn open(
 ///
 /// The vault is bounded by the alias ceiling per session, so reading it whole is
 /// how it is verified: the chain has to be walked from `M_0` in order anyway, and
-/// a streaming reader would buy nothing but a second code path.
+/// a streaming reader would buy nothing but a second code path. Whole is not
+/// unbounded, though; see [`MAX_VAULT_BYTES`] and [`regular_file`], both of which
+/// run before a single byte is allocated.
 fn read_all(path: &Path) -> Result<Option<Vec<u8>>, VaultError> {
-    match File::open(path) {
-        Ok(mut handle) => {
-            let mut bytes = Vec::new();
-            handle
-                .read_to_end(&mut bytes)
-                .map_err(|cause| io_error("read", &cause))?;
-            Ok(Some(bytes))
-        }
-        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(cause) => Err(io_error("opened", &cause)),
+    let Some(looked_at) = regular_file(path, "read")? else {
+        return Ok(None);
+    };
+
+    let handle = match File::open(path) {
+        Ok(handle) => handle,
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(cause) => return Err(io_error("opened", &cause)),
+    };
+    // The look and the open are two steps and the path can be swapped between
+    // them, so the descriptor is compared against what was checked rather than
+    // trusted because the name once pointed at a file.
+    let opened = handle
+        .metadata()
+        .map_err(|cause| io_error("read", &cause))?;
+    same_file(&looked_at, &opened)?;
+
+    // One byte past the ceiling, so that a file exactly at it still opens and a
+    // file over it is recognised without ever being held whole.
+    let mut bytes = Vec::new();
+    Read::take(handle, MAX_VAULT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|cause| io_error("read", &cause))?;
+    if bytes.len() as u64 > MAX_VAULT_BYTES {
+        return Err(VaultError::VaultFileUnavailable {
+            operation: "read",
+            cause: format!("larger than the {MAX_VAULT_BYTES} byte ceiling"),
+        });
     }
+    Ok(Some(bytes))
+}
+
+/// Says whether there is a regular file at `path`, and refuses anything else.
+///
+/// `symlink_metadata` rather than `metadata`: it reports the link instead of what
+/// the link points at, which is the only way to see that this read would be a read
+/// of somewhere else entirely. A vault path that is a link to `/dev/zero` or to a
+/// named pipe is not a vault that failed to parse, it is an instruction to this
+/// process to consume everything the other end supplies, and the answer is a
+/// refusal an operator can act on.
+fn regular_file(path: &Path, operation: &'static str) -> Result<Option<Metadata>, VaultError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(Some(metadata)),
+        Ok(metadata) => Err(VaultError::VaultFileUnavailable {
+            operation,
+            cause: format!("not a regular file but {:?}", metadata.file_type()),
+        }),
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(cause) => Err(io_error(operation, &cause)),
+    }
+}
+
+/// Whether an opened descriptor is the file that was checked a moment ago.
+#[cfg(unix)]
+fn same_file(checked: &Metadata, opened: &Metadata) -> Result<(), VaultError> {
+    use std::os::unix::fs::MetadataExt as _;
+    if checked.dev() == opened.dev() && checked.ino() == opened.ino() {
+        return Ok(());
+    }
+    Err(VaultError::VaultFileUnavailable {
+        operation: "read",
+        cause: "replaced while it was being opened".to_owned(),
+    })
+}
+
+/// Platforms without inode numbers keep the check that does exist: what was at the
+/// path a moment ago was a regular file. The window between that look and the open
+/// is not closed there, and this build says so rather than implying otherwise.
+#[cfg(not(unix))]
+fn same_file(_checked: &Metadata, _opened: &Metadata) -> Result<(), VaultError> {
+    Ok(())
 }
 
 fn create(
@@ -339,7 +441,6 @@ fn create(
             frame_count: 0,
             chain_tail: tail,
             end_of_records: HEADER_BYTES as u64,
-            floor: 0,
         },
         frames: Vec::new(),
         parameters,
@@ -403,7 +504,6 @@ fn load(
             frame_count: header.frame_count,
             chain_tail: header.chain_tail,
             end_of_records,
-            floor: header.record_counter.max(floor.value()),
         },
         frames,
         parameters,
@@ -441,12 +541,31 @@ fn walk(
     Ok((frames, tail, at as u64))
 }
 
+/// Opens the vault for writing, through the same screen the read went through.
+///
+/// A write follows a symbolic link exactly as a read does, and this handle is the
+/// one every later append uses. Checking here as well as in [`read_all`] costs one
+/// `lstat` per open and closes the case where the path became a link between the
+/// two calls.
 fn open_handle(path: &Path) -> Result<File, VaultError> {
-    OpenOptions::new()
+    let looked_at =
+        regular_file(path, "opened")?.ok_or_else(|| VaultError::VaultFileUnavailable {
+            operation: "opened",
+            cause: "removed while it was being opened".to_owned(),
+        })?;
+
+    let handle = OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
-        .map_err(|cause| io_error("opened", &cause))
+        .map_err(|cause| io_error("opened", &cause))?;
+    same_file(
+        &looked_at,
+        &handle
+            .metadata()
+            .map_err(|cause| io_error("opened", &cause))?,
+    )?;
+    Ok(handle)
 }
 
 /// Creates the file, refusing to overwrite one that is already there.
@@ -535,6 +654,20 @@ mod tests {
         Passphrase::new(b"the operator typed this".to_vec())
     }
 
+    /// Every open in these tests goes through here.
+    ///
+    /// One place takes the permit, so it is taken exactly once per open and no
+    /// helper can nest one inside another.
+    fn open_here(
+        path: &Path,
+        passphrase: &Passphrase,
+        profile: ProfileName,
+        floor: CounterFloor,
+    ) -> Result<Loaded, VaultError> {
+        let _permit = key::one_derivation_at_a_time();
+        crate::vault::file::open(path, passphrase, profile, floor)
+    }
+
     fn frame(byte: u8, alias: &str) -> Frame {
         Frame {
             stored_at_ms: 1_700_000_000_000 + u64::from(byte),
@@ -549,7 +682,7 @@ mod tests {
     fn seeded(scratch: &Scratch, count: u8) -> PathBuf {
         let path = scratch.vault();
         let mut loaded =
-            open(&path, &passphrase(), ProfileName::Ci, CounterFloor::Unknown).unwrap();
+            open_here(&path, &passphrase(), ProfileName::Ci, CounterFloor::Unknown).unwrap();
         for byte in 1..=count {
             loaded
                 .file
@@ -560,13 +693,13 @@ mod tests {
     }
 
     fn reopen(path: &Path, floor: CounterFloor) -> Result<Loaded, VaultError> {
-        open(path, &passphrase(), ProfileName::Ci, floor)
+        open_here(path, &passphrase(), ProfileName::Ci, floor)
     }
 
     #[test]
     fn a_new_vault_is_a_header_and_nothing_else() {
         let scratch = Scratch::new("create");
-        let loaded = open(
+        let loaded = open_here(
             &scratch.vault(),
             &passphrase(),
             ProfileName::Ci,
@@ -589,7 +722,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let scratch = Scratch::new("mode");
-        open(
+        open_here(
             &scratch.vault(),
             &passphrase(),
             ProfileName::Ci,
@@ -623,7 +756,7 @@ mod tests {
         let scratch = Scratch::new("passphrase");
         let path = seeded(&scratch, 1);
 
-        let refusal = open(
+        let refusal = open_here(
             &path,
             &Passphrase::new(b"a different operator".to_vec()),
             ProfileName::Ci,
@@ -665,7 +798,7 @@ mod tests {
         );
         assert_eq!(refusal.http_status(), 503);
         assert_eq!(refusal.integrity(), Some(Integrity::ChainMismatch));
-        no_recovery_was_attempted(&scratch, &path, &tampered);
+        no_recovery_was_attempted(&scratch, &path, &tampered, CounterFloor::Unknown);
     }
 
     /// Violation two: an older copy of the file is put back.
@@ -702,7 +835,68 @@ mod tests {
         );
         assert_eq!(refusal.http_status(), 503);
         assert_eq!(refusal.integrity(), Some(Integrity::CounterRollback));
-        no_recovery_was_attempted(&scratch, &path, &old);
+        no_recovery_was_attempted(&scratch, &path, &old, CounterFloor::AtLeast(4));
+    }
+
+    /// The rollback nobody has to forge: the file is simply deleted.
+    ///
+    /// `record_counter` is zero when there is no file, so a caller holding a floor
+    /// of four is looking at a vault that went backwards. Creating a fresh one here
+    /// would make `rm vault.psk` succeed where restoring yesterday's copy is
+    /// refused, and the deletion is the easier attack of the two. ADR-007 section 3
+    /// and `proxy/spec.md` section 10 make no exception for an absent file.
+    #[test]
+    fn counter_rollback_a_deleted_file_does_not_open_a_new_vault() {
+        let scratch = Scratch::new("deleted");
+        let path = seeded(&scratch, 4);
+        std::fs::remove_file(&path).unwrap();
+
+        let refusal = reopen(&path, CounterFloor::AtLeast(4)).unwrap_err();
+        assert_eq!(
+            refusal,
+            VaultError::IntegrityFailed {
+                integrity: Integrity::CounterRollback
+            }
+        );
+        assert_eq!(refusal.http_status(), 503);
+        assert_eq!(refusal.integrity(), Some(Integrity::CounterRollback));
+
+        // And nothing was created on the way to that refusal: an empty vault left
+        // behind here would be adopted by the next caller that happens to pass
+        // `Unknown`, which is the rollback completing one restart later.
+        assert!(!path.exists(), "the refused open created a vault");
+        assert!(
+            scratch.listing().is_empty(),
+            "the refused open left a file behind: {:?}",
+            scratch.listing().keys().collect::<Vec<_>>()
+        );
+
+        // A floor of one is enough; the refusal is not a property of the number 4.
+        assert_eq!(
+            reopen(&path, CounterFloor::AtLeast(1)).unwrap_err(),
+            VaultError::IntegrityFailed {
+                integrity: Integrity::CounterRollback
+            }
+        );
+    }
+
+    /// The other half of the rule, or the first half would just be a broken create.
+    ///
+    /// A caller that knows nothing gets the fresh vault it asked for, and so does
+    /// one whose floor is zero: `AtLeast(0)` is a claim about nothing.
+    #[test]
+    fn a_caller_that_knows_no_floor_still_gets_a_new_vault() {
+        let scratch = Scratch::new("deleted-unknown");
+        let path = seeded(&scratch, 2);
+        std::fs::remove_file(&path).unwrap();
+
+        let fresh = reopen(&path, CounterFloor::Unknown).unwrap();
+        assert_eq!(fresh.file.record_counter(), 0);
+        drop(fresh);
+
+        std::fs::remove_file(&path).unwrap();
+        let zero = reopen(&path, CounterFloor::AtLeast(0)).unwrap();
+        assert_eq!(zero.file.record_counter(), 0);
     }
 
     /// Violation three: the Argon2id parameters in the header are weakened.
@@ -719,7 +913,7 @@ mod tests {
 
         // Created at the shipped strength, which is what makes weakening possible
         // while staying in range.
-        let mut loaded = open(
+        let mut loaded = open_here(
             &path,
             &passphrase(),
             ProfileName::Standard,
@@ -736,7 +930,7 @@ mod tests {
         tampered[12..16].copy_from_slice(&(64u32 * 1024).to_le_bytes());
         std::fs::write(&path, &tampered).unwrap();
 
-        let refusal = open(
+        let refusal = open_here(
             &path,
             &passphrase(),
             ProfileName::Standard,
@@ -751,7 +945,7 @@ mod tests {
         );
         assert_eq!(refusal.http_status(), 503);
         assert_eq!(refusal.integrity(), Some(Integrity::HeaderMacFailed));
-        no_recovery_was_attempted(&scratch, &path, &tampered);
+        no_recovery_was_attempted(&scratch, &path, &tampered, CounterFloor::Unknown);
     }
 
     /// The other half of every violation test: nothing was repaired.
@@ -761,7 +955,19 @@ mod tests {
     /// `proxy/spec.md` section 10 both forbid one. Checked by bytes rather than by
     /// reading the code, and repeated so that a second attempt cannot heal what the
     /// first refused.
-    fn no_recovery_was_attempted(scratch: &Scratch, path: &Path, expected: &[u8]) {
+    ///
+    /// `floor` is the caller's own, not a stand in. It used to be
+    /// `AtLeast(u64::MAX)`, which refuses **every** file including a healthy one, so
+    /// the retry assertion below held no matter what the bytes were and measured
+    /// nothing at all. Passing the floor the test actually refused under makes the
+    /// assertion depend on its input again;
+    /// `the_retry_check_can_tell_a_healthy_vault_apart` is the control that says so.
+    fn no_recovery_was_attempted(
+        scratch: &Scratch,
+        path: &Path,
+        expected: &[u8],
+        floor: CounterFloor,
+    ) {
         assert_eq!(
             std::fs::read(path).unwrap(),
             expected,
@@ -775,13 +981,31 @@ mod tests {
             "a refused open left a file beside the vault"
         );
 
-        let first = reopen(path, CounterFloor::AtLeast(u64::MAX)).is_err();
-        let second = reopen(path, CounterFloor::AtLeast(u64::MAX)).is_err();
-        assert!(
-            first && second,
-            "a second attempt opened what the first refused"
+        let first = reopen(path, floor).unwrap_err();
+        let second = reopen(path, floor).unwrap_err();
+        assert_eq!(
+            first, second,
+            "a second attempt answered differently from the first"
         );
         assert_eq!(std::fs::read(path).unwrap(), expected);
+    }
+
+    /// The control for the helper above: its condition is false for a healthy file.
+    ///
+    /// Without this, a helper that refused everything would look identical to a
+    /// helper that refuses what is broken, which is the shape the previous version
+    /// had.
+    #[test]
+    fn the_retry_check_can_tell_a_healthy_vault_apart() {
+        let scratch = Scratch::new("retry-control");
+        let path = seeded(&scratch, 3);
+        let honest = std::fs::read(&path).unwrap();
+
+        // The same two opens `no_recovery_was_attempted` performs, under a floor a
+        // caller of a healthy vault would hold.
+        assert!(reopen(&path, CounterFloor::AtLeast(3)).is_ok());
+        assert!(reopen(&path, CounterFloor::Unknown).is_ok());
+        assert_eq!(std::fs::read(&path).unwrap(), honest);
     }
 
     #[test]
@@ -843,7 +1067,7 @@ mod tests {
         let path = seeded(&scratch, 1);
 
         let other = donor.vault();
-        let mut donated = open(
+        let mut donated = open_here(
             &other,
             &passphrase(),
             ProfileName::Ci,
@@ -880,7 +1104,7 @@ mod tests {
         let scratch = Scratch::new("monotonic");
         let path = scratch.vault();
         let mut loaded =
-            open(&path, &passphrase(), ProfileName::Ci, CounterFloor::Unknown).unwrap();
+            open_here(&path, &passphrase(), ProfileName::Ci, CounterFloor::Unknown).unwrap();
 
         let mut seen = 0;
         for byte in 1..=4u8 {
@@ -953,6 +1177,108 @@ mod tests {
         let rendered = format!("{:?}", loaded.file);
         assert!(rendered.contains("record_counter"), "{rendered}");
         assert!(!rendered.contains("PSK_PERSON_1"), "{rendered}");
+    }
+
+    /// A vault path that is a symbolic link is refused rather than followed.
+    ///
+    /// The read runs before anything in the file has been authenticated, so it is
+    /// the step an attacker gets to choose the terms of. `/dev/zero` is the version
+    /// that never ends; a link to somebody else's file is the version that makes
+    /// this process read what it was never pointed at. Both are the same refusal.
+    #[cfg(unix)]
+    #[test]
+    fn a_vault_path_that_is_a_symbolic_link_is_refused_rather_than_followed() {
+        let scratch = Scratch::new("symlink");
+        let elsewhere = scratch.root.join("somebody-elses-file");
+        std::fs::write(&elsewhere, b"data nobody pointed this at").unwrap();
+        let link = scratch.vault();
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+
+        // The cause is asserted, not merely the class. Deleting the regular file
+        // screen leaves this path refusing anyway, because the descriptor no longer
+        // matches the name that was checked, so a test that accepted any refusal
+        // stayed green with the screen removed; that is how this assertion came to
+        // be written this way. What has to be true is that the link was seen for
+        // what it is, before anything was opened through it.
+        let refusal = reopen(&link, CounterFloor::Unknown).unwrap_err();
+        match &refusal {
+            VaultError::VaultFileUnavailable { operation, cause } => {
+                assert_eq!(*operation, "read");
+                assert!(cause.contains("not a regular file"), "{cause}");
+            }
+            other => panic!("expected the link to be refused by name, got {other:?}"),
+        }
+        assert_eq!(refusal.http_status(), 503);
+        assert_eq!(refusal.integrity(), None);
+
+        // A link to a path that does not exist yet is the version that leaves
+        // nothing behind to notice: without the screen the read reports "no file",
+        // and the create branch is what would run next.
+        let dangling = scratch.root.join("dangling.psk");
+        std::os::unix::fs::symlink(scratch.root.join("not-there-yet"), &dangling).unwrap();
+        match reopen(&dangling, CounterFloor::Unknown).unwrap_err() {
+            VaultError::VaultFileUnavailable { operation, cause } => {
+                assert_eq!(operation, "read");
+                assert!(cause.contains("not a regular file"), "{cause}");
+            }
+            other => panic!("expected the dangling link to be refused, got {other:?}"),
+        }
+        assert!(!scratch.root.join("not-there-yet").exists());
+
+        // And the file at the other end of the link is exactly as it was: a refusal
+        // that had followed the link would have opened it for writing.
+        assert_eq!(
+            std::fs::read(&elsewhere).unwrap(),
+            b"data nobody pointed this at"
+        );
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    /// A file grown past the ceiling is refused without being held in memory.
+    ///
+    /// The whole file is claimed rather than actually written: this asserts the
+    /// bound is applied, and writing 256 MiB to prove it would make the suite pay
+    /// the cost the bound exists to avoid. `set_len` past the ceiling gives a file
+    /// whose length is over it without the bytes being allocated on any filesystem
+    /// this runs on.
+    #[test]
+    fn a_vault_file_larger_than_the_ceiling_is_refused_without_being_read() {
+        let scratch = Scratch::new("oversized");
+        let path = seeded(&scratch, 1);
+        let honest_len = std::fs::metadata(&path).unwrap().len();
+
+        let handle = OpenOptions::new().write(true).open(&path).unwrap();
+        handle.set_len(MAX_VAULT_BYTES + 1).unwrap();
+        drop(handle);
+
+        let refusal = reopen(&path, CounterFloor::Unknown).unwrap_err();
+        match &refusal {
+            VaultError::VaultFileUnavailable { operation, cause } => {
+                assert_eq!(*operation, "read");
+                assert!(cause.contains("ceiling"), "{cause}");
+            }
+            other => panic!("expected a refusal about the ceiling, got {other:?}"),
+        }
+        assert_eq!(refusal.http_status(), 503);
+        // Not one of the three violations: the file was never authenticated, so
+        // naming a violation would put a fact in the status endpoint that nobody
+        // established.
+        assert_eq!(refusal.integrity(), None);
+
+        // The bound is a ceiling on the vault and not on this test's patience: a
+        // file back under it opens again, so what was refused was the size and not
+        // the file. Deliberately not a file *at* the ceiling, because reading 256
+        // MiB to prove a comparison is the cost the ceiling exists to avoid.
+        let handle = OpenOptions::new().write(true).open(&path).unwrap();
+        handle.set_len(honest_len).unwrap();
+        drop(handle);
+        assert_eq!(
+            reopen(&path, CounterFloor::Unknown).unwrap().frames.len(),
+            1
+        );
     }
 
     #[test]

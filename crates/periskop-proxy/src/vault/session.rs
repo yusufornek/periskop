@@ -46,8 +46,21 @@ pub const DEFAULT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 ///
 /// Also the HKDF salt the session key is expanded under, which is what makes two
 /// sessions produce unrelated aliases for the same value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SessionId([u8; SESSION_ID_BYTES]);
+
+/// Written by hand for the same reason as every other identifier in this vault.
+///
+/// A session identifier is not personal data, but it is the salt every alias in
+/// that conversation was derived under and the key under which its records are
+/// filed. Printed in a log line beside the aliases `TRACE` is allowed to carry, it
+/// is the join key that makes those aliases linkable again, which is the property
+/// ADR-007 spends the session scoped derivation to remove.
+impl fmt::Debug for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SessionId(<redacted>)")
+    }
+}
 
 impl SessionId {
     /// Draws a new identifier from the operating system's entropy source.
@@ -88,10 +101,19 @@ impl Default for SessionLimits {
 
 /// One record inside a session: the alias that was published, and the sealed
 /// original it stands for.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct AliasRecord {
     alias: String,
     sealed: SealedRecord,
+}
+
+/// The alias, which was sent to the provider and is not secret, and no more.
+impl fmt::Debug for AliasRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AliasRecord")
+            .field("alias", &self.alias)
+            .finish()
+    }
 }
 
 /// A masked conversation's memory.

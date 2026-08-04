@@ -98,17 +98,32 @@ pub fn run(request: &ProxyRequest<'_>, passphrase_source: &mut impl Read) -> Pro
     }
 }
 
+/// The most passphrase this command will take from standard input.
+///
+/// A passphrase somebody typed is tens of bytes and the longest anybody generates
+/// is hundreds. The ceiling is here because standard input is whatever the caller
+/// attached to it, and `read_to_end` on `/dev/zero` is a command that never
+/// returns rather than one that says no.
+const PASSPHRASE_CEILING: usize = 4096;
+
+/// The buffer the read starts with, sized so an ordinary passphrase never grows it.
+const PASSPHRASE_ROOM: usize = 256;
+
 /// Reads a passphrase from a stream, into a buffer that clears itself.
 ///
 /// One trailing newline is dropped, because a shell adds one and an operator did
 /// not type it. Nothing else is trimmed: leading and inner whitespace are part of
 /// a passphrase somebody chose.
+///
+/// Read in chunks rather than with `read_to_end`, and grown by hand. `Zeroizing`
+/// clears the buffer it is holding when it drops, which is the **last** allocation
+/// and not the ones before it: a `Vec` that grows copies its contents into a new
+/// allocation and frees the old one with the bytes still in it. A passphrase long
+/// enough to make the buffer grow twice therefore left two readable copies of its
+/// own prefix on the heap, which is the thing `Zeroizing` was reached for to
+/// prevent.
 fn read_passphrase(source: &mut impl Read) -> Result<Passphrase, String> {
-    let mut raw = Zeroizing::new(Vec::new());
-    source
-        .read_to_end(&mut raw)
-        .map_err(|e| format!("the passphrase could not be read from standard input: {e}"))?;
-
+    let raw = read_bounded(source)?;
     let passphrase = Passphrase::new(without_trailing_newline(&raw).to_vec());
     if passphrase.is_empty() {
         return Err(
@@ -118,6 +133,49 @@ fn read_passphrase(source: &mut impl Read) -> Result<Passphrase, String> {
         );
     }
     Ok(passphrase)
+}
+
+/// The bytes on the stream, in a buffer that never leaves a copy of itself behind.
+///
+/// Separate from [`read_passphrase`] so that the assembly can be tested on its own
+/// bytes: [`Passphrase`] deliberately has no accessor a test could read, which is a
+/// property worth keeping rather than one to work around.
+fn read_bounded(source: &mut impl Read) -> Result<Zeroizing<Vec<u8>>, String> {
+    let mut raw = Zeroizing::new(Vec::with_capacity(PASSPHRASE_ROOM));
+    let mut chunk = Zeroizing::new([0u8; PASSPHRASE_ROOM]);
+
+    loop {
+        let read = source
+            .read(chunk.as_mut_slice())
+            .map_err(|e| format!("the passphrase could not be read from standard input: {e}"))?;
+        if read == 0 {
+            return Ok(raw);
+        }
+        if raw.len() + read > PASSPHRASE_CEILING {
+            return Err(format!(
+                "the passphrase on standard input is longer than {PASSPHRASE_CEILING} bytes; \
+                 the vault stays sealed"
+            ));
+        }
+        grow_without_leaving_a_copy(&mut raw, read);
+        raw.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// Makes room for `more` bytes, clearing the buffer it grew out of.
+///
+/// The replacement is assigned over the old one, so the old `Zeroizing` is dropped
+/// here and zeroizes the allocation it holds **before** it is freed. That is the
+/// step `Vec`'s own reallocation skips, and it is the whole reason this function
+/// exists rather than a call to `reserve`.
+fn grow_without_leaving_a_copy(raw: &mut Zeroizing<Vec<u8>>, more: usize) {
+    let needed = raw.len() + more;
+    if needed <= raw.capacity() {
+        return;
+    }
+    let mut grown = Zeroizing::new(Vec::with_capacity(needed.max(raw.capacity() * 2)));
+    grown.extend_from_slice(raw);
+    *raw = grown;
 }
 
 /// Drops the line ending a shell adds, and nothing else.
@@ -195,6 +253,48 @@ mod tests {
         // And nothing more than that one line ending.
         assert_eq!(without_trailing_newline(b" hunter 2 \n"), b" hunter 2 ");
         assert_eq!(without_trailing_newline(b"hunter2\n\n"), b"hunter2\n");
+    }
+
+    /// A passphrase longer than the buffer starts out with still arrives whole.
+    ///
+    /// The read is chunked and the buffer is grown by hand, so the join between
+    /// two chunks is a place a byte could be dropped or repeated. Sized past two
+    /// growths on purpose: one would exercise the fast path only.
+    #[test]
+    fn a_passphrase_longer_than_the_first_buffer_arrives_byte_for_byte() {
+        for length in [
+            PASSPHRASE_ROOM - 1,
+            PASSPHRASE_ROOM,
+            PASSPHRASE_ROOM * 3 + 7,
+        ] {
+            let typed: Vec<u8> = (0..length).map(|at| b'a' + (at % 23) as u8).collect();
+            let mut source = typed.clone();
+            source.push(b'\n');
+
+            let read = read_bounded(&mut source.as_slice()).unwrap();
+            assert_eq!(
+                without_trailing_newline(&read),
+                typed.as_slice(),
+                "a {length} byte passphrase did not survive the read"
+            );
+        }
+    }
+
+    /// Standard input is whatever the caller attached to it, and this command does
+    /// not read all of it.
+    #[test]
+    fn a_passphrase_past_the_ceiling_is_refused_rather_than_read() {
+        let enormous = vec![b'x'; PASSPHRASE_CEILING + 1];
+        let error = read_bounded(&mut enormous.as_slice()).unwrap_err();
+        assert!(error.contains(&PASSPHRASE_CEILING.to_string()), "{error}");
+
+        // And one exactly at the ceiling is still a passphrase, so what was refused
+        // was the size and not the input.
+        let at_the_ceiling = vec![b'x'; PASSPHRASE_CEILING];
+        assert_eq!(
+            read_bounded(&mut at_the_ceiling.as_slice()).unwrap().len(),
+            PASSPHRASE_CEILING
+        );
     }
 
     #[test]

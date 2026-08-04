@@ -34,6 +34,8 @@
 //! (ADR-007's last rejected alternative): a forgotten branch would restore the
 //! silent substitution, whereas a forgotten AAD field cannot decrypt at all.
 
+use std::fmt;
+
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 
@@ -105,8 +107,21 @@ impl RecordType {
 /// Produced by the alias layer in a later wave. The vault treats it as opaque;
 /// what it needs is that it is unique per record, which is what
 /// `HMAC-SHA256(K_session, type || value)` gives it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AliasSeed([u8; ALIAS_SEED_BYTES]);
+
+/// Written by hand, because a seed is a keyed digest **of the masked value**.
+///
+/// The bytes are not the personal data, but they are a stable identifier derived
+/// from it: the same original in the same session always produces the same seed,
+/// so a log line carrying one lets a reader link every occurrence of a value they
+/// were never shown. `proxy/spec.md` section 9 lists what `TRACE` may carry and
+/// this is not on the list.
+impl fmt::Debug for AliasSeed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AliasSeed(<redacted>)")
+    }
+}
 
 impl AliasSeed {
     pub fn from_bytes(bytes: [u8; ALIAS_SEED_BYTES]) -> Self {
@@ -120,11 +135,25 @@ impl AliasSeed {
 
 /// Everything a record is bound to. Borrowed rather than owned so that building
 /// one costs nothing on the request path.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct RecordIdentity<'a> {
     pub record_type: RecordType,
     pub session: &'a SessionId,
     pub alias_seed: &'a AliasSeed,
+}
+
+/// The kind, which is a closed vocabulary, and nothing that identifies anybody.
+///
+/// The derived form printed the session and the seed through their own renderings,
+/// so it is only as safe as those two stay; written out here it is safe on its own.
+impl fmt::Debug for RecordIdentity<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecordIdentity")
+            .field("record_type", &self.record_type)
+            .field("session", &"<redacted>")
+            .field("alias_seed", &"<redacted>")
+            .finish()
+    }
 }
 
 impl RecordIdentity<'_> {
@@ -149,10 +178,26 @@ impl RecordIdentity<'_> {
 ///
 /// There is no counter, no sequence number and no timestamp in here. Anything of
 /// that shape would be state, and state is what rolls back.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SealedRecord {
     nonce: [u8; NONCE_BYTES],
     body: Vec<u8>,
+}
+
+/// Lengths, not bytes.
+///
+/// The body is ciphertext, so printing it does not hand over a value; it hands
+/// over the exact bytes an attacker needs to replay a record into another file,
+/// and it does so through the one call every logger reaches for. The nonce is
+/// worse: it is the input that must never repeat, and a log of nonces is a map of
+/// which records were written when.
+impl fmt::Debug for SealedRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SealedRecord")
+            .field("nonce", &"<redacted>")
+            .field("body", &"<redacted>")
+            .finish()
+    }
 }
 
 impl SealedRecord {
@@ -282,6 +327,29 @@ mod tests {
             session,
             alias_seed: seed,
         }
+    }
+
+    /// The three identifiers in this module print nothing a reader could join on.
+    ///
+    /// A derived `Debug` here is not an abstract risk: a seed is a keyed digest of
+    /// the masked value, so the same original always produces the same bytes, and a
+    /// log line carrying them lets somebody link every occurrence of a value they
+    /// were never shown. The sealed body and its nonce are the bytes an attacker
+    /// needs to replay a record into another file.
+    #[test]
+    fn no_identifier_in_this_module_prints_its_bytes() {
+        let seed = seed(0xAB);
+        let sealed = SealedRecord::from_parts([0xCD; NONCE_BYTES], vec![0xEF; 16]);
+        let identity = identity(&SESSION, &seed);
+
+        let rendered = format!("{seed:?} {sealed:?} {identity:?} {SESSION:?}");
+        for byte in ["171", "ab", "AB", "205", "cd", "239", "ef", "10, 10"] {
+            assert!(!rendered.contains(byte), "{rendered} carries {byte}");
+        }
+        assert_eq!(rendered.matches("<redacted>").count(), 6, "{rendered}");
+        // The kind is a closed vocabulary and stays readable, or the rendering
+        // would be useless rather than careful.
+        assert!(rendered.contains("Alias"), "{rendered}");
     }
 
     fn key() -> RecordKey {
