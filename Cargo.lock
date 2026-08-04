@@ -322,6 +322,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "periskop-network-sensor"
+version = "0.1.0"
+dependencies = [
+ "periskop-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "periskop-reconcile"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "periskop-core",
+ "periskop-report",
+ "periskop-runtime-collector",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "periskop-report"
 version = "0.1.0"
 dependencies = [

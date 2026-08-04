@@ -21,6 +21,13 @@
       "violates": "payload shape may not carry content",
       "expected_error_contains": "raw_body",
       "rationale": "The hook records structure, never content. A raw_body field would turn an observation tool into a copy of the data it was deployed to protect, so the schema refuses the field outright rather than trusting every caller to leave it out."
+    },
+    {
+      "file": "flow.invalid.json",
+      "schema": "flow.schema.json",
+      "violates": "a flow may not carry payload bytes",
+      "expected_error_contains": "payload_bytes",
+      "rationale": "The sensor observes destinations, not contents. A field for payload bytes would turn the component deployed to find leaks into one, so the schema refuses it rather than relying on every implementation to leave it out."
     }
   ]
 }

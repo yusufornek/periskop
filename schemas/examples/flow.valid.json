@@ -1,0 +1,28 @@
+{
+  "schema_version": "1.0",
+  "flow_id": "fl_0000000000000000",
+  "host_id": "h_9f2c4a17be0d5386",
+  "boot_id": "b_3f0a91c7d4e28b56",
+  "t_start_bucket": 1785834000,
+  "duration_ms": 412,
+  "five_tuple": {
+    "src_port": 54321,
+    "dst_ip": "104.18.7.1",
+    "dst_port": 443,
+    "proto": "tcp"
+  },
+  "resolved_host": "api.openai.com",
+  "resolved_host_source": "dns_and_sni",
+  "sni_source": "client_hello",
+  "provider_ref": "openai",
+  "process_attribution": "kernel_attributed",
+  "process": {
+    "pid": 4821,
+    "pid_start_time": 1785833900,
+    "comm": "python3"
+  },
+  "flow_scope": "in_scope",
+  "bytes_out": 2048,
+  "bytes_in": 8192,
+  "mechanism": "ebpf"
+}

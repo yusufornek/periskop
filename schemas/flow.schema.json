@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://periskop.dev/schemas/flow.schema.json",
+  "title": "Flow",
+  "type": "object",
+  "description": "One network connection the sensor observed leaving the machine. A declared egress point says the code can reach a provider and an event says it did; a flow says bytes left, whether or not anything in the code explains them.",
+  "$comment": "Metadata only. There is no field for payload bytes and none will be added: the sensor sees destinations, not contents, and the moment it could record contents it would become the leak it was deployed to find.",
+  "required": [
+    "schema_version",
+    "flow_id",
+    "host_id",
+    "t_start_bucket",
+    "five_tuple",
+    "process_attribution",
+    "flow_scope",
+    "sni_source",
+    "mechanism"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^\\d+\\.\\d+$" },
+    "flow_id": { "type": "string", "pattern": "^fl_[0-9a-f]{16}$" },
+    "host_id": { "type": "string", "description": "Machine the sensor ran on. Not a hostname: a stable opaque id, so a report does not carry infrastructure naming." },
+    "boot_id": { "type": "string" },
+    "netns": { "type": "string", "description": "Network namespace, so container traffic is not confused with host traffic." },
+
+    "t_start_bucket": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Observation start, rounded to a fixed bucket. A raw microsecond stamp would put wall clock into an identity that has to compare equal across runs."
+    },
+    "duration_ms": { "type": "integer", "minimum": 0 },
+
+    "five_tuple": {
+      "type": "object",
+      "required": ["src_port", "dst_ip", "dst_port", "proto"],
+      "additionalProperties": false,
+      "properties": {
+        "src_port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "dst_ip": { "type": "string" },
+        "dst_port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "proto": { "enum": ["tcp", "udp"] }
+      }
+    },
+
+    "resolved_host": { "type": "string", "description": "Destination name, when one could be established." },
+    "resolved_host_source": {
+      "enum": ["dns", "sni", "dns_and_sni", "none"],
+      "description": "How the name was established. Reported because the two sources can disagree and a reader needs to know which one produced this."
+    },
+    "sni_source": {
+      "enum": ["client_hello", "encrypted_client_hello", "absent"],
+      "description": "Required. encrypted_client_hello means the name is genuinely unavailable rather than merely missing, and the two must not read alike."
+    },
+
+    "provider_ref": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+
+    "process_attribution": {
+      "enum": ["kernel_attributed", "inferred", "unattributed"],
+      "description": "How the owning process was determined. Kernel context is certain; an inference from a socket table snapshot is not, and a flow nobody could attribute is still reported."
+    },
+    "process": {
+      "type": "object",
+      "required": ["pid"],
+      "additionalProperties": false,
+      "properties": {
+        "pid": { "type": "integer", "minimum": 0 },
+        "pid_start_time": { "type": "integer", "minimum": 0, "description": "Guards against pid reuse: a pid alone can name two different processes over a long observation." },
+        "comm": { "type": "string" },
+        "exe": { "type": "string" },
+        "cmdline_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+
+    "flow_scope": {
+      "enum": ["in_scope", "out_of_scope_process", "known_benign", "undetermined"],
+      "description": "Which bucket this flow falls into. Only in_scope can produce an unmatched traffic finding. The other three never enter false positive accounting and are never hidden either: a bucket that disappears from the report is a silent swallow, which is what the counting was meant to prevent."
+    },
+
+    "bytes_out": { "type": "integer", "minimum": 0 },
+    "bytes_in": { "type": "integer", "minimum": 0 },
+    "segments_out": { "type": "integer", "minimum": 0 },
+
+    "mechanism": { "enum": ["ebpf", "pcap", "etw"] },
+    "degraded_reasons": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "tc_unavailable",
+          "encrypted_dns",
+          "ech",
+          "sampling_mode",
+          "map_overflow",
+          "container_ns_unresolved",
+          "pid_reuse_suspected",
+          "dns_sni_mismatch",
+          "pre_existing_connection"
+        ]
+      },
+      "description": "pre_existing_connection means bytes_out and duration_ms are lower bounds and t_start_bucket is when observation began, not when the connection did. A threshold rule must not discard such a record for falling under a limit."
+    }
+  }
+}

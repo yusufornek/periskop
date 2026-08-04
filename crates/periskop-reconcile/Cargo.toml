@@ -1,0 +1,31 @@
+[package]
+name = "periskop-reconcile"
+description = "Joins what the code declares against what actually ran, and derives the findings neither source could produce alone."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+periskop-core = { workspace = true }
+# The reconciliation mode is a coverage field this crate decides and the report
+# only carries. Depending on the report crate for the enum keeps one spelling of
+# a contract vocabulary in the workspace; a second copy here would be free to
+# drift from the schema in exactly the way the rest of this codebase writes tests
+# against.
+periskop-report = { workspace = true }
+# Events arrive as the collector read them, already validated against the event
+# contract. Redefining the type here would mean validating the same records
+# twice, against two shapes that are only equal until one of them is edited.
+periskop-runtime-collector = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

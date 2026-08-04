@@ -1,0 +1,24 @@
+[package]
+name = "periskop-network-sensor"
+description = "Observes the connections that left the machine, and never what they carried."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+periskop-core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+# Only the tests read JSON: they hold the types against
+# `schemas/flow.schema.json` and against the contract example. Production code
+# builds records and hands them on, so the parser stays out of the shipped
+# binary.
+[dev-dependencies]
+serde_json = { workspace = true }
