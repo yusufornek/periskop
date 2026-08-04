@@ -54,7 +54,7 @@ pub fn load_rule_file(path: &Path) -> Result<RuleFile, RuleLoadError> {
 
 /// Parses rule text. Split out from file reading so tests do not need a temp dir.
 pub fn parse_rule(path: &Path, text: &str) -> Result<RuleFile, RuleLoadError> {
-    let rule: RuleFile = toml::from_str(text).map_err(|e| {
+    let mut rule: RuleFile = toml::from_str(text).map_err(|e| {
         // The toml crate reports a byte span. Turning it into a line number is
         // what makes the message actionable in an editor.
         let line = e
@@ -68,6 +68,7 @@ pub fn parse_rule(path: &Path, text: &str) -> Result<RuleFile, RuleLoadError> {
         }
     })?;
 
+    rule.rule_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
     validate(path, &rule)?;
     Ok(rule)
 }

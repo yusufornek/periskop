@@ -5,6 +5,7 @@
 //! inside a comment produces a claim the evidence does not support.
 
 pub mod discovery;
+pub mod engine;
 pub mod language;
 pub mod parser;
 pub mod rules;

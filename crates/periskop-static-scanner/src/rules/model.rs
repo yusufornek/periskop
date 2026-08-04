@@ -33,6 +33,13 @@ pub struct RuleFile {
     pub extract: BTreeMap<String, ExtractSpec>,
 
     pub classify: ClassifySpec,
+
+    /// blake3 of the rule file as written. Filled in by the loader, never read
+    /// from the file itself, so a rule cannot claim a hash it does not have.
+    /// Carried into every finding so a report can be traced to the exact rule
+    /// text that produced it.
+    #[serde(skip)]
+    pub rule_hash: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
