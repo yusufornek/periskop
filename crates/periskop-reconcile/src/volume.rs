@@ -36,6 +36,36 @@ pub(crate) const RULE_ID: &str = "any.reconciled.volume-anomaly";
 pub(crate) struct Derived {
     pub findings: Vec<Finding>,
     pub faults: Vec<String>,
+    /// Comparisons this rule could not make, with the reason and the count.
+    ///
+    /// The rule has two ways of knowing nothing, and neither of them used to
+    /// leave a trace: a connection whose bytes nothing counted, and a call that
+    /// declared no payload size. Both ended in `continue`, so a report said
+    /// "the rule ran and found nothing" for a run in which the rule could not
+    /// look at all. Silence has to be told apart from an answer, which is the
+    /// same rule the capability table applies one layer up.
+    pub silences: Vec<String>,
+}
+
+/// What the calls tied to one connection said they were sending.
+///
+/// The count of calls that stated nothing is carried beside the total, because
+/// the total alone cannot be read. `byte_size_estimate` has no absent value in
+/// the contract, so a hook that could not size a payload writes zero, and a zero
+/// mixed into a sum silently lowers the expected total. Three calls of which one
+/// is unsized produce an expected total two thirds of the truth and an anomaly
+/// that describes the hook rather than the traffic.
+struct DeclaredTotal {
+    bytes: u64,
+    tied_calls: u64,
+    unsized_calls: u64,
+}
+
+impl DeclaredTotal {
+    /// Whether the total is a complete statement of what the calls declared.
+    fn is_complete(&self) -> bool {
+        self.tied_calls > 0 && self.unsized_calls == 0
+    }
 }
 
 /// Derives one finding per stretch of traffic whose volume the calls do not
@@ -54,6 +84,8 @@ pub(crate) fn derive(
     settings: &ReconcileSettings,
 ) -> Derived {
     let mut derived = Derived::default();
+    let mut uncounted = Uncomparable::default();
+    let mut unsized_payloads = Uncomparable::default();
 
     for episode in episodes {
         if !episode.counts_toward_findings() {
@@ -67,18 +99,26 @@ pub(crate) fn derive(
         };
         // A connection whose bytes nothing counted is not a connection that
         // carried none. Reading the absence as zero would make every such
-        // record an anomaly against any declared payload.
+        // record an anomaly against any declared payload; passing over it
+        // without a count would let a sensor that cannot measure volume at all
+        // read as a sensor that measured and found everything normal.
         let Some(observed) = episode.bytes_out else {
+            uncounted.record(episode);
             continue;
         };
-        let expected = declared_bytes(episode, j1, events);
-        // Nothing was declared to be sent, so there is no band: every positive
-        // byte count would sit outside a band anchored on zero, and the reason
-        // would be that the hook could not size the payload rather than that
-        // anything unusual happened.
-        if expected == 0 {
+        let declared = declared_bytes(episode, j1, events);
+        // The expected total is only a number when every tied call stated its
+        // size. One unsized call lowers the sum, and the finding that follows
+        // describes the hook's blind spot as though it were the machine's
+        // behaviour, which is the invented finding this rule must never
+        // produce. It also covers the case where nothing was declared at all: a
+        // band anchored on zero admits only zero, so every byte would be an
+        // anomaly.
+        if !declared.is_complete() {
+            unsized_payloads.record(episode);
             continue;
         }
+        let expected = declared.bytes;
         if band.admits(observed, expected) {
             continue;
         }
@@ -126,24 +166,76 @@ pub(crate) fn derive(
         }
     }
 
+    derived.silences.extend(uncounted.note(
+        "no record counted the bytes that left the socket, so nothing could be compared against \
+         the declared payload",
+    ));
+    derived.silences.extend(unsized_payloads.note(
+        "a call tied to it declared no payload size, so the expected total would have been short \
+         and the difference would have described the hook rather than the traffic",
+    ));
+
     derived
+}
+
+/// One reason the comparison could not be made, and how much it covered.
+///
+/// Episodes and connections are both counted for the reason the unmatched rule
+/// counts both: one conversation can hold a thousand connections, and a reader
+/// asking how much of the run this rule was blind to needs the second number.
+#[derive(Debug, Default)]
+struct Uncomparable {
+    episodes: u64,
+    flows: u64,
+}
+
+impl Uncomparable {
+    fn record(&mut self, episode: &WireEpisode) {
+        self.episodes = self.episodes.saturating_add(1);
+        self.flows = self.flows.saturating_add(episode.flow_count());
+    }
+
+    fn note(&self, reason: &str) -> Option<String> {
+        (self.episodes > 0).then(|| {
+            format!(
+                "volume anomaly: {} in scope conversations over {} connections were not compared \
+                 because {reason}",
+                self.episodes, self.flows
+            )
+        })
+    }
 }
 
 /// How much the calls tied to this connection said they were sending.
 ///
 /// Summed over every tied call, because keep alive puts many requests on one
 /// connection and comparing the socket's total against one of them would report
-/// every reused connection as an anomaly.
-fn declared_bytes(episode: &WireEpisode, j1: &J1Result, events: &[EgressEvent]) -> u64 {
-    j1.matches_for(&episode.flow_id)
-        .filter_map(|matched| {
-            events
-                .iter()
-                .find(|event| event.egress_event_id == matched.egress_event_id)
-        })
-        .fold(0u64, |total, event| {
-            total.saturating_add(event.payload_shape.byte_size_estimate)
-        })
+/// every reused connection as an anomaly. The calls that declared nothing are
+/// counted rather than added as zero, so the caller can tell a small payload
+/// from an unmeasured one.
+fn declared_bytes(episode: &WireEpisode, j1: &J1Result, events: &[EgressEvent]) -> DeclaredTotal {
+    let mut total = DeclaredTotal {
+        bytes: 0,
+        tied_calls: 0,
+        unsized_calls: 0,
+    };
+    for event in j1.matches_for(&episode.flow_id).filter_map(|matched| {
+        events
+            .iter()
+            .find(|event| event.egress_event_id == matched.egress_event_id)
+    }) {
+        total.tied_calls = total.tied_calls.saturating_add(1);
+        let declared = event.payload_shape.byte_size_estimate;
+        if declared == 0 {
+            // The contract has no "could not measure" value for this field, so
+            // zero carries both meanings and neither can be told from the
+            // other. Treating it as a measurement is the reading that invents
+            // findings, so it is treated as the absence of one.
+            total.unsized_calls = total.unsized_calls.saturating_add(1);
+        }
+        total.bytes = total.bytes.saturating_add(declared);
+    }
+    total
 }
 
 /// How firmly the claim may be stated.
@@ -205,6 +297,16 @@ mod tests {
         let mut call = event("openai", operation, host, "openai");
         call.payload_shape.byte_size_estimate = bytes;
         call
+    }
+
+    /// One more call to the same destination, distinguished by its operation.
+    ///
+    /// The operation has to differ for the record to be a second call rather
+    /// than a second copy of the first: the event identity is derived from the
+    /// module, the operation and the destination, so two records agreeing on all
+    /// three are one call recorded twice and the join says so.
+    fn call_op(operation: &str, bytes: u64) -> EgressEvent {
+        call_to("api.openai.com", operation, bytes)
     }
 
     fn evidence_of(derived: &Derived) -> String {
@@ -308,14 +410,67 @@ mod tests {
     }
 
     #[test]
-    fn a_connection_whose_bytes_nothing_counted_produces_nothing() {
+    fn a_connection_whose_bytes_nothing_counted_produces_nothing_and_says_so() {
         // Absent is not zero. Reading it as zero would make every uncounted
-        // record an anomaly against any declared payload.
+        // record an anomaly against any declared payload, and passing over it
+        // in silence would let "I could not measure" read as "I measured and
+        // everything was normal".
         let mut uncounted = flow("api.openai.com", BUCKET, FlowScope::InScope);
         uncounted.bytes_out = None;
-        assert!(derive_with(&[uncounted], &[call_of(100)], band())
-            .findings
-            .is_empty());
+        let derived = derive_with(&[uncounted], &[call_of(100)], band());
+
+        assert!(derived.findings.is_empty());
+        assert_eq!(derived.silences.len(), 1, "{:?}", derived.silences);
+        assert!(
+            derived.silences[0].contains("no record counted the bytes"),
+            "{:?}",
+            derived.silences
+        );
+        assert!(
+            derived.silences[0].contains("1 in scope conversations over 1 connections"),
+            "{:?}",
+            derived.silences
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_connection_is_counted_beside_the_measured_ones_it_ran_with() {
+        // The shape that hid the defect: a run where most connections are
+        // measured produces findings, and the blind spot in the middle of it
+        // has to be visible rather than averaged away.
+        let mut uncounted = named_flow(
+            "api.anthropic.com",
+            "anthropic",
+            BUCKET,
+            FlowScope::InScope,
+            54_999,
+        );
+        uncounted.bytes_out = None;
+        let anthropic_call = {
+            let mut call = event(
+                "anthropic",
+                "messages.create",
+                "api.anthropic.com",
+                "anthropic",
+            );
+            call.payload_shape.byte_size_estimate = 100;
+            call
+        };
+        let flows = [
+            flow("api.openai.com", BUCKET, FlowScope::InScope),
+            uncounted,
+        ];
+        let derived = derive_with(&flows, &[call_of(100), anthropic_call], band());
+
+        // The measured connection carried 2048 against a declared 100, which is
+        // outside the band.
+        assert_eq!(derived.findings.len(), 1, "{:?}", derived.findings);
+        assert_eq!(derived.silences.len(), 1, "{:?}", derived.silences);
+        assert!(
+            derived.silences[0].contains("1 in scope conversations over 1 connections"),
+            "{:?}",
+            derived.silences
+        );
     }
 
     #[test]
@@ -324,9 +479,61 @@ mod tests {
         // anomaly and the reason would be that the hook could not size the
         // payload.
         let flows = [flow("api.openai.com", BUCKET, FlowScope::InScope)];
-        assert!(derive_with(&flows, &[call_of(0)], band())
-            .findings
-            .is_empty());
+        let derived = derive_with(&flows, &[call_of(0)], band());
+
+        assert!(derived.findings.is_empty());
+        assert!(
+            derived
+                .silences
+                .iter()
+                .any(|line| line.contains("declared no payload size")),
+            "{:?}",
+            derived.silences
+        );
+    }
+
+    #[test]
+    fn one_unsized_call_on_a_reused_connection_produces_no_finding_at_all() {
+        // The invented finding this rule must never produce. Three calls
+        // travelled over one socket, the hook could size two of them, and the
+        // expected total is therefore 600 against 2048 on the wire: outside a
+        // band that admits three times the payload, so an anomaly appears whose
+        // subject is the hook's blind spot rather than the machine's behaviour.
+        let flows = [flow("api.openai.com", BUCKET, FlowScope::InScope)];
+        let events = [
+            call_of(300),
+            call_op("responses.create", 300),
+            call_op("embeddings.create", 0),
+        ];
+        let derived = derive_with(&flows, &events, band());
+
+        assert!(derived.findings.is_empty(), "{:?}", derived.findings);
+        assert!(
+            derived
+                .silences
+                .iter()
+                .any(|line| line.contains("declared no payload size")),
+            "{:?}",
+            derived.silences
+        );
+    }
+
+    #[test]
+    fn the_same_three_calls_with_every_size_stated_are_compared_as_before() {
+        // The other edge of the same rule, and the same three calls: the skip
+        // above is a statement about a missing measurement, so a complete set of
+        // measurements is still compared. 1100 declared against 2048 observed is
+        // inside a band that admits three times the payload.
+        let flows = [flow("api.openai.com", BUCKET, FlowScope::InScope)];
+        let events = [
+            call_of(300),
+            call_op("responses.create", 300),
+            call_op("embeddings.create", 500),
+        ];
+        let derived = derive_with(&flows, &events, band());
+
+        assert!(derived.findings.is_empty(), "{:?}", derived.findings);
+        assert!(derived.silences.is_empty(), "{:?}", derived.silences);
     }
 
     #[test]

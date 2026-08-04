@@ -73,6 +73,7 @@ pub fn reconcile(inputs: &ReconcileInputs) -> ReconcileOutcome {
     let mut findings = Vec::new();
     let mut resolved_targets = Vec::new();
     let mut faults = wire_losses;
+    let mut silences: Vec<String> = Vec::new();
 
     if capabilities.allows(DerivedKind::DormantEgressPoint) {
         let derived = dormant::derive(
@@ -103,6 +104,7 @@ pub fn reconcile(inputs: &ReconcileInputs) -> ReconcileOutcome {
         );
         findings.extend(derived.findings);
         faults.extend(derived.faults);
+        silences.extend(derived.silences);
     }
 
     // The band is read here rather than inside the deriver, so the rule that a
@@ -116,6 +118,7 @@ pub fn reconcile(inputs: &ReconcileInputs) -> ReconcileOutcome {
         let derived = volume::derive(&episodes, &j1_links, events, band, &inputs.settings);
         findings.extend(derived.findings);
         faults.extend(derived.faults);
+        silences.extend(derived.silences);
     }
 
     // Ordering is applied here rather than at serialization, so a caller that
@@ -139,12 +142,15 @@ pub fn reconcile(inputs: &ReconcileInputs) -> ReconcileOutcome {
     resolved_targets.dedup();
     faults.sort();
     faults.dedup();
+    silences.sort();
+    silences.dedup();
 
     ReconcileOutcome {
         findings,
         suppressed: capabilities.suppressed().to_vec(),
         resolved_targets,
         unlinked_events: links.unlinked_events(),
+        unresolved_event_targets: j1_links.unreadable_target_events(),
         reconciliation_mode: inputs.sources.reconciliation_mode(),
         observation_window_ms: inputs.window.duration_ms(),
         matches: links.matches().to_vec(),
@@ -155,5 +161,6 @@ pub fn reconcile(inputs: &ReconcileInputs) -> ReconcileOutcome {
         wire: inputs.sources.has_wire().then(|| WireCoverage::of(flows)),
         settings: inputs.settings.clone(),
         faults,
+        silences,
     }
 }

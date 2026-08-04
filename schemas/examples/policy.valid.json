@@ -1,0 +1,44 @@
+{
+  "policy": {
+    "name": "kurumsal-varsayilan",
+    "version": 3
+  },
+  "defaults": {
+    "severity": "warn"
+  },
+  "reconciliation": {
+    "volume_band": {
+      "min_basis_points": 5000,
+      "max_basis_points": 30000
+    }
+  },
+  "threshold": [
+    {
+      "id": "unmatched-wire-hard-stop",
+      "applies": {
+        "kind": "unmatched_wire_traffic",
+        "class": "application-egress"
+      },
+      "max": 0,
+      "on_exceed": "fail"
+    }
+  ],
+  "condition": [
+    {
+      "id": "onaysiz-saglayici",
+      "when.all": [
+        { "field": "category", "equals": "llm" },
+        { "field": "provider", "not_in": ["openai", "anthropic", "azure-openai"] }
+      ],
+      "severity": "fail",
+      "message": "Onayli olmayan bir LLM saglayicisina cikis tespit edildi."
+    }
+  ],
+  "coverage_condition": [
+    {
+      "id": "cok-fazla-ayristirilamayan-dosya",
+      "when": { "field": "coverage_unparsed_ratio", "greater_than": 200 },
+      "severity": "warn"
+    }
+  ]
+}

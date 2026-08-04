@@ -255,14 +255,22 @@ fn scan(
         let stage = reconcile::run(sources, &static_findings, &settings);
         coverage.dropped_events = stage.dropped_events;
         coverage.unlinked_events = stage.unlinked_events;
+        coverage.unresolved_event_targets = stage.unresolved_event_targets;
         coverage.observation_window_ms = stage.observation_window_ms;
         coverage.reconciliation_mode = stage.reconciliation_mode;
-        // Written only when a sensor fed the run. Four zeros left by a static
+        // Written only when a sensor fed the run. Five zeros left by a static
         // scan would say the sensor watched and the machine stayed quiet, and
-        // three of these four are the buckets that produce no finding: a bucket
+        // three of the buckets are the ones that produce no finding: a bucket
         // that keeps traffic out of the count and then reads as an observation
         // nobody made is the silent swallow K-15 exists to prevent.
+        //
+        // `in_scope_flows` is written with them because the other three are
+        // meaningless without it. A reader who is told 412 flows were out of
+        // scope cannot act on that number until the report also says what it is
+        // 412 of, and K-15's attribution accuracy gate is a ratio nobody can
+        // compute from a numerator.
         if let Some(wire) = stage.wire {
+            coverage.in_scope_flows = wire.in_scope_flows;
             coverage.out_of_scope_flows = wire.out_of_scope_flows;
             coverage.known_benign_flows = wire.known_benign_flows;
             coverage.unattributed_flows = wire.unattributed_flows;

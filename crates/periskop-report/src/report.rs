@@ -209,7 +209,16 @@ pub struct ScanReport {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-pub const SCHEMA_VERSION: &str = "1.0";
+/// Version of the report document this build writes.
+///
+/// `1.1` because the coverage statement gained fields, and the coverage
+/// statement has no version of its own by contract: it is a sub object of the
+/// report and inherits this one. The fields are `in_scope_flows`, the
+/// denominator the other flow buckets are read against, and
+/// `unresolved_event_targets`, the calls whose destination the hook could not
+/// read. Both are additions, so a reader of a 1.0 document loses nothing; what
+/// it cannot do is compute the attribution ratio K-15 states.
+pub const SCHEMA_VERSION: &str = "1.1";
 
 /// Collects findings and produces a report.
 ///

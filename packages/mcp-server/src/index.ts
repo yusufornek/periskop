@@ -45,7 +45,14 @@ async function main(): Promise<void> {
       description:
         "Walks a project and reports call sites that send data to an LLM provider. " +
         "Returns a summary with a first page of findings, plus what the scan could not read. " +
-        "A result with no findings is not the same as a project with no egress; read the coverage block.",
+        "A result with no findings is not the same as a project with no egress; read the coverage block. " +
+        "summary.reconciliation_mode says which sources fed the run, and every count is only as " +
+        "strong as that; summary.unmatched_wire_traffic counts findings where data left the machine " +
+        "and no code explains it, and is null when the findings do not state their kind. " +
+        "Confirmed and suspected findings are two separate lists and are never merged: one call " +
+        "pages one of them, the confidence argument chooses which, and page.other says how many " +
+        "are in the other. On a project with no runtime hooks installed the unmatched wire " +
+        "findings are suspected, so a caller that never asks for that list never sees them.",
       inputSchema: scanInput.shape,
     },
     async (args) => ({
@@ -80,7 +87,11 @@ async function main(): Promise<void> {
       title: "What the scan could not see",
       description:
         "Files that could not be read, libraries with no detector, and which observation " +
-        "layers were running. Answers whether a clean scan means clean or means unread.",
+        "layers were running. Answers whether a clean scan means clean or means unread. " +
+        "network_sensor is one of running, not running or unknown, and the third means the " +
+        "report did not say rather than that nothing was watching. flow_buckets counts the " +
+        "observed flows that produced no finding, and a count there is only readable next to " +
+        "the sensor state.",
       inputSchema: coverageInput.shape,
     },
     async (args) => ({

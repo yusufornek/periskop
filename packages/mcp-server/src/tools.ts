@@ -15,10 +15,29 @@
 
 import { z } from "zod";
 
-import type { EngineBridge } from "./bridge.js";
+import type { ReportSource } from "./bridge.js";
+import {
+  countUnmatchedWireTraffic,
+  flowBuckets,
+  networkSensor,
+  reconciliationMode,
+} from "./sources.js";
 
 export const DEFAULT_PAGE_SIZE = 20;
 export const MAX_PAGE_SIZE = 100;
+
+/**
+ * The two lists a report keeps, named by the confidence they carry.
+ *
+ * They are separate lists rather than one list with a field because the
+ * difference is what a reader has to act on: a confirmed finding is something
+ * the engine proved, a suspected one is something it could not rule out. The
+ * words are the ones `findings-schema.md` uses and the ones `mcp-tools.md`
+ * gives `filter.confidence`, so the tool argument, the report and the finding
+ * record all spell the same state the same way.
+ */
+export const CONFIDENCE_LEVELS = ["confirmed", "suspect"] as const;
+export type ConfidenceLevel = (typeof CONFIDENCE_LEVELS)[number];
 
 export interface EntityRef {
   ref_type: string;
@@ -52,6 +71,16 @@ export interface Coverage {
   unparsed_files: Array<{ path: string; reason: string }>;
   undetected_libraries: string[];
   runtime_coverage: Array<{ language: string; status: string }>;
+  // The observation half of the statement, optional for the same reason
+  // Finding.kind is: an engine older than a field omits it, and requiring it
+  // here would turn that into a type error at the boundary instead of an
+  // unknown in the answer. What each one means is in sources.ts, which is the
+  // only reader.
+  reconciliation_mode?: string;
+  out_of_scope_flows?: number;
+  known_benign_flows?: number;
+  unattributed_flows?: number;
+  unclassified_flows?: number;
 }
 
 export interface ScanReport {
@@ -65,6 +94,14 @@ export interface ScanReport {
 
 export const scanInput = z.object({
   path: z.string().describe("Project directory to scan."),
+  confidence: z
+    .enum(CONFIDENCE_LEVELS)
+    .optional()
+    .describe(
+      "Which of the two finding lists to page: confirmed, or suspect. Defaults to confirmed. " +
+        "The lists are never merged, and every answer says how many findings are in the one " +
+        "it is not showing.",
+    ),
   limit: z
     .number()
     .int()
@@ -97,23 +134,56 @@ function condense(finding: Finding): Record<string, unknown> {
   };
 }
 
+/** Provider identifiers in a list, deduplicated and ordered so answers diff. */
+function providersOf(findings: readonly Finding[]): string[] {
+  return [...new Set(findings.map((f) => f.provider_ref))].sort();
+}
+
 export async function runScan(
-  bridge: EngineBridge,
+  bridge: ReportSource,
   input: z.infer<typeof scanInput>,
 ): Promise<Record<string, unknown>> {
   const report = (await bridge.call("scan", { path: input.path })) as ScanReport;
 
+  // Which list this page comes from. Paging only the confirmed list was the
+  // bug: on a run without hooks every unmatched wire finding is suspected, so
+  // the summary counted flows nothing explained, the page was empty, the total
+  // was zero and no cursor reached them. The product's central claim was a
+  // number the caller could not open.
+  const shown: ConfidenceLevel = input.confidence ?? "confirmed";
+  const paged = shown === "confirmed" ? report.findings : report.suspect_findings;
+  const other: ConfidenceLevel = shown === "confirmed" ? "suspect" : "confirmed";
+  const otherList = shown === "confirmed" ? report.suspect_findings : report.findings;
+
   const limit = input.limit ?? DEFAULT_PAGE_SIZE;
   const cursor = input.cursor ?? 0;
-  const page = report.findings.slice(cursor, cursor + limit);
-  const nextCursor = cursor + limit < report.findings.length ? cursor + limit : null;
+  const page = paged.slice(cursor, cursor + limit);
+  const nextCursor = cursor + limit < paged.length ? cursor + limit : null;
 
   return {
     verdict: report.verdict,
     summary: {
       confirmed: report.findings.length,
       suspected: report.suspect_findings.length,
-      providers: [...new Set(report.findings.map((f) => f.provider_ref))].sort(),
+      // Both lists, because this is a kind and those two are confidences: a
+      // suspected unmatched flow is still a flow nothing in the code explains.
+      unmatched_wire_traffic: countUnmatchedWireTraffic([
+        ...report.findings,
+        ...report.suspect_findings,
+      ]),
+      // How many sources spoke. Without it a reader cannot weigh anything above:
+      // a scan that only read code has said nothing about what left the machine,
+      // and its silence has to be readable as silence.
+      reconciliation_mode: reconciliationMode(report.coverage),
+      // Kept apart rather than pooled, and keyed by the confidence enum. Answered
+      // from the confirmed findings alone, this list omitted any provider that
+      // only ever appeared in a suspected finding, which reads as a project that
+      // talks to nobody. Pooling the two would have hidden the opposite thing:
+      // which of the names was proved.
+      providers: {
+        confirmed: providersOf(report.findings),
+        suspect: providersOf(report.suspect_findings),
+      },
     },
     // Coverage travels with the summary rather than waiting to be asked for.
     // A caller who sees only counts would reasonably read zero findings as
@@ -125,15 +195,33 @@ export async function runScan(
       runtime_instrumented: report.coverage.runtime_coverage.some(
         (r) => r.status === "instrumented",
       ),
-      network_observed: false,
+      // Read from the report, and named the same here as in the coverage tool so
+      // that one fact does not answer to two words. It was a constant false
+      // until the third source arrived, which was the wrong answer for every run
+      // that had a sensor and an unprovable one for every run that did not.
+      network_sensor: networkSensor(report.coverage),
     },
     findings: page.map(condense),
-    page: { cursor, limit, next_cursor: nextCursor, total: report.findings.length },
+    page: {
+      // Named, because an empty page carries no rows to infer it from and an
+      // empty confirmed list is exactly when the other one matters.
+      confidence: shown,
+      cursor,
+      limit,
+      next_cursor: nextCursor,
+      total: paged.length,
+      // The list this answer is not showing, with the argument that pages it.
+      // Structured rather than described, so that reaching the rest of the
+      // findings does not depend on the caller having read the tool
+      // description, and paged rather than inlined so that neither list can
+      // empty the caller's context in one response.
+      other: { confidence: other, total: otherList.length, fetch_with: { confidence: other } },
+    },
   };
 }
 
 export async function getDetail(
-  bridge: EngineBridge,
+  bridge: ReportSource,
   input: z.infer<typeof detailInput>,
 ): Promise<Record<string, unknown>> {
   const report = (await bridge.call("scan", { path: input.path })) as ScanReport;
@@ -155,7 +243,7 @@ export async function getDetail(
 }
 
 export async function getCoverage(
-  bridge: EngineBridge,
+  bridge: ReportSource,
   input: z.infer<typeof coverageInput>,
 ): Promise<Record<string, unknown>> {
   const report = (await bridge.call("scan", { path: input.path })) as ScanReport;
@@ -167,9 +255,18 @@ export async function getCoverage(
     unread_total: coverage.unparsed_files.length,
     libraries_without_rules: coverage.undetected_libraries,
     runtime_coverage: coverage.runtime_coverage,
+    // Which sources fed the run. The counters below say how much each source
+    // could not account for, and none of them can be read without knowing
+    // whether the source was there at all.
+    reconciliation_mode: reconciliationMode(coverage),
     // Stated rather than implied. An empty list of network findings and an
     // absent network sensor look identical from the outside and mean opposite
-    // things.
-    network_sensor: "not running",
+    // things, and a sensor this server was told nothing about is a third case
+    // that must not borrow the words of the second.
+    network_sensor: networkSensor(coverage),
+    // Counts, never lists, and never left out. These four hold flows that
+    // produced no finding; a bucket that keeps traffic out of the count and
+    // then disappears from the answer is a silent drop (K-15).
+    flow_buckets: flowBuckets(coverage),
   };
 }

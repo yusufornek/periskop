@@ -95,8 +95,25 @@ pub struct CoverageStatement {
     pub unhooked_processes: u64,
     pub dropped_events: u64,
     pub unlinked_events: u64,
+    /// Observed calls whose destination the hook could not read.
+    ///
+    /// Different from `unlinked_events`, which counts calls that reached no code
+    /// point: these named no destination at all, so nothing could be compared
+    /// against the traffic that left the machine. The number is what keeps a
+    /// downgraded traffic claim readable, since a call that went nowhere nameable
+    /// is a standing candidate explanation for any connection in the run.
+    pub unresolved_event_targets: u64,
     pub unattributed_flows: u64,
     pub unclassified_flows: u64,
+    /// Flows attributed to the codebase under scan, and the only bucket derived
+    /// findings come from (K-15).
+    ///
+    /// The denominator the other three buckets are read against. Without it a
+    /// reader sees "412 out of scope" and cannot tell 412 of 450 from 412 of
+    /// 40000, which are opposite conclusions about the same machine, and the
+    /// attribution accuracy gate K-15 states cannot be checked from the report
+    /// at all.
+    pub in_scope_flows: u64,
     pub out_of_scope_flows: u64,
     pub known_benign_flows: u64,
     pub sensor_platform_class: SensorPlatformClass,
@@ -127,8 +144,10 @@ impl CoverageStatement {
             unhooked_processes: 0,
             dropped_events: 0,
             unlinked_events: 0,
+            unresolved_event_targets: 0,
             unattributed_flows: 0,
             unclassified_flows: 0,
+            in_scope_flows: 0,
             out_of_scope_flows: 0,
             known_benign_flows: 0,
             sensor_platform_class: SensorPlatformClass::None,

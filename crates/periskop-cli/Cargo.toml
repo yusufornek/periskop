@@ -33,6 +33,9 @@ periskop-runtime-collector = { workspace = true }
 periskop-static-scanner = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Only the signing command touches it, and only for the buffer a private key
+# file is read into. The key type itself clears its own copy (ADR-015).
+zeroize = { workspace = true }
 
 [dev-dependencies]
 periskop-static-scanner = { workspace = true }

@@ -13,6 +13,14 @@ use periskop_cli::clock::now_rfc3339;
 use periskop_cli::hook::{self, Ambient, HookError, HookRequest, Language};
 use periskop_cli::{render, rpc, scan};
 
+// The two halves of report signing. Modules of the binary rather than of the
+// library, because they are command surfaces: argument parsing, file paths and
+// exit codes. Everything that decides what a signature means lives in
+// `periskop-report`, where a second front end can reach it without going through
+// a process.
+mod sign;
+mod verify;
+
 /// Exit codes, fixed by the command line contract.
 mod exit {
     /// Scan completed and the policy passed.
@@ -97,6 +105,40 @@ enum Command {
         #[command(subcommand)]
         command: HookCommand,
     },
+
+    /// Sign a report, producing a detached signature envelope beside it.
+    ///
+    /// The signature says the report came from the named key unaltered. It says
+    /// nothing about whether the scan was complete or correct: that is what the
+    /// report's own coverage block is for.
+    Sign(sign::SignArgs),
+
+    /// Check a detached signature over a report.
+    ///
+    /// Exits non zero for every outcome but one. An unsigned report, a broken
+    /// signature, a key that was not named and an envelope that fails its schema
+    /// are all refusals, and none of them can be mistaken for a pass.
+    Verify(verify::VerifyArgs),
+
+    /// Ed25519 key material for report signing.
+    Key {
+        #[command(subcommand)]
+        command: KeyCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeyCommand {
+    // Unresolved against `docs/02-components/reporting/spec.md` §5, which says
+    // periskop does not generate keys. Recorded with the quote and three ways
+    // out in ADR-015 §7.1 rather than left for somebody to discover. The two
+    // commands beside it, `sign --key` and `verify --public-key`, do match that
+    // spec: it names a key file as a supported source.
+    /// Generate a signing key pair.
+    ///
+    /// Writes to the two paths given and to nowhere else. There is no default
+    /// location: a private key belongs where its owner decided to put it.
+    Generate(sign::KeyGenerateArgs),
 }
 
 #[derive(Subcommand)]
@@ -154,6 +196,11 @@ fn main() -> ExitCode {
         Command::Hook {
             command: HookCommand::Install(args),
         } => run_hook_install(&args),
+        Command::Sign(args) => sign::run(&args),
+        Command::Verify(args) => verify::run(&args),
+        Command::Key {
+            command: KeyCommand::Generate(args),
+        } => sign::run_key_generate(&args),
     }
 }
 

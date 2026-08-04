@@ -23,6 +23,8 @@
 //! all: a bucket that keeps flows out of the count and then disappears from the
 //! report is a silent swallow (K-15).
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 use periskop_network_sensor::flow::{Classification, Flow, ProcessAttribution};
@@ -166,17 +168,46 @@ impl WireEpisode {
             && self.attribution == other.attribution
     }
 
-    fn absorb(&mut self, other: Self) {
-        self.flow_ids.extend(other.flow_ids);
+    fn absorb(&mut self, mut other: Self) {
         self.interval = self.interval.joined(other.interval);
         self.bytes_out = match (self.bytes_out, other.bytes_out) {
             (Some(left), Some(right)) => Some(left.saturating_add(right)),
             (Some(left), None) => Some(left),
             (None, right) => right,
         };
-        // The weaker classification wins: an episode is only as classified as
-        // its least classified record, so a single opaque connection is not
-        // hidden behind a named one.
+        self.weaken_with(&other);
+        self.flow_ids.append(&mut other.flow_ids);
+    }
+
+    /// Folds a second record of *this same connection* into the first.
+    ///
+    /// Not a second connection, so nothing is added up. The sensor writes a
+    /// record when a socket opens and another when it closes, both under one
+    /// identity, because `flow_id` deliberately carries neither duration nor
+    /// volume. Summing the two produced a report that said `flows=1
+    /// bytes_out=4096` for a connection that carried 2048: the byte counts added
+    /// while the identity list collapsed back to one entry, so the evidence
+    /// stated twice the traffic under a count that looked right.
+    ///
+    /// `bytes_out` is cumulative for the life of the connection, so the larger
+    /// reading is the later one and the honest one. An absent count on either
+    /// side is the absence of a measurement, never a zero.
+    fn merge_reading(&mut self, other: Self) {
+        self.interval = self.interval.joined(other.interval);
+        self.bytes_out = match (self.bytes_out, other.bytes_out) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (Some(left), None) => Some(left),
+            (None, right) => right,
+        };
+        self.weaken_with(&other);
+    }
+
+    /// The properties an episode takes from its weakest record.
+    ///
+    /// Shared by both merges because the rule is the same either way: an episode
+    /// is only as classified and only as named as its least informative record,
+    /// so a single opaque connection is never hidden behind a named one.
+    fn weaken_with(&mut self, other: &Self) {
         self.classification = self.classification.max(other.classification);
         self.named &= other.named;
     }
@@ -253,6 +284,7 @@ pub(crate) fn episodes(flows: &[Flow], tolerance_ms: u64) -> (Vec<WireEpisode>, 
             .then_with(|| a.interval.cmp(&b.interval))
             .then_with(|| a.flow_id.cmp(&b.flow_id))
     });
+    let singles = one_record_per_connection(singles);
 
     let mut episodes: Vec<WireEpisode> = Vec::new();
     for episode in singles {
@@ -272,6 +304,50 @@ pub(crate) fn episodes(flows: &[Flow], tolerance_ms: u64) -> (Vec<WireEpisode>, 
     losses.sort();
     losses.dedup();
     (episodes, losses)
+}
+
+/// Folds every record of one connection into one record of it.
+///
+/// Two records sharing a `flow_id` are one connection observed twice, and the
+/// grouping below cannot tell them apart from two connections: it adds their
+/// byte counts and then deduplicates their identities, so the traffic doubles
+/// while the flow count stays at one. That is not a rare shape. The identity is
+/// derived from the host, the connection tuple and the start bucket and
+/// deliberately carries neither duration nor volume, so a sensor that writes one
+/// record at connect and another at close produces it for every connection it
+/// watches to the end.
+///
+/// Indexed rather than scanned over neighbours, so the result does not depend on
+/// two records of one connection happening to sort next to each other: a third
+/// connection to the same destination can start between them and separate them.
+///
+/// Records that share an identity and disagree about the conversation they
+/// belong to are left alone. That pair cannot come from one sensor run, since
+/// the identity is derived from the destination and the tuple, but a record read
+/// back was written by a build that is not this one and merging contradictory
+/// records would move traffic between the scope buckets K-15 keeps apart.
+fn one_record_per_connection(singles: Vec<WireEpisode>) -> Vec<WireEpisode> {
+    let mut merged: Vec<WireEpisode> = Vec::new();
+    let mut by_identity: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for single in singles {
+        let earlier_reading = by_identity.get(&single.flow_id).and_then(|positions| {
+            positions
+                .iter()
+                .copied()
+                .find(|&at| merged[at].same_conversation(&single))
+        });
+        match earlier_reading {
+            Some(at) => merged[at].merge_reading(single),
+            None => {
+                by_identity
+                    .entry(single.flow_id.clone())
+                    .or_default()
+                    .push(merged.len());
+                merged.push(single);
+            }
+        }
+    }
+    merged
 }
 
 /// What the wire source saw, in the counters the coverage statement carries.
@@ -427,6 +503,49 @@ pub(crate) mod tests {
         assert_eq!(episodes[0].flow_count(), 3);
         assert_eq!(episodes[0].bytes_out, Some(6_144));
         assert!(losses.is_empty());
+    }
+
+    #[test]
+    fn two_records_of_one_connection_are_one_connection_and_not_twice_the_traffic() {
+        // The sensor writes a record when the socket opens and another when it
+        // closes. Both carry the same identity, because the identity carries
+        // neither duration nor volume, so the pair used to be read as two
+        // connections: the byte counts were added and the identities collapsed,
+        // and the evidence said 3072 bytes over one connection for a connection
+        // that carried 2048.
+        let closed = flow("api.openai.com", 1_785_834_000, FlowScope::InScope);
+        let mut opened = closed.clone();
+        opened.bytes_out = Some(1_024);
+        opened.duration_ms = None;
+        assert_eq!(
+            opened.flow_id, closed.flow_id,
+            "one connection, two records"
+        );
+
+        let (episodes, losses) = episodes(&[opened, closed], TOLERANCE_MS);
+
+        assert_eq!(episodes.len(), 1, "{episodes:?}");
+        assert_eq!(episodes[0].flow_count(), 1);
+        // The cumulative counter at close, not the sum of the two readings.
+        assert_eq!(episodes[0].bytes_out, Some(2_048));
+        // The wider of the two readings survives, so a connection observed to
+        // its end is not shortened by the record written at its start.
+        assert_eq!(episodes[0].interval.span_ms(), 120);
+        assert!(losses.is_empty());
+    }
+
+    #[test]
+    fn a_connection_counted_once_and_uncounted_once_keeps_the_measurement() {
+        // Absent is not zero on either side of the merge: one reading knows the
+        // volume and the other does not, and the episode knows it.
+        let counted = flow("api.openai.com", 1_785_834_000, FlowScope::InScope);
+        let mut uncounted = counted.clone();
+        uncounted.bytes_out = None;
+
+        let (episodes, _) = episodes(&[uncounted, counted], TOLERANCE_MS);
+
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].bytes_out, Some(2_048));
     }
 
     #[test]

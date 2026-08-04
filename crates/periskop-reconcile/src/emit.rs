@@ -37,10 +37,37 @@ const FIELD_SEPARATOR: u8 = 0x1f;
 /// `rule_hash` covers the thresholds as well as the rule, because a threshold
 /// change alters which findings the rule produces. Two reports whose rules
 /// differ only in configuration would otherwise be indistinguishable at the one
-/// place a reader looks to ask what produced a claim. The thresholds stay out of
-/// the finding identity, which is derived from the kind, the source, the primary
-/// reference and the rule id, so the same finding keeps its identity when a
-/// threshold moves.
+/// place a reader looks to ask what produced a claim.
+///
+/// **No threshold is an input to the identity**, which is derived from the kind,
+/// the source, the primary reference and the rule id. What that sentence does
+/// not mean, and used to be read as meaning, is that a finding keeps its
+/// identity across a threshold change. It does for the kinds anchored on a code
+/// point: an egress point is what it is whatever the dormancy window says. It
+/// does not for the two kinds anchored on traffic, and the mechanism is worth
+/// stating rather than discovering. Their primary reference is the episode
+/// anchor, the lowest flow identity in the conversation ([`crate::wire`]), and
+/// `effective_join_tolerance_ms` is what decides which connections make up one
+/// conversation. Widen it and two bursts merge; the merged conversation is
+/// anchored on the earlier of the two anchors and the later finding is gone.
+///
+/// The claim was corrected rather than the behaviour, and the reason is that the
+/// alternative reading is false. A finding that survived a regrouping with its
+/// identity intact would assert a continuity that did not happen: two bursts an
+/// hour apart and one hour long conversation are different facts about the
+/// machine, not one fact under two settings. Every anchor that would be stable
+/// across tolerances collapses that difference, either by anchoring on the
+/// destination, which merges conversations one report is supposed to keep apart,
+/// or by ignoring the grouping, which is what the tolerance exists to do. So the
+/// tolerance is reported in the evidence of every finding it shaped, and a
+/// reader comparing two reports across a tolerance change is told to read them
+/// as two groupings rather than as one set of findings that moved.
+///
+/// A separate limit sits underneath this one and is not this crate's to fix: a
+/// flow identity carries the ephemeral source port, so the same repeated
+/// connection is a new identity on every run and the two traffic anchored kinds
+/// cannot be followed across runs at all. That belongs to the flow identity
+/// contract and is filed against its owner.
 pub(crate) fn detector(rule_id: &str, settings: &ReconcileSettings) -> Detector {
     // Every threshold that can change what a rule emits, including the one that
     // is usually absent: a run with no volume band and a run with a very wide
@@ -227,14 +254,47 @@ mod tests {
     }
 
     #[test]
-    fn a_threshold_change_moves_the_rule_hash_and_not_the_identity() {
+    fn a_threshold_change_moves_the_rule_hash_and_not_a_code_point_identity() {
         // The report has to show that the rules were configured differently.
-        // What it must not show is a different finding for the same fact.
+        // What it must not show is a different finding for the same place in the
+        // code: an egress point is what it is whatever the window says.
+        //
+        // The claim is deliberately stated for the kinds anchored on a code
+        // point only. The two anchored on traffic are grouped by a threshold,
+        // and the test below this one is where that is pinned.
         let default = finding(&ReconcileSettings::default());
         let strict = finding(&ReconcileSettings::default().with_min_dormant_window_ms(7_200_000));
 
         assert_ne!(default.detector.rule_hash, strict.detector.rule_hash);
         assert_eq!(default.finding_id, strict.finding_id);
+    }
+
+    #[test]
+    fn every_threshold_this_build_has_reaches_the_rule_digest() {
+        // The digest is what tells two reports apart when only the configuration
+        // moved, so a threshold missing from it would let two differently
+        // configured runs claim the same detector. Each one is moved on its own,
+        // because a digest covering two of three would pass a test that changed
+        // all three at once.
+        let base = ReconcileSettings::default();
+        let hash_of = |settings: &ReconcileSettings| detector(RULE, settings).rule_hash;
+
+        assert_ne!(
+            hash_of(&base),
+            hash_of(&base.clone().with_min_dormant_window_ms(7_200_000))
+        );
+        assert_ne!(
+            hash_of(&base),
+            hash_of(&base.clone().with_join_tolerance_ms(30_000))
+        );
+        assert_ne!(
+            hash_of(&base),
+            hash_of(
+                &base.clone().with_volume_band(
+                    crate::settings::VolumeBand::declared(5_000, 30_000).unwrap()
+                )
+            )
+        );
     }
 
     #[test]

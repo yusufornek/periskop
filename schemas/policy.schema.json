@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://periskop.dev/schemas/policy.schema.json",
+  "title": "Policy",
+  "type": "object",
+  "description": "The verdict policy file, written as TOML (reporting/spec.md 2.1: periskop-policy.toml in the project root) and validated here in its JSON form. Two kinds of table live in it and they are not the same thing. The three rule blocks decide a verdict and their vocabulary is closed by ADR-006. The declaration tables state values the engine reads: [policy] names the document, [defaults] states the severity of an unmatched finding, and [reconciliation] states thresholds that decide which findings exist at all. A declaration table produces no severity and no verdict, so it does not extend ADR-006's closed list of rule blocks, exactly as [policy] and [defaults] do not.",
+  "required": ["policy"],
+  "additionalProperties": false,
+  "properties": {
+    "policy": {
+      "type": "object",
+      "description": "Identity of the policy document. Written into the report as policy_ref, so a reader can say which rules produced a verdict.",
+      "required": ["name", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "severity": { "$ref": "#/$defs/severity" }
+      }
+    },
+
+    "reconciliation": {
+      "type": "object",
+      "description": "Thresholds the reconciliation engine reads. These decide which findings exist rather than which verdict they carry, which is why they are declared rather than written as rule blocks. Every one of them is reported in the result the engine produces, because a threshold that is invisible until it fires cannot be reviewed beforehand.",
+      "additionalProperties": false,
+      "properties": {
+        "volume_band": {
+          "type": "object",
+          "description": "The range an observed outbound volume is expected to fall in, as a share of what the observed calls declared they were sending. The one threshold the engine refuses to invent: a batch job and a chat endpoint disagree about a normal ratio by orders of magnitude, so any built in constant would be wrong for most workloads while looking authoritative in every report. Absent is a valid and expected state: the volume_anomaly kind is then reported as suppressed with the reason volume_band_not_declared, and no finding of that kind is derived.",
+          "required": ["min_basis_points", "max_basis_points"],
+          "additionalProperties": false,
+          "properties": {
+            "min_basis_points": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Lower edge, in basis points of the declared payload total. 5000 is half. Integers only: the policy DSL takes no floating point (ADR-006), and the comparison it feeds is integer throughout."
+            },
+            "max_basis_points": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Upper edge, in basis points. 30000 is three times. Must not be below min_basis_points; an inverted band admits nothing, so every matched flow would be an anomaly, and the engine refuses it rather than reordering the edges and hiding the typo."
+            }
+          }
+        },
+        "min_dormant_window_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Shortest observation window a dormant_egress_point finding may be derived from. Absent means the engine default, which is ten minutes. Zero is not accepted: it would let a run that watched nothing report every egress point in the repository as dead code."
+        },
+        "join_tolerance_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How far apart two connections may be and still describe one conversation. Absent means the engine default. The effective value is never finer than the one second bucket a flow start time is rounded to, and the effective value is what travels into the evidence of every finding it shaped."
+        }
+      }
+    },
+
+    "threshold": {
+      "type": "array",
+      "description": "Rule block: looks at the number of findings in a set (reporting/spec.md 2.1).",
+      "items": {
+        "type": "object",
+        "required": ["id", "applies", "max", "on_exceed"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "$ref": "#/$defs/rule_id" },
+          "applies": {
+            "type": "object",
+            "description": "Finding fields the set is selected by. Field names come from findings-schema.md; a name that is not in it is a policy load error rather than a rule that quietly matches nothing.",
+            "minProperties": 1,
+            "additionalProperties": {
+              "type": ["string", "integer", "boolean"]
+            }
+          },
+          "max": { "type": "integer", "minimum": 0 },
+          "on_exceed": { "$ref": "#/$defs/severity" },
+          "message": { "type": "string" }
+        }
+      }
+    },
+    "condition": {
+      "type": "array",
+      "description": "Rule block: looks at the fields of a single finding (reporting/spec.md 2.2).",
+      "items": { "$ref": "#/$defs/conditional_rule" }
+    },
+    "coverage_condition": {
+      "type": "array",
+      "description": "Rule block: looks at the coverage statement rather than at any finding (reporting/spec.md 2.2, 2.4). The only legitimate way a coverage gap reaches a verdict (K-20): the gap on its own never produces a warning.",
+      "items": { "$ref": "#/$defs/conditional_rule" }
+    }
+  },
+
+  "$defs": {
+    "severity": {
+      "enum": ["warn", "fail"],
+      "description": "Two values, lower case. PASS is not a severity, it is no rule matching at all, and the report's upper case verdict is derived from the maximum rather than written here."
+    },
+    "rule_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Names the rule in policy_ref.rule_hits[], which is what makes a verdict traceable to the line that produced it."
+    },
+    "conditional_rule": {
+      "type": "object",
+      "required": ["id", "severity"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/rule_id" },
+        "when": { "$ref": "#/$defs/predicate" },
+        "when.all": { "type": "array", "items": { "$ref": "#/$defs/predicate" }, "minItems": 1 },
+        "when.any": { "type": "array", "items": { "$ref": "#/$defs/predicate" }, "minItems": 1 },
+        "severity": { "$ref": "#/$defs/severity" },
+        "message": { "type": "string" }
+      },
+      "oneOf": [
+        { "required": ["when"] },
+        { "required": ["when.all"] },
+        { "required": ["when.any"] }
+      ]
+    },
+    "predicate": {
+      "type": "object",
+      "description": "One comparison. The field name is always written under the field key: making it the TOML key itself would put field names and operator names in one namespace, and the day a field called equals exists the file stops being parsable.",
+      "required": ["field"],
+      "additionalProperties": false,
+      "minProperties": 2,
+      "maxProperties": 2,
+      "properties": {
+        "field": { "type": "string", "minLength": 1 },
+        "equals": { "type": ["string", "integer", "boolean"] },
+        "not_equals": { "type": ["string", "integer", "boolean"] },
+        "in": { "type": "array", "items": { "type": ["string", "integer", "boolean"] } },
+        "not_in": { "type": "array", "items": { "type": ["string", "integer", "boolean"] } },
+        "greater_than": {
+          "type": "integer",
+          "description": "Integer only. Ratio thresholds are basis points, so 500 is five percent; 0.05 is a policy load error rather than a value the loader interprets."
+        },
+        "less_than": { "type": "integer" }
+      }
+    }
+  }
+}

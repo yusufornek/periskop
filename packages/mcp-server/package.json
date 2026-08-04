@@ -9,7 +9,8 @@
   "scripts": {
     "build": "tsc",
     "lint": "tsc --noEmit",
-    "test": "node --test dist/*.test.js"
+    "test": "node --test dist/*.test.js",
+    "check": "npm run lint && npm run build && npm run test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.21.1",

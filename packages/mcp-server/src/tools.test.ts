@@ -1,0 +1,413 @@
+// What the two summarising tools put in front of a reader.
+//
+// Checked against recorded reports rather than the engine, for the reason the
+// reconciliation tests give: the answers that matter here belong to runs with a
+// second and a third source, and a static only pipeline produces none of them.
+// The smoke test covers the other half, that the engine and this side agree on
+// the wire, and it is skipped whenever the binary is not built.
+
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import type { ReportSource } from "./bridge.js";
+import { SENSOR_NOT_RUNNING, SENSOR_RUNNING, UNKNOWN } from "./sources.js";
+import {
+  getCoverage,
+  getDetail,
+  runScan,
+  type Coverage,
+  type Finding,
+  type ScanReport,
+} from "./tools.js";
+
+/**
+ * The shape of a scan answer, named once because seven tests read it.
+ *
+ * An alias rather than an interface: only an alias is comparable to the
+ * `Record<string, unknown>` the tools return, so this is what lets the cast
+ * below stay a cast rather than a trip through `unknown`.
+ */
+type ScanAnswer = {
+  summary: {
+    confirmed: number;
+    suspected: number;
+    unmatched_wire_traffic: number | null;
+    providers: { confirmed: string[]; suspect: string[] };
+  };
+  findings: Array<{ finding_id: string; confidence: string }>;
+  page: {
+    confidence: string;
+    cursor: number;
+    limit: number;
+    next_cursor: number | null;
+    total: number;
+    other: { confidence: string; total: number; fetch_with: { confidence: string } };
+  };
+};
+
+/** A coverage statement as a run with all three sources writes one. */
+function fullCoverage(overrides: Partial<Coverage> = {}): Coverage {
+  return {
+    parsed_files: 42,
+    unparsed_files: [],
+    undetected_libraries: [],
+    runtime_coverage: [{ language: "python", status: "instrumented" }],
+    reconciliation_mode: "full",
+    out_of_scope_flows: 9,
+    known_benign_flows: 4,
+    unattributed_flows: 2,
+    unclassified_flows: 1,
+    ...overrides,
+  };
+}
+
+/** A statement from an engine that predates the observation fields. */
+function olderCoverage(): Coverage {
+  return {
+    parsed_files: 42,
+    unparsed_files: [],
+    undetected_libraries: [],
+    runtime_coverage: [],
+  };
+}
+
+function unmatched(id: string): Finding {
+  return {
+    finding_id: id,
+    provider_ref: "openai",
+    confidence: "confirmed",
+    detector: { rule_id: "any.reconciled.unmatched-wire-traffic" },
+    kind: "unmatched_wire_traffic",
+    source: "reconciled",
+  };
+}
+
+function declared(id: string): Finding {
+  return {
+    finding_id: id,
+    provider_ref: "openai",
+    confidence: "confirmed",
+    detector: { rule_id: "py.openai.chat_completions" },
+    kind: "declared_egress_point",
+    source: "declared",
+    location: { path: "src/summarize.py", span: { start_line: 42 } },
+  };
+}
+
+/**
+ * A finding the engine could not confirm.
+ *
+ * Every unmatched wire finding is one of these on a run without hooks, which is
+ * every run of a project that has not installed them, so this is the ordinary
+ * case rather than an edge one.
+ */
+function suspected(id: string, provider = "openai"): Finding {
+  return {
+    finding_id: id,
+    provider_ref: provider,
+    confidence: "suspect",
+    detector: { rule_id: "any.reconciled.unmatched-wire-traffic" },
+    kind: "unmatched_wire_traffic",
+    source: "reconciled",
+  };
+}
+
+function source(coverage: Coverage, findings: Finding[], suspects: Finding[] = []): ReportSource {
+  const report: ScanReport = {
+    report_id: "rpt_0000000000000001",
+    scan_run_id: "scan_0000000000000001",
+    verdict: "WARN",
+    findings,
+    suspect_findings: suspects,
+    coverage,
+  };
+  return { call: () => Promise.resolve(report) };
+}
+
+test("a scan with a network sensor does not report the sensor as absent", async () => {
+  // The case the hard coded false was wrong about. A run that watched the wire
+  // and a run that never looked produced the same answer, and the second is the
+  // one the reader would have acted on.
+  const result = (await runScan(source(fullCoverage(), [unmatched("fnd_0000000000000001")]), {
+    path: ".",
+  })) as { coverage: { network_sensor: string } };
+
+  assert.equal(result.coverage.network_sensor, SENSOR_RUNNING);
+});
+
+test("a scan whose report is silent about its sources says unknown, not not running", async () => {
+  const result = (await runScan(source(olderCoverage(), [declared("fnd_0000000000000002")]), {
+    path: ".",
+  })) as { coverage: { network_sensor: string }; summary: { reconciliation_mode: string } };
+
+  assert.equal(result.coverage.network_sensor, UNKNOWN);
+  assert.notEqual(result.coverage.network_sensor, SENSOR_NOT_RUNNING);
+  assert.equal(result.summary.reconciliation_mode, UNKNOWN);
+});
+
+test("the summary says how many sources fed the run", async () => {
+  const result = (await runScan(source(fullCoverage(), [declared("fnd_0000000000000003")]), {
+    path: ".",
+  })) as { summary: { reconciliation_mode: string } };
+
+  assert.equal(result.summary.reconciliation_mode, "full");
+});
+
+test("unmatched wire traffic is counted apart from the confidence totals", async () => {
+  // Three findings, one of which is the claim the product is built on. Folded
+  // into confirmed it would be indistinguishable from two ordinary call sites.
+  const result = (await runScan(
+    source(
+      fullCoverage(),
+      [declared("fnd_0000000000000004"), unmatched("fnd_0000000000000005")],
+      [unmatched("fnd_0000000000000006")],
+    ),
+    { path: "." },
+  )) as {
+    summary: { confirmed: number; suspected: number; unmatched_wire_traffic: number | null };
+  };
+
+  assert.equal(result.summary.confirmed, 2);
+  assert.equal(result.summary.suspected, 1);
+  // Both lists, because unmatched wire traffic is a kind and those two are
+  // confidences.
+  assert.equal(result.summary.unmatched_wire_traffic, 2);
+});
+
+test("the summary stays a summary", async () => {
+  // The new fields are counts and a word. A list here would be the thing the
+  // page exists to prevent.
+  const result = (await runScan(source(fullCoverage(), [unmatched("fnd_0000000000000007")]), {
+    path: ".",
+  })) as { summary: Record<string, unknown> };
+
+  assert.equal(typeof result.summary["unmatched_wire_traffic"], "number");
+  assert.equal(typeof result.summary["reconciliation_mode"], "string");
+  assert.ok(!Array.isArray(result.summary["unmatched_wire_traffic"]));
+});
+
+test("coverage shows the four buckets that produce no finding", async () => {
+  const result = (await getCoverage(source(fullCoverage(), []), { path: "." })) as {
+    flow_buckets: Record<string, number | null>;
+    network_sensor: string;
+    reconciliation_mode: string;
+  };
+
+  assert.deepEqual(result.flow_buckets, {
+    out_of_scope_flows: 9,
+    known_benign_flows: 4,
+    unattributed_flows: 2,
+    unclassified_flows: 1,
+  });
+  assert.equal(result.network_sensor, SENSOR_RUNNING);
+  assert.equal(result.reconciliation_mode, "full");
+});
+
+test("coverage buckets are null, not zero, when the report never counted them", async () => {
+  // Four zeros beside an unknown sensor would read as a machine that stayed
+  // quiet. Nothing here watched it.
+  const result = (await getCoverage(source(olderCoverage(), []), { path: "." })) as {
+    flow_buckets: Record<string, number | null>;
+    network_sensor: string;
+  };
+
+  assert.deepEqual(result.flow_buckets, {
+    out_of_scope_flows: null,
+    known_benign_flows: null,
+    unattributed_flows: null,
+    unclassified_flows: null,
+  });
+  assert.equal(result.network_sensor, UNKNOWN);
+});
+
+test("a run with hooks but no sensor says the sensor was not running", async () => {
+  const runtimeOnly = fullCoverage({
+    reconciliation_mode: "static_plus_runtime",
+    out_of_scope_flows: 0,
+    known_benign_flows: 0,
+    unattributed_flows: 0,
+    unclassified_flows: 0,
+  });
+
+  const result = (await getCoverage(source(runtimeOnly, []), { path: "." })) as {
+    network_sensor: string;
+    flow_buckets: Record<string, number | null>;
+  };
+
+  // Zeros are correct here and mean what they say only because the sensor state
+  // is beside them: the run had no wire source, so nothing was counted.
+  assert.equal(result.network_sensor, SENSOR_NOT_RUNNING);
+  assert.equal(result.flow_buckets["out_of_scope_flows"], 0);
+});
+
+test("findings the engine only suspects can be read, not only counted", async () => {
+  // The run this product is built for: a project with no hooks installed, where
+  // every unmatched wire finding is suspected. The summary said three flows had
+  // nothing explaining them and no page, cursor or identifier could reach one of
+  // them, so the central claim was visible as a number and nowhere else.
+  const suspects = [
+    suspected("fnd_0000000000000101"),
+    suspected("fnd_0000000000000102"),
+    suspected("fnd_0000000000000103"),
+  ];
+  const reports = source(fullCoverage(), [], suspects);
+
+  const first = (await runScan(reports, { path: "." })) as ScanAnswer;
+  assert.equal(first.summary.suspected, 3);
+  assert.equal(first.summary.unmatched_wire_traffic, 3);
+  assert.deepEqual(first.findings, []);
+  assert.equal(first.page.total, 0);
+  // The counted findings are somewhere, and the answer says where.
+  assert.equal(first.page.other.total, 3);
+
+  const page = (await runScan(reports, { path: ".", confidence: "suspect" })) as ScanAnswer;
+  assert.deepEqual(
+    page.findings.map((f) => f.finding_id),
+    ["fnd_0000000000000101", "fnd_0000000000000102", "fnd_0000000000000103"],
+  );
+
+  // The whole point of reaching them: an identifier that get_finding_detail
+  // accepts. A count the caller cannot turn into a name is not a finding.
+  const detail = (await getDetail(reports, {
+    path: ".",
+    finding_id: "fnd_0000000000000102",
+  })) as { finding?: Finding; error?: string };
+  assert.equal(detail.error, undefined);
+  assert.equal(detail.finding?.finding_id, "fnd_0000000000000102");
+});
+
+test("the two lists never share a page", async () => {
+  // Merging them would be the other way to make suspects reachable, and it
+  // would cost the reader the one thing they need: whether the engine proved
+  // this or guessed it.
+  const reports = source(
+    fullCoverage(),
+    [declared("fnd_0000000000000201"), unmatched("fnd_0000000000000202")],
+    [suspected("fnd_0000000000000203")],
+  );
+
+  const confirmed = (await runScan(reports, { path: ".", confidence: "confirmed" })) as ScanAnswer;
+  assert.deepEqual(
+    confirmed.findings.map((f) => f.finding_id),
+    ["fnd_0000000000000201", "fnd_0000000000000202"],
+  );
+  assert.ok(confirmed.findings.every((f) => f.confidence === "confirmed"));
+
+  const suspect = (await runScan(reports, { path: ".", confidence: "suspect" })) as ScanAnswer;
+  assert.deepEqual(
+    suspect.findings.map((f) => f.finding_id),
+    ["fnd_0000000000000203"],
+  );
+  assert.ok(suspect.findings.every((f) => f.confidence === "suspect"));
+});
+
+test("a page says which list it came from", async () => {
+  // A reader who cannot see which list a page is has to infer it from the rows,
+  // and an empty page carries no rows to infer from.
+  const reports = source(
+    fullCoverage(),
+    [declared("fnd_0000000000000301")],
+    [suspected("fnd_0000000000000302")],
+  );
+
+  const byDefault = (await runScan(reports, { path: "." })) as ScanAnswer;
+  assert.equal(byDefault.page.confidence, "confirmed");
+
+  const suspect = (await runScan(reports, { path: ".", confidence: "suspect" })) as ScanAnswer;
+  assert.equal(suspect.page.confidence, "suspect");
+});
+
+test("the suspected list is paged like the confirmed one", async () => {
+  const reports = source(fullCoverage(), [], [
+    suspected("fnd_0000000000000401"),
+    suspected("fnd_0000000000000402"),
+    suspected("fnd_0000000000000403"),
+  ]);
+
+  const first = (await runScan(reports, { path: ".", confidence: "suspect", limit: 1 })) as ScanAnswer;
+  assert.equal(first.findings.length, 1);
+  assert.equal(first.page.total, 3);
+  assert.equal(first.page.next_cursor, 1);
+
+  const last = (await runScan(reports, {
+    path: ".",
+    confidence: "suspect",
+    limit: 1,
+    cursor: 2,
+  })) as ScanAnswer;
+  assert.deepEqual(
+    last.findings.map((f) => f.finding_id),
+    ["fnd_0000000000000403"],
+  );
+  assert.equal(last.page.next_cursor, null);
+});
+
+test("the answer names the argument that reaches the other list", async () => {
+  // Structured rather than described, so that reaching the rest of the findings
+  // does not depend on the caller having read the tool description.
+  const reports = source(
+    fullCoverage(),
+    [declared("fnd_0000000000000501")],
+    [suspected("fnd_0000000000000502"), suspected("fnd_0000000000000503")],
+  );
+
+  const confirmed = (await runScan(reports, { path: "." })) as ScanAnswer;
+  assert.deepEqual(confirmed.page.other, {
+    confidence: "suspect",
+    total: 2,
+    fetch_with: { confidence: "suspect" },
+  });
+
+  const suspect = (await runScan(reports, { path: ".", confidence: "suspect" })) as ScanAnswer;
+  assert.deepEqual(suspect.page.other, {
+    confidence: "confirmed",
+    total: 1,
+    fetch_with: { confidence: "confirmed" },
+  });
+});
+
+test("a provider seen only in suspected findings is not left out", async () => {
+  // The provider list answered from the confirmed findings alone, so a project
+  // whose only egress was suspected reported no providers at all, which reads
+  // as a project that talks to nobody.
+  const reports = source(
+    fullCoverage(),
+    [declared("fnd_0000000000000601")],
+    [suspected("fnd_0000000000000602", "acme")],
+  );
+
+  const result = (await runScan(reports, { path: "." })) as ScanAnswer;
+  assert.deepEqual(result.summary.providers.confirmed, ["openai"]);
+  assert.deepEqual(result.summary.providers.suspect, ["acme"]);
+});
+
+test("a page of suspected findings is still a page", async () => {
+  // Reachable must not mean returned all at once. Thirty suspected findings in
+  // one response is the context emptying this tool exists to avoid.
+  const many = Array.from({ length: 30 }, (_, i) =>
+    suspected(`fnd_00000000000007${String(i).padStart(2, "0")}`),
+  );
+
+  const result = (await runScan(source(fullCoverage(), [], many), {
+    path: ".",
+    confidence: "suspect",
+  })) as ScanAnswer;
+
+  assert.equal(result.findings.length, 20);
+  assert.equal(result.page.total, 30);
+  assert.equal(result.page.next_cursor, 20);
+});
+
+test("the two tools answer the sensor question with the same word", async () => {
+  // One fact, one vocabulary. Two spellings of the same state would let a reader
+  // conclude the tools disagree about the run.
+  const coverage = fullCoverage({ reconciliation_mode: "static_plus_wire" });
+  const scan = (await runScan(source(coverage, []), { path: "." })) as {
+    coverage: { network_sensor: string };
+  };
+  const report = (await getCoverage(source(coverage, []), { path: "." })) as {
+    network_sensor: string;
+  };
+
+  assert.equal(scan.coverage.network_sensor, report.network_sensor);
+});

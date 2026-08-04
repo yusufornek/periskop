@@ -18,13 +18,12 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import test from "node:test";
 
-import { EngineBridge } from "./bridge.js";
+import { EngineBridge, type ReportSource } from "./bridge.js";
 import {
   DEFAULT_TRACE_DEPTH,
   MAX_TRACE_DEPTH,
   trace,
   traceReconciliation,
-  type ReportSource,
 } from "./reconciliation.js";
 import { runScan, type Finding, type ScanReport } from "./tools.js";
 

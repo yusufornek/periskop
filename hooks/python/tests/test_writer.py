@@ -144,12 +144,19 @@ class StreamTest(unittest.TestCase):
         # nothing dropped" and the report called the run clean. The guard around
         # the drain only ever recorded *which* failure it was, never how many
         # events went with it.
+        # A directory in place of the stream: every open for append raises, the
+        # way a revoked mount or a read only volume does.
+        #
+        # The obstacle goes in before the writer exists rather than after the
+        # submits. EventWriter drains on a background thread, so putting it in
+        # afterwards raced that thread: if the drain won, the stream was already
+        # a file and makedirs was the thing that failed, which made this test
+        # pass or fail with the load on the machine rather than with the code.
+        os.makedirs(self.path)
+
         writer = EventWriter(self.path, capacity=16)
         for index in range(5):
             writer.submit(_event(index))
-        # A directory in place of the stream: every open for append raises, the
-        # way a revoked mount or a read only volume does.
-        os.makedirs(self.path)
         writer.close()
 
         self.assertEqual(5, writer.dropped_events_count)

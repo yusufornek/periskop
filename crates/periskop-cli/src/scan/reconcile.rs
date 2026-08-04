@@ -88,6 +88,10 @@ pub(super) struct ReconciledStage {
     pub diagnostics: Vec<Diagnostic>,
     pub dropped_events: u64,
     pub unlinked_events: u64,
+    /// Observed calls whose destination the hook could not read. A coverage
+    /// counter, and the reason an unexplained traffic claim in the same report
+    /// may be stated as suspected rather than confirmed.
+    pub unresolved_event_targets: u64,
     pub observation_window_ms: u64,
     pub reconciliation_mode: ReconciliationMode,
     /// The four buckets and the unclassified count, or `None` when no sensor fed
@@ -133,6 +137,15 @@ pub(super) fn run(
             .iter()
             .map(|fault| internal_diagnostic(DiagnosticComponent::Reconciliation, fault.clone())),
     );
+    // A rule that ran, produced nothing, and had a reason. Without these lines a
+    // reader cannot tell a clean run from a run where one weak rung silenced
+    // every accusation or no measurement allowed a single comparison
+    // (`reconciliation/spec.md` §6: no class stays out of the report).
+    diagnostics.extend(
+        outcome.silences.iter().map(|silence| {
+            internal_diagnostic(DiagnosticComponent::Reconciliation, silence.clone())
+        }),
+    );
 
     // Two parts of the outcome have no home in the report contract and are
     // therefore not written anywhere. `resolved_targets` is the destination an
@@ -148,6 +161,7 @@ pub(super) fn run(
         diagnostics,
         dropped_events,
         unlinked_events: outcome.unlinked_events,
+        unresolved_event_targets: outcome.unresolved_event_targets,
         observation_window_ms: outcome.observation_window_ms,
         reconciliation_mode: outcome.reconciliation_mode,
         wire: outcome.wire,

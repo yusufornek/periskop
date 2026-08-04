@@ -7,7 +7,12 @@
 pub mod coverage;
 pub mod report;
 pub mod serialize;
+pub mod signature;
 
 pub use coverage::CoverageStatement;
 pub use report::{Envelope, PolicyRef, ReportBuilder, RuleHit, ScanReport, Verdict};
 pub use serialize::{body_hash, to_canonical_json};
+pub use signature::{
+    sign, verify, KeyRing, SignatureEnvelope, SignatureError, SignedDocument, SigningKey, Verified,
+    VerifyingKey,
+};

@@ -14,7 +14,8 @@ import path from "node:path";
 import test from "node:test";
 
 import { EngineBridge } from "./bridge.js";
-import { getCoverage, runScan } from "./tools.js";
+import { SENSOR_NOT_RUNNING } from "./sources.js";
+import { getCoverage, getDetail, runScan } from "./tools.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "../../..");
@@ -22,7 +23,24 @@ const binary = process.env["PERISKOP_BINARY"] ?? path.join(repoRoot, "target/deb
 const rules = path.join(repoRoot, "rules");
 const fixtures = path.join(repoRoot, "crates/periskop-static-scanner/fixtures/python");
 
+// A missing engine fails this suite rather than skipping it.
+//
+// Skipping was the earlier behaviour and it was wrong in a way worth spelling
+// out: these are the only tests that check the two languages agree on the wire,
+// so a run without the binary reported success while proving nothing. Opting
+// out is still possible, but it now takes an explicit environment variable,
+// which is an act rather than an accident.
+const optedOut = process.env["PERISKOP_SKIP_ENGINE_TESTS"] === "1";
 const available = existsSync(binary);
+
+test("the engine binary is present", { skip: optedOut }, () => {
+  assert.ok(
+    available,
+    `no engine at ${binary}. Build it with "cargo build -p periskop-cli", point ` +
+      `PERISKOP_BINARY at one, or set PERISKOP_SKIP_ENGINE_TESTS=1 to state that ` +
+      `this run is not checking the language boundary.`,
+  );
+});
 
 function bridge(): EngineBridge {
   return new EngineBridge({ binary, rulesDir: rules, timeoutMs: 60_000 });
@@ -42,7 +60,13 @@ test("a scan crosses the boundary intact", { skip: !available }, async () => {
   try {
     const result = (await runScan(engine, { path: fixtures })) as {
       verdict: string;
-      summary: { confirmed: number; suspected: number; providers: string[] };
+      summary: {
+        confirmed: number;
+        suspected: number;
+        providers: { confirmed: string[]; suspect: string[] };
+        reconciliation_mode: string;
+        unmatched_wire_traffic: number | null;
+      };
       findings: unknown[];
       coverage: { files_read: number };
     };
@@ -55,8 +79,15 @@ test("a scan crosses the boundary intact", { skip: !available }, async () => {
     assert.equal(result.verdict, "WARN");
     assert.ok(result.summary.confirmed >= 4, `expected findings, got ${result.summary.confirmed}`);
     assert.ok(result.summary.suspected >= 1, "the suspected list should not be empty here");
-    assert.ok(result.summary.providers.includes("openai"));
+    assert.ok(result.summary.providers.confirmed.includes("openai"));
     assert.ok(result.coverage.files_read > 0);
+
+    // This run has one source, and the answer has to say so. A reader weighing
+    // the findings above needs to know that nothing here watched the machine.
+    assert.equal(result.summary.reconciliation_mode, "static_only");
+    // Zero rather than null: the count is only null when the findings do not
+    // state their kind, so this also proves the engine sends the field.
+    assert.equal(result.summary.unmatched_wire_traffic, 0);
   } finally {
     await engine.close();
   }
@@ -79,15 +110,79 @@ test("the first page is a page, not the whole result", { skip: !available }, asy
   }
 });
 
+test("the findings the engine only suspects can be paged too", { skip: !available }, async () => {
+  // The half the recorded reports cannot check: that the list the engine really
+  // fills is the one this side really pages. The fixture set has a call matched
+  // only by the text of its URL, so this asserts against a suspected finding the
+  // engine produced rather than one a test wrote.
+  const engine = bridge();
+  try {
+    const confirmed = (await runScan(engine, { path: fixtures })) as {
+      summary: { suspected: number };
+      page: { confidence: string; other: { confidence: string; total: number } };
+    };
+    assert.equal(confirmed.page.confidence, "confirmed");
+    assert.equal(confirmed.page.other.confidence, "suspect");
+    assert.equal(confirmed.page.other.total, confirmed.summary.suspected);
+
+    const suspected = (await runScan(engine, { path: fixtures, confidence: "suspect" })) as {
+      findings: Array<{ finding_id: string; confidence: string }>;
+      page: { confidence: string; total: number };
+    };
+    assert.equal(suspected.page.confidence, "suspect");
+    assert.equal(suspected.page.total, confirmed.summary.suspected);
+
+    const first = suspected.findings[0];
+    assert.ok(first, "the engine reported suspected findings and none of them reached the page");
+    assert.equal(first.confidence, "suspect");
+
+    // The identifier is good for something, which is the whole claim.
+    const detail = (await getDetail(engine, { path: fixtures, finding_id: first.finding_id })) as {
+      finding?: { finding_id: string };
+      error?: string;
+    };
+    assert.equal(detail.error, undefined);
+    assert.equal(detail.finding?.finding_id, first.finding_id);
+  } finally {
+    await engine.close();
+  }
+});
+
 test("coverage states what was not running", { skip: !available }, async () => {
   const engine = bridge();
   try {
     const coverage = (await getCoverage(engine, { path: fixtures })) as {
       network_sensor: string;
+      reconciliation_mode: string;
+      flow_buckets: Record<string, number | null>;
       runtime_coverage: Array<{ status: string }>;
     };
-    assert.equal(coverage.network_sensor, "not running");
+    // Derived from the report rather than asserted by this server, so what is
+    // really being checked is that the engine states its mode and that a static
+    // only run reads as one source.
+    assert.equal(coverage.reconciliation_mode, "static_only");
+    assert.equal(coverage.network_sensor, SENSOR_NOT_RUNNING);
     assert.ok(coverage.runtime_coverage.every((r) => r.status === "not_instrumented"));
+  } finally {
+    await engine.close();
+  }
+});
+
+test("the four flow buckets cross the boundary as numbers", { skip: !available }, async () => {
+  // The half a recorded report cannot check: whether the engine actually sends
+  // these fields. A null here would mean the wire dropped them, and the server
+  // would be counting nothing while looking like it counted zero.
+  const engine = bridge();
+  try {
+    const coverage = (await getCoverage(engine, { path: fixtures })) as {
+      flow_buckets: Record<string, number | null>;
+    };
+    assert.deepEqual(coverage.flow_buckets, {
+      out_of_scope_flows: 0,
+      known_benign_flows: 0,
+      unattributed_flows: 0,
+      unclassified_flows: 0,
+    });
   } finally {
     await engine.close();
   }

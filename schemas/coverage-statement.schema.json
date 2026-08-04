@@ -3,7 +3,7 @@
   "$id": "https://periskop.dev/schemas/coverage-statement.schema.json",
   "title": "CoverageStatement",
   "type": "object",
-  "description": "Normative field list for the coverage statement. All 17 fields are required even when empty, because the gap between an absent field and a zero is the easiest way to break the honest coverage principle without anyone noticing. Engine, rule and schema errors do not belong here; they go to the report diagnostics block.",
+  "description": "Normative field list for the coverage statement. All 19 fields are required even when empty, because the gap between an absent field and a zero is the easiest way to break the honest coverage principle without anyone noticing. Engine, rule and schema errors do not belong here; they go to the report diagnostics block.",
   "required": [
     "parsed_files",
     "unparsed_files",
@@ -14,8 +14,10 @@
     "unhooked_processes",
     "dropped_events",
     "unlinked_events",
+    "unresolved_event_targets",
     "unattributed_flows",
     "unclassified_flows",
+    "in_scope_flows",
     "out_of_scope_flows",
     "known_benign_flows",
     "sensor_platform_class",
@@ -118,9 +120,19 @@
     "unhooked_processes": { "type": "integer", "minimum": 0 },
     "dropped_events": { "type": "integer", "minimum": 0 },
     "unlinked_events": { "type": "integer", "minimum": 0 },
+    "unresolved_event_targets": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Observed calls whose destination the hook could not read, so they could take no part in the join against the wire. Not the same gap as unlinked_events, which counts calls that reached no code point. While this is above zero, no unmatched_wire_traffic claim in the run may be stated as confirmed: a call that went nowhere nameable is a standing candidate explanation for any connection observed."
+    },
 
     "unattributed_flows": { "type": "integer", "minimum": 0 },
     "unclassified_flows": { "type": "integer", "minimum": 0 },
+    "in_scope_flows": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Attributed to the codebase under scan, and the only bucket derived findings come from (K-15). The denominator the other three buckets are read against: 412 out of scope means opposite things over 450 flows and over 40000, and without this field the attribution accuracy gate K-15 states cannot be computed from the report."
+    },
     "out_of_scope_flows": {
       "type": "integer",
       "minimum": 0,

@@ -73,6 +73,13 @@ pub enum SuppressionReason {
     /// wrong for most workloads while looking authoritative in every report, so
     /// a run without a declared band derives nothing and says why.
     VolumeBandNotDeclared,
+    /// A sensor fed the run and not one of its records counted a byte.
+    ///
+    /// The difference this exists to keep: a rule that ran and found nothing
+    /// reads exactly like a rule that could not look, and a capture mechanism
+    /// that reports connections without volume makes every volume comparison
+    /// impossible while leaving the report looking complete.
+    VolumeNotMeasured,
 }
 
 /// One derived kind that will not appear in this report, and why.
@@ -145,6 +152,19 @@ impl Capabilities {
             );
         }
 
+        // The other half of the same question, asked of the records rather than
+        // of the policy: a band is worth nothing against traffic nobody
+        // measured. Only a sensor that handed over connections can be said to
+        // have failed to measure them, so an empty flow list is not this case;
+        // that run observed no traffic, which the flow counters already state.
+        let flows = sources.flows();
+        if !flows.is_empty() && flows.iter().all(|flow| flow.bytes_out.is_none()) {
+            suppress(
+                DerivedKind::VolumeAnomaly,
+                SuppressionReason::VolumeNotMeasured,
+            );
+        }
+
         suppressed.sort();
         suppressed.dedup();
         Self { suppressed }
@@ -166,6 +186,7 @@ impl Capabilities {
 mod tests {
     use super::*;
     use crate::sources::{DeclaredSource, RuntimeSource, WireSource};
+    use periskop_network_sensor::scope::FlowScope;
 
     fn sources(declared: bool, runtime: bool, wire: WireSource) -> Sources {
         Sources::new(
@@ -249,6 +270,41 @@ mod tests {
             ),
         );
         assert!(declared.allows(DerivedKind::VolumeAnomaly));
+    }
+
+    #[test]
+    fn a_sensor_that_counts_no_bytes_cannot_support_a_volume_claim_either() {
+        // The band is declared, the sensor watched, and not one record says how
+        // much left the socket. Deriving nothing here is right; deriving nothing
+        // and saying nothing is what made a mechanism that cannot measure look
+        // like a machine that behaved normally.
+        let band = crate::settings::VolumeBand::declared(5_000, 30_000).expect("a band");
+        let mut unmeasured =
+            crate::wire::tests::flow("api.openai.com", 1_785_834_000, FlowScope::InScope);
+        unmeasured.bytes_out = None;
+        let capabilities = Capabilities::of(
+            &sources(true, true, WireSource::Present(vec![unmeasured.clone()])),
+            ObservationWindow::of_ms(3_600_000),
+            &ReconcileSettings::default().with_volume_band(band),
+        );
+
+        assert!(!capabilities.allows(DerivedKind::VolumeAnomaly));
+        assert_eq!(
+            reasons_for(&capabilities, DerivedKind::VolumeAnomaly),
+            [SuppressionReason::VolumeNotMeasured]
+        );
+
+        // One measured record is enough to make the comparison possible, and the
+        // records that carry no count are then reported by the deriver rather
+        // than by the table.
+        let measured =
+            crate::wire::tests::flow("api.openai.com", 1_785_834_000, FlowScope::InScope);
+        let mixed = Capabilities::of(
+            &sources(true, true, WireSource::Present(vec![unmeasured, measured])),
+            ObservationWindow::of_ms(3_600_000),
+            &ReconcileSettings::default().with_volume_band(band),
+        );
+        assert!(mixed.allows(DerivedKind::VolumeAnomaly));
     }
 
     #[test]

@@ -45,6 +45,15 @@ pub struct ReconcileOutcome {
     /// A coverage counter, never a finding (K-10). Feeds
     /// `coverage.unlinked_events`.
     pub unlinked_events: u64,
+    /// Observed calls whose destination the hook could not read.
+    ///
+    /// A coverage counter for the same reason as the one above and a different
+    /// gap: those calls reached no code point, these named nowhere at all, so
+    /// they could take no part in the join against the wire. Feeds
+    /// `coverage.unresolved_event_targets`. While it is above zero, no
+    /// unexplained traffic claim in the run is stated as certain, and reading a
+    /// report without it would leave that downgrade unexplained.
+    pub unresolved_event_targets: u64,
     /// Which sources fed this run, in the vocabulary the coverage statement uses.
     pub reconciliation_mode: ReconciliationMode,
     /// Feeds `coverage.observation_window_ms`. A duration, not a stamp.
@@ -73,4 +82,13 @@ pub struct ReconcileOutcome {
     /// block, not in the coverage counters: a rule that failed is a different
     /// thing from something the run could not see.
     pub faults: Vec<String>,
+    /// Where a rule ran, produced nothing, and the nothing means something.
+    ///
+    /// Neither findings nor faults. A rung that silenced an accusation and a
+    /// comparison no measurement allowed are both cases where a reader who sees
+    /// an empty finding list would otherwise conclude the run was clean.
+    /// `reconciliation/spec.md` §6 states the rule these lines exist for: no
+    /// class stays out of the report. They travel as report diagnostics, sorted
+    /// and deduplicated like the faults beside them.
+    pub silences: Vec<String>,
 }

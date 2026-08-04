@@ -26,24 +26,13 @@
 
 import { z } from "zod";
 
+import type { ReportSource } from "./bridge.js";
 import type { EntityRef, Evidence, Finding, ScanReport } from "./tools.js";
 
 /** Contract default for the input chain depth (mcp-tools.md section 7). */
 export const DEFAULT_TRACE_DEPTH = 10;
 /** Contract ceiling for the same. */
 export const MAX_TRACE_DEPTH = 25;
-
-/**
- * The part of the engine bridge this tool uses.
- *
- * Narrower than the bridge class so that a test can supply a recorded report
- * without starting a process. The reconciled findings this tool projects are not
- * produced by a static only pipeline, so a test that could only go through the
- * real binary could not cover the projection at all.
- */
-export interface ReportSource {
-  call(method: string, params?: Record<string, unknown>): Promise<unknown>;
-}
 
 export const traceInput = z.object({
   path: z.string().describe("Project directory the finding came from."),

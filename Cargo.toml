@@ -41,6 +41,16 @@ periskop-ebpf-loader = { path = "crates/periskop-ebpf-loader" }
 
 blake3 = "1.5"
 clap = { version = "4.5", features = ["derive"] }
+# Report signing (ADR-015). Default features are switched off deliberately:
+# `fast` pulls in precomputed tables that only buy signing throughput, and this
+# workspace signs one document per run.
+ed25519-dalek = { version = "2.2", default-features = false, features = [
+    "std",
+    "zeroize",
+] }
+# The operating system's entropy source. Signing key generation is the only
+# caller; nothing else in this workspace is allowed to be non-deterministic.
+getrandom = "0.3"
 ignore = "0.4"
 tree-sitter = "0.25"
 tree-sitter-python = "0.25"
@@ -53,6 +63,10 @@ serde_json = "1.0"
 thiserror = "2.0"
 toml = "0.9"
 streaming-iterator = "0.1"
+# Clears private key bytes from the buffers this workspace owns. The signing key
+# type from `ed25519-dalek` clears itself on drop; the seed and the text form of
+# a key file are ours, so clearing them is ours too.
+zeroize = "1.8"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

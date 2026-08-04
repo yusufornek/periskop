@@ -28,7 +28,11 @@
 //! **A run with no hooks may not state the finding firmly.** Without the
 //! runtime source, "no application call explains this" means "nobody was
 //! listening for one", so the claim is stated as suspected and the coverage
-//! impact says which gap produced it (`data-model.md` §3).
+//! impact says which gap produced it (`data-model.md` §3). A hook that was
+//! listening and could not read where a call went costs the same certainty for
+//! the same reason: the call it could not place may be the one that produced
+//! this very connection, and an accusation may not be built on top of a
+//! destination nobody could name.
 
 use periskop_core::finding::{Confidence, CoverageImpact, Finding, Kind};
 
@@ -47,6 +51,30 @@ const UNKNOWN_PROVIDER: &str = "unknown";
 pub(crate) struct Derived {
     pub findings: Vec<Finding>,
     pub faults: Vec<String>,
+    /// What this rule chose not to say, and how often.
+    ///
+    /// `reconciliation/spec.md` §6 closes with the rule that no class stays out
+    /// of the report, and a suppression rung with no counter is exactly a class
+    /// that does. A reader who sees no unmatched traffic has to be able to tell
+    /// a quiet machine from a machine whose traffic one weak rung silenced.
+    pub silences: Vec<String>,
+}
+
+/// How the repository accounts for a destination, if it does at all.
+///
+/// Two rungs with very different weights, kept apart because only one of them
+/// is worth reporting as a silence. Naming the same destination is a direct
+/// answer. Naming only the same provider is `data-model.md`'s J3: it may never
+/// confirm anything, and here it silences the product's headline finding on the
+/// strength of a vendor name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeExplanation {
+    /// Nothing in the code accounts for this destination.
+    None,
+    /// A code point names this exact destination.
+    DeclaredTarget,
+    /// No code point names it, but the repository uses this provider elsewhere.
+    DeclaredProvider,
 }
 
 /// Derives one finding per stretch of traffic nothing in the run accounts for.
@@ -58,6 +86,9 @@ pub(crate) fn derive(
     settings: &ReconcileSettings,
 ) -> Derived {
     let mut derived = Derived::default();
+    let unreadable_calls = j1.unreadable_target_events();
+    let mut silenced_by_target = Silenced::default();
+    let mut silenced_by_provider = Silenced::default();
 
     for episode in episodes {
         if !episode.counts_toward_findings() {
@@ -67,15 +98,25 @@ pub(crate) fn derive(
             continue;
         }
         // Not a fault and not a finding: the code accounts for this
-        // destination, which is the answer the reader wanted.
-        if code_explains(episode, points) {
-            continue;
+        // destination, which is the answer the reader wanted. Which rung
+        // answered it is counted, because the weaker of the two silences an
+        // accusation on the strength of a vendor name alone.
+        match code_explains(episode, points) {
+            CodeExplanation::DeclaredTarget => {
+                silenced_by_target.record(episode);
+                continue;
+            }
+            CodeExplanation::DeclaredProvider => {
+                silenced_by_provider.record(episode);
+                continue;
+            }
+            CodeExplanation::None => {}
         }
 
         let evidence = emit::join_evidence(format!(
             "J1:none J3:none flow_scope={} target={} provider={} classification={} \
              attribution={} flows={} span_ms={} bytes_out={} tolerance_ms={} \
-             runtime_source={}",
+             runtime_source={} unreadable_call_targets={unreadable_calls}",
             episode.scope.as_str(),
             episode.target,
             episode.provider_ref,
@@ -92,7 +133,7 @@ pub(crate) fn derive(
 
         match emit::derived_finding_anchored(
             Kind::UnmatchedWireTraffic,
-            confidence_for(episode, runtime_watched),
+            confidence_for(episode, runtime_watched, unreadable_calls),
             &episode.provider_ref,
             emit::flow_ref(&episode.flow_id),
             evidence,
@@ -100,15 +141,8 @@ pub(crate) fn derive(
             RULE_ID,
         ) {
             Ok(finding) => {
-                let mut finding = finding.with_coverage_impact(if runtime_watched {
-                    CoverageImpact::None
-                } else {
-                    // The traffic may well have had an application call behind
-                    // it that nothing was there to record. That is a gap in
-                    // coverage, and the finding says so rather than implying the
-                    // process was silent.
-                    CoverageImpact::UnhookedProcess
-                });
+                let mut finding = finding
+                    .with_coverage_impact(coverage_impact_for(runtime_watched, unreadable_calls));
                 emit::attach_flow_refs(&mut finding, &episode.flow_ids);
                 derived.findings.push(finding);
             }
@@ -123,37 +157,114 @@ pub(crate) fn derive(
         }
     }
 
+    derived.silences.extend(silenced_by_target.note(
+        "the repository declares the same destination (target rung), so the traffic is accounted for",
+    ));
+    derived.silences.extend(silenced_by_provider.note(
+        "the repository declares the same provider elsewhere (J3 rung), which silences the claim and never confirms one",
+    ));
+    if unreadable_calls > 0 {
+        derived.silences.push(format!(
+            "unmatched wire traffic: {unreadable_calls} observed calls named a destination the hook \
+             could not read, so no connection in this run is reported as unexplained with certainty"
+        ));
+    }
+
     derived
+}
+
+/// One suppression rung's tally.
+///
+/// Episodes and flows are both counted because they answer different questions:
+/// a reader wants to know how many facts were silenced and how much traffic sat
+/// behind them, and one episode can hold a thousand connections.
+#[derive(Debug, Default)]
+struct Silenced {
+    episodes: u64,
+    flows: u64,
+}
+
+impl Silenced {
+    fn record(&mut self, episode: &WireEpisode) {
+        self.episodes = self.episodes.saturating_add(1);
+        self.flows = self.flows.saturating_add(episode.flow_count());
+    }
+
+    /// The line the report carries, or nothing when this rung silenced nothing.
+    fn note(&self, reason: &str) -> Option<String> {
+        (self.episodes > 0).then(|| {
+            format!(
+                "unmatched wire traffic: {} in scope conversations over {} connections produced no \
+                 finding because {reason}",
+                self.episodes, self.flows
+            )
+        })
+    }
 }
 
 /// How firmly the claim may be stated.
 ///
-/// Confirmed needs both halves of the argument. Something had to be listening
-/// for application calls, or "no call explains this" is a statement about the
-/// tool rather than about the machine. And the destination has to have a name,
-/// because a claim about traffic to a bare address is one a reader cannot check
-/// and cannot act on.
-fn confidence_for(episode: &WireEpisode, runtime_watched: bool) -> Confidence {
-    if runtime_watched && episode.named {
+/// Confirmed needs every half of the argument. Something had to be listening for
+/// application calls, or "no call explains this" is a statement about the tool
+/// rather than about the machine. That listener had to be able to read where the
+/// calls it heard went, because a call whose destination was unreadable is a
+/// candidate explanation for this very connection. And the destination has to
+/// have a name, because a claim about traffic to a bare address is one a reader
+/// cannot check and cannot act on.
+fn confidence_for(
+    episode: &WireEpisode,
+    runtime_watched: bool,
+    unreadable_calls: u64,
+) -> Confidence {
+    if runtime_watched && episode.named && unreadable_calls == 0 {
         Confidence::Confirmed
     } else {
         Confidence::Suspect
     }
 }
 
-/// Whether any code point accounts for this destination.
+/// Which gap in the run's coverage the finding rests on, if any.
+///
+/// Ordered by how much of the argument is missing. No hook at all leaves the
+/// whole application side unobserved; a hook that could not read a destination
+/// leaves one call unplaced. Both are gaps the finding has to carry with it, so
+/// that a finding read on its own does not imply an observation nobody made.
+fn coverage_impact_for(runtime_watched: bool, unreadable_calls: u64) -> CoverageImpact {
+    if !runtime_watched {
+        // The traffic may well have had an application call behind it that
+        // nothing was there to record.
+        return CoverageImpact::UnhookedProcess;
+    }
+    if unreadable_calls > 0 {
+        return CoverageImpact::UnresolvedTarget;
+    }
+    CoverageImpact::None
+}
+
+/// How the code accounts for this destination, if it does at all.
 ///
 /// Two rungs, both weak by construction and both only ever used to silence.
 /// Naming the same destination is the stronger one. Naming the same provider is
 /// `data-model.md`'s J3, which may never produce a confirmed claim; it is
 /// admitted here because the finding it would silence is an accusation, and the
-/// bar for accusing is higher than the bar for staying quiet.
-fn code_explains(episode: &WireEpisode, points: &[DeclaredPoint]) -> bool {
-    points.iter().any(|point| {
-        point.target() == Some(&episode.target)
-            || (episode.provider_ref != UNKNOWN_PROVIDER
-                && point.provider_ref() == episode.provider_ref)
-    })
+/// bar for accusing is higher than the bar for staying quiet. Which of the two
+/// answered is returned rather than a boolean, because the caller counts them
+/// apart.
+fn code_explains(episode: &WireEpisode, points: &[DeclaredPoint]) -> CodeExplanation {
+    if points
+        .iter()
+        .any(|point| point.target() == Some(&episode.target))
+    {
+        return CodeExplanation::DeclaredTarget;
+    }
+    if episode.provider_ref != UNKNOWN_PROVIDER
+        && points
+            .iter()
+            .any(|point| point.provider_ref() == episode.provider_ref)
+    {
+        return CodeExplanation::DeclaredProvider;
+    }
+    CodeExplanation::None
 }
 
 fn classification_of(episode: &WireEpisode) -> &'static str {
@@ -205,6 +316,19 @@ mod tests {
             runtime_watched,
             &ReconcileSettings::default(),
         )
+    }
+
+    /// The same derivation, run at a stated join tolerance.
+    ///
+    /// Separate from [`derive_with`] because the tolerance has to reach both the
+    /// grouping and the settings the finding carries; passing it to one and not
+    /// the other would produce a finding whose evidence names a tolerance that
+    /// did not group it.
+    fn derive_with_tolerance(flows: &[Flow], tolerance_ms: u64) -> Derived {
+        let settings = ReconcileSettings::default().with_join_tolerance_ms(tolerance_ms);
+        let (episodes, _) = episodes(flows, settings.effective_join_tolerance_ms());
+        let j1 = j1::join(&episodes, &[]);
+        derive(&episodes, &j1, &[], true, &settings)
     }
 
     fn evidence_of(derived: &Derived) -> String {
@@ -281,10 +405,15 @@ mod tests {
     }
 
     #[test]
-    fn traffic_to_a_provider_the_code_uses_elsewhere_produces_nothing() {
+    fn traffic_to_a_provider_the_code_uses_elsewhere_produces_nothing_but_is_counted() {
         // The J3 rung. The repository uses this vendor, so the vendor's regional
         // endpoint is not traffic nobody can account for, and accusing on a
         // provider level tie is exactly what the ladder forbids.
+        //
+        // What it may not do is disappear. Spec §6 closes with "no class stays
+        // out of the report", and a repository with a single provider call would
+        // otherwise silence every in scope connection to that provider with
+        // nothing anywhere to show it happened.
         let flows = [named_flow(
             "eu.api.openai.com",
             "openai",
@@ -293,8 +422,166 @@ mod tests {
             54_321,
         )];
         let points = [unresolved_point(EP, "openai")];
+        let derived = derive_with(&flows, &[], &points, true);
 
-        assert!(derive_with(&flows, &[], &points, true).findings.is_empty());
+        assert!(derived.findings.is_empty());
+        assert_eq!(derived.silences.len(), 1, "{:?}", derived.silences);
+        assert!(
+            derived.silences[0].contains("J3 rung"),
+            "{:?}",
+            derived.silences
+        );
+        assert!(
+            derived.silences[0].contains("1 in scope conversations over 1 connections"),
+            "{:?}",
+            derived.silences
+        );
+    }
+
+    #[test]
+    fn the_two_silencing_rungs_are_counted_apart_over_several_conversations() {
+        // A repository with one provider call and one declared destination, and
+        // traffic that hits both rungs plus a third destination nothing
+        // explains. One finding, and two counted silences that say how much
+        // traffic each rung took out of the accounting.
+        let flows = [
+            // Silenced by the target rung.
+            flow("api.openai.com", BUCKET, FlowScope::InScope),
+            // Silenced by the provider rung: two connections, one conversation.
+            named_flow(
+                "eu.api.anthropic.com",
+                "anthropic",
+                BUCKET,
+                FlowScope::InScope,
+                54_401,
+            ),
+            named_flow(
+                "eu.api.anthropic.com",
+                "anthropic",
+                BUCKET,
+                FlowScope::InScope,
+                54_402,
+            ),
+            // Nothing explains this one.
+            named_flow(
+                "telemetry.vendor.example",
+                "unknown",
+                BUCKET,
+                FlowScope::InScope,
+                54_403,
+            ),
+        ];
+        let points = [
+            point(EP, "api.openai.com", "chat.completions.create"),
+            unresolved_point("ep_0000000000000002", "anthropic"),
+        ];
+        let derived = derive_with(&flows, &[], &points, true);
+
+        assert_eq!(derived.findings.len(), 1, "{:?}", derived.findings);
+        let target_rung = derived
+            .silences
+            .iter()
+            .find(|line| line.contains("target rung"));
+        let provider_rung = derived
+            .silences
+            .iter()
+            .find(|line| line.contains("J3 rung"));
+        assert!(
+            target_rung
+                .is_some_and(|line| line.contains("1 in scope conversations over 1 connections")),
+            "{:?}",
+            derived.silences
+        );
+        assert!(
+            provider_rung
+                .is_some_and(|line| line.contains("1 in scope conversations over 2 connections")),
+            "{:?}",
+            derived.silences
+        );
+    }
+
+    #[test]
+    fn a_call_the_hook_could_not_place_costs_the_certainty_of_every_accusation() {
+        // The failure this rule exists for. The hook could not read where one
+        // call went, so that call is a standing candidate explanation for any
+        // connection in the run. Stating the accusation as certain would build a
+        // confirmed claim on top of an admitted gap, and the coverage impact is
+        // what carries the gap when the finding is read on its own.
+        let flows = [
+            named_flow(
+                "telemetry.vendor.example",
+                "unknown",
+                BUCKET,
+                FlowScope::InScope,
+                54_321,
+            ),
+            named_flow(
+                "analytics.vendor.example",
+                "unknown",
+                BUCKET,
+                FlowScope::InScope,
+                54_322,
+            ),
+        ];
+        let events = [
+            event(
+                "openai",
+                "chat.completions.create",
+                "api.openai.com",
+                "openai",
+            ),
+            crate::join::tests::event_with_unresolved_target("http.post", "unknown"),
+        ];
+        let derived = derive_with(&flows, &events, &[], true);
+
+        assert_eq!(derived.findings.len(), 2, "{:?}", derived.faults);
+        for finding in &derived.findings {
+            assert_eq!(finding.confidence, Confidence::Suspect, "{finding:?}");
+            assert_eq!(
+                finding.coverage_impact,
+                Some(CoverageImpact::UnresolvedTarget),
+                "{finding:?}"
+            );
+        }
+        let evidence = evidence_of(&derived);
+        assert!(evidence.contains("unreadable_call_targets=1"), "{evidence}");
+        assert!(
+            derived
+                .silences
+                .iter()
+                .any(|line| line.contains("could not read")),
+            "{:?}",
+            derived.silences
+        );
+    }
+
+    #[test]
+    fn a_hook_that_read_every_destination_leaves_the_certainty_where_it_was() {
+        // The other edge of the same rule: the downgrade is a statement about a
+        // gap, so a run without the gap keeps the confirmed claim the product
+        // exists to make.
+        let flows = [named_flow(
+            "telemetry.vendor.example",
+            "unknown",
+            BUCKET,
+            FlowScope::InScope,
+            54_321,
+        )];
+        let events = [event(
+            "openai",
+            "chat.completions.create",
+            "api.openai.com",
+            "openai",
+        )];
+        let derived = derive_with(&flows, &events, &[], true);
+
+        assert_eq!(derived.findings.len(), 1);
+        assert_eq!(derived.findings[0].confidence, Confidence::Confirmed);
+        assert_eq!(
+            derived.findings[0].coverage_impact,
+            Some(CoverageImpact::None)
+        );
+        assert!(evidence_of(&derived).contains("unreadable_call_targets=0"));
     }
 
     #[test]
@@ -389,6 +676,58 @@ mod tests {
         let evidence = evidence_of(&derived);
         assert!(evidence.contains("flows=3"), "{evidence}");
         assert!(evidence.contains("bytes_out=6144"), "{evidence}");
+    }
+
+    #[test]
+    fn the_join_tolerance_regroups_the_traffic_and_the_findings_change_with_it() {
+        // The boundary of the identity claim in `emit`. No threshold is an input
+        // to a finding identity, and for the kinds anchored on a code point that
+        // means the identity survives a threshold change. For these two it does
+        // not: the anchor is the conversation, the tolerance decides where one
+        // conversation ends, and two bursts merged into one are a different fact
+        // rather than the same fact reconfigured.
+        //
+        // Two connections ten seconds apart: two conversations under the default
+        // tolerance, one under a wider one.
+        let flows = [
+            named_flow(
+                "telemetry.vendor.example",
+                "unknown",
+                BUCKET,
+                FlowScope::InScope,
+                54_321,
+            ),
+            named_flow(
+                "telemetry.vendor.example",
+                "unknown",
+                BUCKET + 10,
+                FlowScope::InScope,
+                54_322,
+            ),
+        ];
+
+        let narrow = derive_with_tolerance(&flows, TOLERANCE_MS);
+        let wide = derive_with_tolerance(&flows, 60_000);
+
+        assert_eq!(narrow.findings.len(), 2, "{:?}", narrow.findings);
+        assert_eq!(wide.findings.len(), 1, "{:?}", wide.findings);
+        // The surviving finding is anchored on the earlier conversation, so one
+        // of the two identities is gone rather than both being preserved.
+        let narrow_ids: Vec<&str> = narrow
+            .findings
+            .iter()
+            .map(|finding| finding.finding_id.as_str())
+            .collect();
+        assert!(
+            narrow_ids.contains(&wide.findings[0].finding_id.as_str()),
+            "{narrow_ids:?} against {}",
+            wide.findings[0].finding_id
+        );
+        assert_eq!(
+            wide.findings[0].refs.len(),
+            2,
+            "both connections are carried"
+        );
     }
 
     #[test]

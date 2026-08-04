@@ -84,6 +84,19 @@ pub struct J1Result {
     /// becomes a finding is decided by the bucket it sits in and by whether any
     /// code explains it.
     unmatched_episode_ids: BTreeSet<String>,
+    /// Calls the hook recorded and this join could not use, because the
+    /// destination field held the sentinel or a value no target could be parsed
+    /// from.
+    ///
+    /// The wire side has carried its equivalent since it existed
+    /// ([`crate::wire::episodes`] returns its losses), and this side had none:
+    /// such a call left no trace in any counter, so a run where the hook could
+    /// not read a single destination was indistinguishable from a run where the
+    /// application made no calls at all. That difference decides whether "no
+    /// call explains this traffic" is a statement about the machine or about the
+    /// tool, so it may not be inferred, and the set is kept rather than a count
+    /// because one call recorded twice is one call.
+    unreadable_target_event_ids: BTreeSet<String>,
 }
 
 impl J1Result {
@@ -93,6 +106,15 @@ impl J1Result {
 
     pub fn is_unmatched(&self, flow_id: &str) -> bool {
         self.unmatched_episode_ids.contains(flow_id)
+    }
+
+    /// How many observed calls named a destination this join could not read.
+    ///
+    /// Load bearing rather than informational: while it is above zero, some
+    /// application call went somewhere nobody can name, so no connection may be
+    /// declared unexplained with certainty ([`crate::unmatched`]).
+    pub fn unreadable_target_events(&self) -> u64 {
+        self.unreadable_target_event_ids.len() as u64
     }
 
     /// Every call tied to one connection, strongest quality first.
@@ -141,9 +163,17 @@ pub(crate) fn join(episodes: &[WireEpisode], events: &[EgressEvent]) -> J1Result
     // two numbers that both grow with the run, and on a busy machine the answer
     // to "which connections reached nothing" cost more than the join itself.
     let mut by_target: BTreeMap<&TargetId, Vec<&CallKey<'_>>> = BTreeMap::new();
+    let mut unreadable_target_event_ids: BTreeSet<String> = BTreeSet::new();
     for key in &keys {
-        if let Some(target) = key.target.as_ref() {
-            by_target.entry(target).or_default().push(key);
+        match key.target.as_ref() {
+            Some(target) => by_target.entry(target).or_default().push(key),
+            // Counted rather than skipped. The call happened; what could not be
+            // read is where it went, and dropping it here would let the traffic
+            // it may well have produced be reported as traffic no application
+            // accounts for.
+            None => {
+                unreadable_target_event_ids.insert(key.egress_event_id.to_owned());
+            }
         }
     }
     // One call recorded twice is one call. Counting the copy as a second
@@ -173,15 +203,17 @@ pub(crate) fn join(episodes: &[WireEpisode], events: &[EgressEvent]) -> J1Result
         }
     }
 
-    // Ordered before deduplication so the strongest quality survives a pair
-    // offered twice, and so the output does not depend on the order either
-    // source handed its records over in.
+    // Ordered so the output does not depend on the order either source handed
+    // its records over in. Nothing is deduplicated afterwards: an episode is
+    // visited once and its candidate list was deduplicated above, so no pair can
+    // be produced twice, and a guard against that would be a line no input can
+    // reach.
     matches.sort();
-    matches.dedup_by(|a, b| a.flow_id == b.flow_id && a.egress_event_id == b.egress_event_id);
 
     J1Result {
         matches,
         unmatched_episode_ids,
+        unreadable_target_event_ids,
     }
 }
 
@@ -315,10 +347,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_call_whose_destination_the_hook_could_not_read_ties_to_nothing() {
+    fn a_call_whose_destination_the_hook_could_not_read_ties_to_nothing_and_is_counted() {
         // The sentinel is not a host. Reading it as one would tie every
         // unobservable call to every connection and silence the finding this
         // whole phase exists to produce.
+        //
+        // What the earlier version of this test locked in was the other half of
+        // the same mistake: the call tied to nothing and then left no trace at
+        // all, so the run could not tell "the hook saw a call it could not
+        // place" from "the application made no call". The count is asserted
+        // here because a downstream rule reads it before stating a certainty.
         let flows = [flow("api.openai.com", BUCKET, FlowScope::InScope)];
         let events = [crate::join::tests::event_with_unresolved_target(
             "chat.completions.create",
@@ -328,6 +366,57 @@ pub(crate) mod tests {
 
         assert!(result.matches().is_empty());
         assert!(result.is_unmatched(&first_episode_id(&flows)));
+        assert_eq!(result.unreadable_target_events(), 1);
+    }
+
+    #[test]
+    fn unreadable_calls_are_counted_beside_the_readable_ones_they_arrived_with() {
+        // The shape a real run has: several destinations, several calls, and one
+        // hook that could not read where one of them went. The readable calls
+        // still join, and the unreadable one is neither joined nor lost.
+        let flows = [
+            flow("api.openai.com", BUCKET, FlowScope::InScope),
+            named_flow(
+                "api.anthropic.com",
+                "anthropic",
+                BUCKET,
+                FlowScope::InScope,
+                54_999,
+            ),
+        ];
+        let events = [
+            crate::join::tests::event(
+                "openai",
+                "chat.completions.create",
+                "api.openai.com",
+                "openai",
+            ),
+            crate::join::tests::event_with_unresolved_target("http.post", "unknown"),
+            crate::join::tests::event_with_unresolved_target("http.request", "unknown"),
+        ];
+        let result = joined(&flows, &events);
+
+        assert_eq!(result.matches().len(), 1);
+        assert_eq!(result.unreadable_target_events(), 2);
+        // The anthropic connection is unexplained as far as the join can tell,
+        // and the two unreadable calls are exactly why that cannot be stated as
+        // a certainty further down.
+        let anthropic_is_unexplained = episodes(&flows, TOLERANCE_MS).0.iter().any(|episode| {
+            episode.target.host() == "api.anthropic.com" && result.is_unmatched(&episode.flow_id)
+        });
+        assert!(anthropic_is_unexplained);
+    }
+
+    #[test]
+    fn one_unreadable_call_recorded_twice_is_counted_once() {
+        // Identity rather than arrival: a replayed stream or a directory read
+        // twice must not make the run look blinder than it was.
+        let flows = [flow("api.openai.com", BUCKET, FlowScope::InScope)];
+        let repeated =
+            crate::join::tests::event_with_unresolved_target("chat.completions.create", "openai");
+        let result = joined(&flows, &[repeated.clone(), repeated]);
+
+        assert_eq!(result.unreadable_target_events(), 1);
     }
 
     #[test]

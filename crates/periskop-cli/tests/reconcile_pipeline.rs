@@ -746,6 +746,161 @@ fn traffic_no_code_and_no_call_explains_becomes_a_finding_in_a_real_report() {
 }
 
 #[test]
+fn a_call_the_hook_could_not_place_costs_the_headline_claim_its_certainty() {
+    // **Critic round K1, end to end.** The failure the report could not show:
+    // the hook could not read where one call went, so the call took part in no
+    // join and left no trace, and the traffic it may well have produced came out
+    // as a confirmed accusation. The run below has three connections and three
+    // calls, one of which went somewhere the hook could not name.
+    let fixture = Fixture::new("unreadable-call");
+    fixture
+        .write_events(
+            "worker-1.jsonl",
+            &[
+                call_to("api.openai.com"),
+                call_to_somewhere_unreadable(),
+                event("requests", "http.post", "unknown", "unknown")
+                    .with_degraded_reasons(vec![DegradedReason::TargetNotResolved]),
+            ],
+        )
+        .write_flows(
+            "sensor-1.jsonl",
+            &[
+                unexplained_traffic(FlowScope::InScope, 54_321),
+                connection(
+                    "analytics.vendor.example",
+                    "unknown",
+                    FlowScope::InScope,
+                    54_322,
+                ),
+                connection("api.openai.com", "openai", FlowScope::InScope, 54_323),
+            ],
+        );
+
+    let outcome = fixture.scan_all_sources();
+    let unmatched = findings_of_kind(&outcome, periskop_core::finding::Kind::UnmatchedWireTraffic);
+
+    // The two unexplained connections are still reported: the point is not to
+    // hide them, it is to state them at the strength the evidence carries.
+    assert_eq!(unmatched.len(), 2, "{:?}", outcome.report);
+    for finding in &unmatched {
+        assert_eq!(
+            finding.confidence,
+            periskop_core::finding::Confidence::Suspect,
+            "{finding:?}"
+        );
+        assert_eq!(
+            finding.coverage_impact,
+            Some(periskop_core::finding::CoverageImpact::UnresolvedTarget),
+            "{finding:?}"
+        );
+    }
+    // And the count reaches the coverage statement, which is the only place a
+    // reader can find out why the claim was downgraded.
+    assert_eq!(outcome.report.coverage.unresolved_event_targets, 2);
+    // A suspected finding lives in its own list, so the downgrade also moves it
+    // out of the confirmed one.
+    assert!(outcome
+        .report
+        .findings
+        .iter()
+        .all(|finding| finding.kind != periskop_core::finding::Kind::UnmatchedWireTraffic));
+}
+
+#[test]
+fn a_hook_that_read_every_destination_still_produces_the_confirmed_claim() {
+    // The other edge of K1, so the downgrade above cannot be met by downgrading
+    // everything. The same three sources with nothing unreadable in them: the
+    // product's headline finding is stated as certain and the counter is zero.
+    let fixture = Fixture::new("readable-calls");
+    fixture
+        .write_events("worker-1.jsonl", &[call_to("api.openai.com")])
+        .write_flows(
+            "sensor-1.jsonl",
+            &[unexplained_traffic(FlowScope::InScope, 54_321)],
+        );
+
+    let outcome = fixture.scan_all_sources();
+    let unmatched = findings_of_kind(&outcome, periskop_core::finding::Kind::UnmatchedWireTraffic);
+
+    assert_eq!(unmatched.len(), 1, "{:?}", outcome.report);
+    assert_eq!(
+        unmatched[0].confidence,
+        periskop_core::finding::Confidence::Confirmed
+    );
+    assert_eq!(outcome.report.coverage.unresolved_event_targets, 0);
+}
+
+#[test]
+fn a_rung_that_silenced_the_headline_finding_says_so_in_the_report() {
+    // **Critic round O1, end to end.** The repository declares one provider, and
+    // every in scope connection to that provider is therefore silenced by the
+    // weakest rung in the ladder. Spec §6: no class stays out of the report, so
+    // the silence is counted where a reader will find it.
+    let fixture = Fixture::new("provider-rung");
+    fixture.write_flows(
+        "sensor-1.jsonl",
+        &[
+            connection("eu.api.openai.com", "openai", FlowScope::InScope, 54_321),
+            connection("us.api.openai.com", "openai", FlowScope::InScope, 54_322),
+        ],
+    );
+
+    let outcome = fixture.scan_with_flows_only();
+
+    assert!(
+        findings_of_kind(&outcome, periskop_core::finding::Kind::UnmatchedWireTraffic).is_empty(),
+        "{:?}",
+        outcome.report
+    );
+    let stated = details(&outcome, DiagnosticComponent::Reconciliation);
+    assert!(
+        stated
+            .iter()
+            .any(|detail| detail.contains("J3 rung") && detail.contains("2 connections")),
+        "{stated:?}"
+    );
+}
+
+#[test]
+fn the_flow_buckets_are_written_with_the_denominator_they_are_read_against() {
+    // **Critic round O2, end to end.** Three of the four buckets were in the
+    // report and the fourth was dropped on the floor, so "one flow out of scope"
+    // could not be read: out of two, or out of two thousand. K-15's attribution
+    // gate is a ratio, and a ratio needs the number underneath it.
+    let fixture = Fixture::new("bucket-denominator");
+    fixture.write_flows(
+        "sensor-1.jsonl",
+        &[
+            connection("api.openai.com", "openai", FlowScope::InScope, 54_321),
+            connection("api.openai.com", "openai", FlowScope::InScope, 54_322),
+            connection("api.openai.com", "openai", FlowScope::InScope, 54_323),
+            unexplained_traffic(FlowScope::OutOfScopeProcess, 54_324),
+            unexplained_traffic(FlowScope::KnownBenign, 54_325),
+        ],
+    );
+
+    let coverage = fixture.scan_with_flows_only().report.coverage;
+
+    assert_eq!(coverage.in_scope_flows, 3);
+    assert_eq!(coverage.out_of_scope_flows, 1);
+    assert_eq!(coverage.known_benign_flows, 1);
+    assert_eq!(coverage.unattributed_flows, 0);
+}
+
+#[test]
+fn a_static_scan_writes_no_denominator_because_no_sensor_counted_anything() {
+    // The zero has to mean the same thing as the other four buckets' zeros: not
+    // "the sensor saw no in scope traffic" but "there was no sensor". The mode
+    // is what carries that, and the counter must not imply an observation.
+    let fixture = Fixture::new("bucket-denominator-static");
+    let coverage = fixture.scan_without_events().report.coverage;
+
+    assert_eq!(coverage.in_scope_flows, 0);
+    assert_eq!(coverage.reconciliation_mode, ReconciliationMode::StaticOnly);
+}
+
+#[test]
 fn the_same_traffic_produces_nothing_when_it_is_not_the_scanned_codebase() {
     // **Milestone 56's non negotiable constraint, through the command.** The
     // identical connection in the three quiet buckets, and the report gains no
@@ -858,6 +1013,89 @@ fn a_volume_claim_is_not_derived_until_a_policy_declares_the_band() {
         1,
         "{:?}",
         with.report
+    );
+}
+
+#[test]
+fn a_sensor_that_counted_no_bytes_is_not_a_run_without_anomalies() {
+    // **Critic round K2, end to end, first half.** The band is declared and the
+    // capture mechanism reported connections without volume. Every comparison is
+    // impossible, and the report used to say what it says for a clean run:
+    // nothing. The suppression is what tells the two apart.
+    let fixture = Fixture::new("volume-unmeasured");
+    let mut uncounted = connection("api.openai.com", "openai", FlowScope::InScope, 54_321);
+    uncounted.bytes_out = None;
+    let mut also_uncounted = connection("api.openai.com", "openai", FlowScope::InScope, 54_322);
+    also_uncounted.bytes_out = None;
+    fixture
+        .write_events("worker-1.jsonl", &[call_to("api.openai.com")])
+        .write_flows("sensor-1.jsonl", &[uncounted, also_uncounted]);
+
+    let outcome = fixture.scan_with_sources(
+        scan::ScanSources {
+            event_dir: Some(&fixture.events()),
+            flow_dir: Some(&fixture.flows()),
+        },
+        ReconcileSettings::default().with_volume_band(VolumeBand::declared(5_000, 30_000).unwrap()),
+    );
+
+    assert!(
+        findings_of_kind(&outcome, periskop_core::finding::Kind::VolumeAnomaly).is_empty(),
+        "{:?}",
+        outcome.report
+    );
+    let stated = details(&outcome, DiagnosticComponent::Reconciliation);
+    assert!(
+        stated
+            .iter()
+            .any(|detail| detail.contains("volume_anomaly")
+                && detail.contains("volume_not_measured")),
+        "{stated:?}"
+    );
+}
+
+#[test]
+fn a_call_the_hook_could_not_size_produces_no_volume_anomaly_and_says_why() {
+    // **Critic round K2, end to end, second half, and the worse one.** Two calls
+    // travelled over one connection and the hook could size only one of them, so
+    // the expected total was half of what was really declared and an anomaly
+    // appeared out of the missing half. The subject of that finding was the
+    // hook's blind spot, presented as the machine's behaviour.
+    let fixture = Fixture::new("volume-unsized-call");
+    let sized = call_to("api.openai.com");
+    let mut unmeasured = event("openai", "embeddings.create", "api.openai.com", "openai");
+    unmeasured.payload_shape.byte_size_estimate = 0;
+    fixture
+        .write_events("worker-1.jsonl", &[sized, unmeasured])
+        .write_flows(
+            "sensor-1.jsonl",
+            &[connection(
+                "api.openai.com",
+                "openai",
+                FlowScope::InScope,
+                54_321,
+            )],
+        );
+
+    let outcome = fixture.scan_with_sources(
+        scan::ScanSources {
+            event_dir: Some(&fixture.events()),
+            flow_dir: Some(&fixture.flows()),
+        },
+        ReconcileSettings::default().with_volume_band(VolumeBand::declared(5_000, 30_000).unwrap()),
+    );
+
+    assert!(
+        findings_of_kind(&outcome, periskop_core::finding::Kind::VolumeAnomaly).is_empty(),
+        "{:?}",
+        outcome.report
+    );
+    let stated = details(&outcome, DiagnosticComponent::Reconciliation);
+    assert!(
+        stated
+            .iter()
+            .any(|detail| detail.contains("declared no payload size")),
+        "{stated:?}"
     );
 }
 

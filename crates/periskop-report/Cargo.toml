@@ -14,6 +14,13 @@ workspace = true
 [dependencies]
 periskop-core = { workspace = true }
 blake3 = { workspace = true }
+# Report signing lives here rather than in the command line crate, because the
+# bytes a signature covers are decided by this crate's canonical form. A second
+# implementation of that rule elsewhere is the way a verifier and a signer drift
+# apart without either of them being wrong on its own.
+ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+zeroize = { workspace = true }

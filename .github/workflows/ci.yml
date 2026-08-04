@@ -60,8 +60,10 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
 
+      # Features here are additive, so linting with all of them on covers the
+      # default build as well as the code the default build leaves out.
       - name: Lints
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       # PERISKOP_REQUIRE_PROOF turns a skipped F2 gate into a failure. Without it
       # a runner with no python3 records `status: skipped` in target/f2-proof.json
@@ -72,6 +74,15 @@ jobs:
         env:
           PERISKOP_REQUIRE_PROOF: 1
         run: cargo test --workspace
+
+      # The default build leaves the ebpf loader out, so its tests run nowhere
+      # unless they are asked for by name. One of them reads the loader crate's
+      # own sources to keep the unsafe exception from spreading, and a guard
+      # that only runs locally guards nothing.
+      - name: Tests with every feature on
+        env:
+          PERISKOP_REQUIRE_PROOF: 1
+        run: cargo test --workspace --all-features
 
       # periskop scans its own repository. If the tool cannot run on the codebase
       # that produces it, that is worth finding out here rather than from a user.
@@ -190,6 +201,11 @@ jobs:
 
       # Both sides pass their own tests without agreeing on the wire. This is
       # where a renamed field or a framing mismatch surfaces.
-      - name: Cross language smoke tests
+      #
+      # The glob is deliberate. Naming one file here meant that every suite
+      # added later ran on a developer machine and nowhere else, which is the
+      # same defect this project exists to report: a check that looks like it
+      # covers something and does not.
+      - name: Tests
         working-directory: packages/mcp-server
-        run: node --test dist/smoke.test.js
+        run: node --test dist/*.test.js
