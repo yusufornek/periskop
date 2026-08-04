@@ -1,0 +1,98 @@
+# Can a hosted runner load a BPF program at all?
+#
+# ADR-014 deferred the eBPF loader three times, and every deferral rested on
+# the same fact: the development machine is macOS, where aya does not compile
+# and no gate can see the code. The F4 plan then found that without kernel
+# capture the phase cannot close, whatever else is finished.
+#
+# So the question worth answering before writing that code is whether a hosted
+# Linux runner can run it. If BTF is present and bpf() is reachable, the loader
+# becomes verifiable in CI and the deferral ends. If not, that is worth knowing
+# now rather than after thirty tasks.
+#
+# This job asserts nothing and gates nothing. It reports.
+
+name: Kernel probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/kernel-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: What this runner offers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kernel and distribution
+        run: |
+          uname -a
+          cat /etc/os-release | head -3
+
+      # BTF is what lets a loader relocate a program against the running
+      # kernel's own types. Without it, a program has to be compiled for the
+      # exact kernel it will run on, which is the packaging problem ADR-008
+      # wanted to avoid.
+      - name: BTF
+        run: |
+          if [ -r /sys/kernel/btf/vmlinux ]; then
+            echo "BTF present: $(stat -c %s /sys/kernel/btf/vmlinux) bytes"
+          else
+            echo "BTF absent"
+          fi
+
+      - name: Capabilities of this shell
+        run: |
+          grep -E 'CapEff|CapBnd' /proc/self/status
+          echo "--- under sudo ---"
+          sudo grep -E 'CapEff' /proc/self/status
+
+      # The direct question. A map is the cheapest object the verifier will
+      # accept, so creating one answers whether bpf() is reachable without
+      # needing a compiled program.
+      - name: Can bpf() create a map
+        run: |
+          sudo apt-get install -y --no-install-recommends libbpf-dev >/dev/null 2>&1 || true
+          cat > probe.c <<'PROBE'
+          #include <stdio.h>
+          #include <errno.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <linux/bpf.h>
+          #include <sys/syscall.h>
+
+          int main(void) {
+            union bpf_attr attr;
+            memset(&attr, 0, sizeof(attr));
+            attr.map_type = BPF_MAP_TYPE_HASH;
+            attr.key_size = 4;
+            attr.value_size = 8;
+            attr.max_entries = 16;
+            int fd = syscall(SYS_bpf, BPF_MAP_CREATE, &attr, sizeof(attr));
+            if (fd < 0) {
+              printf("bpf(BPF_MAP_CREATE) refused: %s\n", strerror(errno));
+              return 1;
+            }
+            printf("bpf(BPF_MAP_CREATE) returned fd %d\n", fd);
+            close(fd);
+            return 0;
+          }
+          PROBE
+          gcc -o probe probe.c
+          echo "--- unprivileged ---"
+          ./probe || true
+          echo "--- privileged ---"
+          sudo ./probe || true
+
+      # aya is the crate ADR-014 named and deferred. Whether it compiles on a
+      # hosted runner is the other half of the answer.
+      - name: Does aya build here
+        run: |
+          cargo new --lib /tmp/ayaprobe >/dev/null
+          cd /tmp/ayaprobe
+          cargo add aya >/dev/null 2>&1 || echo "cargo add aya failed"
+          cargo build 2>&1 | tail -5
