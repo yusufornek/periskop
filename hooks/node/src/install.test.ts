@@ -3,6 +3,7 @@ import test from "node:test";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 
+import { EVENT_DIR } from "./config";
 import { install } from "./install";
 import { resetStatus, snapshot } from "./hook-status";
 import type { EgressEvent } from "./egress-event";
@@ -39,7 +40,7 @@ test("installing patches every transport the process has", async (t) => {
   resetStatus();
   const server = await echoServer();
   const { sink, events } = collectingSink();
-  const result = install({ sink, now: () => 1_764_000_000_000 });
+  const result = install({ sink });
   t.after(async () => {
     result.uninstall();
     await server.close();
@@ -102,11 +103,11 @@ test("a sink that cannot be built leaves the application unhooked and says so", 
   resetStatus();
   const originalRequest = http.request;
   // A directory that cannot exist, so the real sink fails to be created.
-  const previous = process.env["PERISKOP_HOOK_DIR"];
-  process.env["PERISKOP_HOOK_DIR"] = "/dev/null/not-a-directory";
+  const previous = process.env[EVENT_DIR];
+  process.env[EVENT_DIR] = "/dev/null/not-a-directory";
   t.after(() => {
-    if (previous === undefined) delete process.env["PERISKOP_HOOK_DIR"];
-    else process.env["PERISKOP_HOOK_DIR"] = previous;
+    if (previous === undefined) delete process.env[EVENT_DIR];
+    else process.env[EVENT_DIR] = previous;
   });
 
   const result = install({});

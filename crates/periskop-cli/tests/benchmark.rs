@@ -9,11 +9,20 @@
 //! a project needs a symbol table the scanner does not build, so a call site
 //! score would be measuring a capability the tool does not claim. The file unit
 //! answers the question a reader actually has: did the scan notice this file
-//! sends data to a provider.
+//! sends data to a provider. A suspected finding counts as noticing. Scoring
+//! only confirmed findings would mark a rule as failing on the day it correctly
+//! lowered its own confidence, which is the opposite of the incentive wanted.
 //!
 //! A miss that is already in the gap catalogue is reported separately from one
 //! that is not. The first is a known limit; the second is a regression. Adding
 //! them together would let a catalogued gap hide a genuine loss of coverage.
+//!
+//! Catalogued gaps stay in the denominator of the recall figure. Removing them
+//! made the number a tautology: the run already fails on any uncatalogued miss,
+//! so once that assertion passed, recall was one hundred percent by arithmetic
+//! and could not have come out otherwise. Counted in, the figure measures what
+//! share of known egress this rule set actually finds, and it moves when the
+//! catalogue grows.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -87,35 +96,35 @@ fn group(language_dir: &str, group: &str) -> Vec<(String, String, Language)> {
     out
 }
 
-fn has_confirmed_finding(source: &str, name: &str, language: Language) -> bool {
+fn has_finding(source: &str, name: &str, language: Language) -> bool {
     let (family, compiled) = rules_for(language);
     let Ok(parsed) = parse_as(name, source, language) else {
         return false;
     };
-    detect(&parsed, &compiled, &family)
-        .findings
-        .iter()
-        .any(|f| f.confidence == periskop_core::finding::Confidence::Confirmed)
+    !detect(&parsed, &compiled, &family).findings.is_empty()
 }
 
+/// The marker an evasion fixture carries in its own header.
+const GAP_MARKER: &str = "Known gap";
+
 /// Gaps the project has written down. A miss listed here is expected.
-fn catalogued_gaps() -> BTreeSet<String> {
-    // Sourced from the evasion fixtures, which exist precisely to record what the
-    // scanner cannot see. Keeping the list here rather than in a separate file
-    // means a new evasion fixture is catalogued the moment it is added.
-    [
-        "dynamic_dispatch.py",
-        "env_built_url.py",
-        "dynamic_property.ts",
-        "env_built_url.ts",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect()
+///
+/// Read out of the fixtures rather than held as a list in this file. The list
+/// used to sit here with a comment claiming a new evasion fixture was catalogued
+/// the moment it was added; the code did the opposite, and adding one turned the
+/// benchmark red until somebody found the array in a Rust test and edited it.
+/// A fixture now declares its own status, which is the only place a contributor
+/// is already looking.
+fn catalogued_gaps(language_dir: &str) -> BTreeSet<String> {
+    group(language_dir, "evasion")
+        .into_iter()
+        .filter(|(_, source, _)| source.contains(GAP_MARKER))
+        .map(|(name, _, _)| name)
+        .collect()
 }
 
 fn score(language_dir: &str) -> LanguageScore {
-    let catalogued = catalogued_gaps();
+    let catalogued = catalogued_gaps(language_dir);
     let mut detected = 0usize;
     let mut missed_catalogued = Vec::new();
     let mut missed_uncatalogued = Vec::new();
@@ -128,7 +137,7 @@ fn score(language_dir: &str) -> LanguageScore {
         .chain(group(language_dir, "evasion"))
     {
         positives += 1;
-        if has_confirmed_finding(&source, &name, language) {
+        if has_finding(&source, &name, language) {
             detected += 1;
         } else if catalogued.contains(&name) {
             missed_catalogued.push(name);
@@ -139,20 +148,16 @@ fn score(language_dir: &str) -> LanguageScore {
 
     let mut false_positives = 0usize;
     for (name, source, language) in group(language_dir, "negative") {
-        if has_confirmed_finding(&source, &name, language) {
+        if has_finding(&source, &name, language) {
             false_positives += 1;
             missed_uncatalogued.push(format!("false positive: {name}"));
         }
     }
 
-    // Catalogued gaps are excluded from the denominator. Scoring the tool against
-    // limits it has already declared would measure the size of the catalogue
-    // rather than the quality of the rules.
-    let scorable = positives - missed_catalogued.len();
-    let recall = if scorable == 0 {
+    let recall = if positives == 0 {
         0
     } else {
-        (detected as u64 * 10_000) / scorable as u64
+        (detected as u64 * 10_000) / positives as u64
     };
 
     LanguageScore {
@@ -165,6 +170,16 @@ fn score(language_dir: &str) -> LanguageScore {
         recall_file_unit_basis_points: recall,
     }
 }
+
+/// The share of labeled egress the rule set is expected to find.
+///
+/// Not one hundred percent, and that is the point. The corpus deliberately
+/// contains fixtures the scanner cannot see, so a perfect score would mean the
+/// catalogue had been emptied rather than the rules improved. The floor is set
+/// below the current figure with room for one more catalogued gap per language,
+/// so adding a gap is a decision rather than a build failure, and losing a
+/// detector is still a red test.
+const RECALL_FLOOR_BASIS_POINTS: u64 = 6_500;
 
 #[test]
 fn detection_benchmark() {
@@ -201,11 +216,17 @@ fn detection_benchmark() {
 
     for language in &result.languages {
         assert!(
-            language.recall_file_unit_basis_points == 10_000,
-            "{} recall is {} basis points on the bootstrap corpus, where every \
-             scorable fixture is expected to be found",
+            language.recall_file_unit_basis_points >= RECALL_FLOOR_BASIS_POINTS,
+            "{} recall is {} basis points, below the declared floor of \
+             {RECALL_FLOOR_BASIS_POINTS}",
             language.language,
             language.recall_file_unit_basis_points
+        );
+        assert!(
+            !language.missed_catalogued.is_empty(),
+            "{} has no catalogued gap left, so the recall figure is measuring an \
+             empty catalogue rather than the rules",
+            language.language
         );
     }
 }

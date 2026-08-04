@@ -10,6 +10,7 @@
 // of what went is reported through the status file. Dropping is acceptable;
 // dropping quietly is not.
 
+import { randomBytes } from "node:crypto";
 import { appendFileSync, createWriteStream, mkdirSync, type WriteStream } from "node:fs";
 import { join } from "node:path";
 
@@ -24,6 +25,19 @@ export interface EventSink {
 
 const FLUSH_INTERVAL_MS = 200;
 
+/**
+ * File this process appends to, unique among every writer in the directory.
+ *
+ * The extension is what the collector selects on, so anything but .jsonl is a
+ * stream it never reads. The pid alone would not make the name unique enough:
+ * pids are reused, so a short lived process can land on a finished one's number
+ * and append its events to that run's file, merging two runs into one stream
+ * nobody can separate again.
+ */
+export function streamName(pid: number): string {
+  return `node-${pid}-${randomBytes(4).toString("hex")}.jsonl`;
+}
+
 export class FileEventSink implements EventSink {
   readonly #pending: string[] = [];
   readonly #limit: number;
@@ -35,13 +49,20 @@ export class FileEventSink implements EventSink {
 
   constructor(outputDir: string, pid: number, maxBufferedEvents: number) {
     this.#limit = maxBufferedEvents;
-    this.#eventPath = join(outputDir, `node-${pid}.ndjson`);
-    this.#statusPath = join(outputDir, `node-${pid}.status.json`);
+    const name = streamName(pid);
+    this.#eventPath = join(outputDir, name);
+    // Ends in .json, not .jsonl, so the collector never reads a run's own
+    // accounting back as a malformed event.
+    this.#statusPath = join(outputDir, `${name}.status.json`);
     mkdirSync(outputDir, { recursive: true });
   }
 
   get eventPath(): string {
     return this.#eventPath;
+  }
+
+  get statusPath(): string {
+    return this.#statusPath;
   }
 
   record(event: EgressEvent): void {

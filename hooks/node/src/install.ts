@@ -14,9 +14,8 @@ import { readConfig } from "./config";
 import { runSafely } from "./fail-open";
 
 export interface InstallOptions {
-  /** Injected by tests; production writes NDJSON next to the status file. */
+  /** Injected by tests; production writes JSON lines next to the status file. */
   readonly sink?: EventSink;
-  readonly now?: () => number;
 }
 
 export interface InstallResult {
@@ -74,9 +73,7 @@ export function install(options: InstallOptions = {}): InstallResult {
     }
     const record = createRecorder(sink, {
       runtime: runtimeName(process.version),
-      pid: process.pid,
       config,
-      now: options.now ?? Date.now,
     });
     undo = patchTransports(record);
   });

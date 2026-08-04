@@ -9,9 +9,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-mod render;
-mod rpc;
-mod scan;
+use periskop_cli::clock::now_rfc3339;
+use periskop_cli::{render, rpc, scan};
 
 /// Exit codes, fixed by the command line contract.
 mod exit {
@@ -121,11 +120,23 @@ fn run_scan(
         return ExitCode::from(exit::ERROR);
     }
 
+    // The clock is read before anything else runs. A report whose envelope
+    // carries an invented timestamp is not auditable, and the previous behaviour
+    // was to fall back to the epoch, which prints as a real date and reads as
+    // one. Refusing to produce the report at all is the honest answer.
+    let generated_at = match now_rfc3339() {
+        Ok(now) => now,
+        Err(e) => {
+            eprintln!("periskop: {e}");
+            return ExitCode::from(exit::ERROR);
+        }
+    };
+
     let outcome = scan::run(scan::ScanRequest {
         project_root: &path,
         rules_root: &rules_root,
         tool_version: env!("CARGO_PKG_VERSION"),
-        generated_at: now_rfc3339(),
+        generated_at,
     });
 
     for error in &outcome.rule_errors {
@@ -179,70 +190,4 @@ fn default_rules_root() -> PathBuf {
         }
     }
     PathBuf::from("rules")
-}
-
-/// Current time in the format the envelope declares.
-///
-/// The envelope is excluded from the body hash, so this value never affects
-/// whether two reports of the same tree compare equal.
-fn now_rfc3339() -> String {
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format_epoch_seconds(seconds)
-}
-
-/// Formats seconds since the epoch as RFC 3339 in UTC.
-///
-/// Written out rather than pulled in as a dependency: the report needs one
-/// timestamp in one format, and a date library would be a new dependency
-/// decision for that alone.
-fn format_epoch_seconds(seconds: u64) -> String {
-    let days = seconds / 86_400;
-    let time_of_day = seconds % 86_400;
-    let (hour, minute, second) = (
-        time_of_day / 3600,
-        (time_of_day % 3600) / 60,
-        time_of_day % 60,
-    );
-    let (year, month, day) = civil_from_days(days as i64);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-/// Days since the epoch to a calendar date.
-///
-/// Howard Hinnant's civil_from_days, the standard branch free form of this
-/// conversion. It handles leap years without a lookup table.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn epoch_formats_as_the_start_of_1970() {
-        assert_eq!(format_epoch_seconds(0), "1970-01-01T00:00:00Z");
-    }
-
-    #[test]
-    fn a_known_instant_round_trips() {
-        assert_eq!(format_epoch_seconds(1_785_834_000), "2026-08-04T09:00:00Z");
-    }
-
-    #[test]
-    fn leap_day_is_handled() {
-        assert_eq!(format_epoch_seconds(1_709_164_800), "2024-02-29T00:00:00Z");
-    }
 }

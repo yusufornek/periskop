@@ -2,6 +2,20 @@
 #
 # As on the Python side, the destination is what the rule keys on. Matching every
 # fetch in a codebase would bury the findings that matter.
+#
+# And as on the Python side, that is why the rule reports `suspect`. The call
+# shape is structural, but what narrows it to a provider is a regular expression
+# run over the text of a string literal, and reading a string is a text match
+# rather than a structural fact. `cache.get("api.openai.com")` satisfies it as
+# well as a real request does. The project forbids a text match from reaching the
+# confirmed list, so the call is still reported and the claim about where it goes
+# is what weakens.
+#
+# Restoring `confirmed` needs the receiver proven to be an HTTP client, which is
+# a binding rather than a stronger regex. The libraries in `covers_modules` are
+# the set that binding would have to accept. `fetch` is the harder half: it is a
+# global with no import to resolve, so proving it needs something other than the
+# binding table.
 
 schema_version = "1.0"
 language = "typescript"
@@ -45,7 +59,7 @@ target_url = { from = "url" }
 
 [classify]
 egress_kind = "llm_chat"
-default_confidence = "confirmed"
+default_confidence = "suspect"
 
 [[classify.downgrade]]
 when = "target_url.unresolved"

@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::language::Language;
 use crate::rules::model::RuleFile;
 
 /// Why a rule file was rejected.
@@ -92,14 +93,23 @@ pub fn parse_rule(path: &Path, text: &str) -> Result<RuleFile, RuleLoadError> {
     let mut rule: RuleFile = toml::from_str(text).map_err(|e| {
         // The toml crate reports a byte span. Turning it into a line number is
         // what makes the message actionable in an editor.
-        let line = e
-            .span()
-            .map(|span| text[..span.start.min(text.len())].lines().count())
-            .unwrap_or(1);
-        RuleLoadError::Syntax {
-            path: path.to_path_buf(),
-            line,
-            detail: e.message().to_owned(),
+        //
+        // Counting newlines rather than lines: an error at the first column of a
+        // line has a prefix that ends in a newline, and `lines()` does not count
+        // the empty piece after it, so the message pointed one line above the
+        // problem and the reader looked at the wrong row. An error with no span
+        // becomes an `Invalid`, because naming line one would be a guess that
+        // reads exactly like a fact.
+        match e.span() {
+            Some(span) => RuleLoadError::Syntax {
+                path: path.to_path_buf(),
+                line: text[..span.start.min(text.len())].matches('\n').count() + 1,
+                detail: e.message().to_owned(),
+            },
+            None => RuleLoadError::Invalid {
+                path: path.to_path_buf(),
+                detail: e.message().to_owned(),
+            },
         }
     })?;
 
@@ -130,6 +140,7 @@ fn validate(path: &Path, rule: &RuleFile) -> Result<(), RuleLoadError> {
     }
 
     validate_rule_id(&rule.rule_id).map_err(invalid)?;
+    validate_language(path, rule).map_err(invalid)?;
 
     if rule.rule_version.split('.').count() != 3 {
         return Err(invalid(format!(
@@ -160,6 +171,50 @@ fn validate(path: &Path, rule: &RuleFile) -> Result<(), RuleLoadError> {
     }
 
     Ok(())
+}
+
+/// Checks that a rule agrees with itself and with where it sits about its family.
+///
+/// Three ways a rule could name a family and be ignored or misapplied, none of
+/// which produced an error before. A family no grammar serves loaded cleanly,
+/// matched no language and never ran, with an empty error list to prove it went
+/// well. A `rule_id` whose first segment disagreed with `language` split the join
+/// key the gap catalogue and the benchmark use. And a rule for one language sitting
+/// in another language's directory compiled against the wrong grammar, which takes
+/// down the whole family it landed in rather than just itself.
+///
+/// The directory check is skipped when the file does not sit under a directory
+/// named for a family. Rule text is also loaded from strings in tests, where
+/// there is no directory to agree with.
+fn validate_language(path: &Path, rule: &RuleFile) -> Result<(), String> {
+    let families: Vec<&str> = Language::ALL.iter().map(|l| l.rule_family()).collect();
+    if !families.contains(&rule.language.as_str()) {
+        return Err(format!(
+            "language {:?} is not one of the rule families this build serves: {}",
+            rule.language,
+            families.join(", ")
+        ));
+    }
+
+    let first_segment = rule.rule_id.split('.').next().unwrap_or_default();
+    if first_segment != rule.language {
+        return Err(format!(
+            "rule_id starts with {first_segment:?} but language is {:?}; the two are the same key",
+            rule.language
+        ));
+    }
+
+    let directory = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str());
+    match directory {
+        Some(name) if families.contains(&name) && name != rule.language => Err(format!(
+            "rule sits in {name:?} but declares language {:?}",
+            rule.language
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Enforces the `language.source.rule-name` shape.
@@ -222,7 +277,36 @@ pub fn load_directory(dir: &Path) -> (Vec<RuleFile>, Vec<RuleLoadError>) {
     (rules, errors)
 }
 
+/// How deep the rule tree may nest.
+///
+/// The walk used to recurse without a bound and `is_dir` follows links, so a
+/// link back to an ancestor turned the walk into an unbounded descent that ended
+/// in a stack overflow. That is not a panic and not an error the caller can
+/// report; the process dies with a signal and the user sees nothing at all. The
+/// depth is generous: the shipped layout is one directory per language.
+const MAX_RULE_TREE_DEPTH: usize = 8;
+
 fn collect_toml_files(dir: &Path, out: &mut Vec<PathBuf>, errors: &mut Vec<RuleLoadError>) {
+    collect_toml_files_at(dir, 0, out, errors);
+}
+
+fn collect_toml_files_at(
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<PathBuf>,
+    errors: &mut Vec<RuleLoadError>,
+) {
+    if depth > MAX_RULE_TREE_DEPTH {
+        errors.push(RuleLoadError::Invalid {
+            path: dir.to_path_buf(),
+            detail: format!(
+                "rule tree is nested more than {MAX_RULE_TREE_DEPTH} levels deep and was not \
+                 followed further; a link back to an ancestor looks like this"
+            ),
+        });
+        return;
+    }
+
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(source) => {
@@ -250,8 +334,12 @@ fn collect_toml_files(dir: &Path, out: &mut Vec<PathBuf>, errors: &mut Vec<RuleL
             }
         };
         let path = entry.path();
-        if path.is_dir() {
-            collect_toml_files(&path, out, errors);
+        // `symlink_metadata` does not follow the link, so a link to a directory
+        // is not descended into. Together with the depth bound this makes the
+        // walk terminate on any tree, including one that points at itself.
+        let is_directory = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir());
+        if is_directory {
+            collect_toml_files_at(&path, depth + 1, out, errors);
         } else if path.extension().is_some_and(|e| e == "toml") {
             out.push(path);
         }
@@ -363,6 +451,71 @@ default_confidence = "confirmed"
     fn rule_version_must_be_three_segments() {
         let text = MINIMAL.replace("rule_version = \"1.0.0\"", "rule_version = \"1.0\"");
         assert!(parse(&text).is_err());
+    }
+
+    #[test]
+    fn a_syntax_error_at_the_start_of_a_line_names_that_line() {
+        // The bug this pins: the prefix before a column zero error ends in a
+        // newline, and `lines()` does not count the empty piece after it, so
+        // every such error pointed one row above the actual problem.
+        let broken = "schema_version = \"1.0\"\nlanguage = \"python\"\n= 1\n";
+        let err = parse(broken).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains(":3:"), "expected line 3 in {rendered}");
+    }
+
+    #[test]
+    fn an_unknown_rule_family_is_rejected_at_load_time() {
+        // A family no grammar serves used to load cleanly, match no language and
+        // never run, leaving an empty error list behind it. Only a repository
+        // wide lint caught it, and that lint does not see rules passed with
+        // --rules at all.
+        let text = MINIMAL
+            .replace("language = \"python\"", "language = \"js\"")
+            .replace("python.static.openai", "js.static.openai");
+        let err = parse(&text).unwrap_err();
+        assert!(err.to_string().contains("js"), "{err}");
+    }
+
+    #[test]
+    fn the_rule_id_and_the_language_have_to_agree() {
+        let text = MINIMAL.replace("language = \"python\"", "language = \"typescript\"");
+        let err = parse(&text).unwrap_err();
+        assert!(err.to_string().contains("rule_id"), "{err}");
+    }
+
+    #[test]
+    fn a_rule_in_the_wrong_language_directory_is_rejected() {
+        // Left alone this compiles a TypeScript query against the Python grammar,
+        // which fails and takes every other Python rule down with it.
+        let text = MINIMAL
+            .replace("language = \"python\"", "language = \"typescript\"")
+            .replace("python.static.openai", "typescript.static.openai");
+        let err = parse_rule(Path::new("rules/python/openai.toml"), &text).unwrap_err();
+        assert!(err.to_string().contains("python"), "{err}");
+        // The same text under the directory it belongs in is fine.
+        assert!(parse_rule(Path::new("rules/typescript/openai.toml"), &text).is_ok());
+    }
+
+    #[test]
+    fn a_rule_directory_that_links_to_its_own_parent_terminates() {
+        // Without a depth bound this recursed until the stack ran out, which
+        // kills the process with a signal rather than an error anyone can read.
+        #[cfg(unix)]
+        {
+            let root =
+                std::env::temp_dir().join(format!("periskop-rule-loop-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("python")).unwrap();
+            std::fs::write(root.join("python/openai.toml"), MINIMAL).unwrap();
+            std::os::unix::fs::symlink(&root, root.join("python/loop")).unwrap();
+
+            let (rules, errors) = load_directory(&root);
+            let _ = std::fs::remove_dir_all(&root);
+
+            assert_eq!(rules.len(), 1, "{rules:?}");
+            assert!(errors.is_empty(), "{errors:?}");
+        }
     }
 
     #[test]

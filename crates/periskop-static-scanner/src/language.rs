@@ -6,6 +6,8 @@
 
 use std::path::Path;
 
+use periskop_core::coverage::CoverageLanguage;
+
 /// A grammar the scanner is built against.
 ///
 /// TypeScript and TSX are separate grammars even though they share a rule family.
@@ -34,6 +36,24 @@ impl Language {
             Self::JavaScript => "javascript",
             Self::Go => "go",
             Self::Java => "java",
+        }
+    }
+
+    /// How this grammar is named in a coverage statement.
+    ///
+    /// The coverage vocabulary is a closed list of ten and does not have a `tsx`
+    /// member, which is the same reason [`as_str`] folds TSX into TypeScript.
+    /// Going through the enum rather than the string is what stops a spelling the
+    /// contract rejects from reaching a report.
+    ///
+    /// [`as_str`]: Language::as_str
+    pub fn coverage_language(self) -> CoverageLanguage {
+        match self {
+            Self::Python => CoverageLanguage::Python,
+            Self::TypeScript | Self::Tsx => CoverageLanguage::Typescript,
+            Self::JavaScript => CoverageLanguage::Javascript,
+            Self::Go => CoverageLanguage::Go,
+            Self::Java => CoverageLanguage::Java,
         }
     }
 
@@ -116,6 +136,19 @@ mod tests {
             Language::Python.rule_family(),
             Language::TypeScript.rule_family()
         );
+    }
+
+    #[test]
+    fn every_grammar_names_itself_in_the_coverage_vocabulary() {
+        // The coverage list is closed at ten values and has no `tsx`, so the two
+        // TypeScript grammars report under one name.
+        assert_eq!(
+            Language::Tsx.coverage_language(),
+            Language::TypeScript.coverage_language()
+        );
+        for language in Language::ALL {
+            assert_eq!(language.coverage_language().as_str(), language.as_str());
+        }
     }
 
     #[test]

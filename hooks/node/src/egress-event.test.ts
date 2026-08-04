@@ -8,83 +8,16 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { buildEgressEvent, type BuildContext, type CallObservation } from "./egress-event";
+import { validate, type Schema } from "./schema-check";
 
 const SCHEMA_PATH = join(__dirname, "..", "..", "..", "schemas", "egress-event.schema.json");
-
-type Schema = Record<string, unknown>;
-
-/**
- * A validator for the subset of JSON Schema this contract uses.
- *
- * Reaching for ajv would mean a dependency, and the schema uses six keywords.
- */
-function validate(schema: Schema, value: unknown, path = "$"): string[] {
-  const errors: string[] = [];
-
-  const enumeration = schema["enum"] as unknown[] | undefined;
-  if (enumeration !== undefined && !enumeration.includes(value)) {
-    errors.push(`${path}: ${String(value)} is not one of ${enumeration.join(", ")}`);
-  }
-
-  const type = schema["type"] as string | undefined;
-  if (type === "object") {
-    if (typeof value !== "object" || value === null || Array.isArray(value)) {
-      return [`${path}: expected object`];
-    }
-    const record = value as Record<string, unknown>;
-    const properties = (schema["properties"] ?? {}) as Record<string, Schema>;
-
-    for (const key of (schema["required"] ?? []) as string[]) {
-      if (!(key in record)) errors.push(`${path}.${key}: required`);
-    }
-    if (schema["additionalProperties"] === false) {
-      for (const key of Object.keys(record)) {
-        if (!(key in properties)) errors.push(`${path}.${key}: not allowed by the schema`);
-      }
-    }
-    for (const [key, subSchema] of Object.entries(properties)) {
-      if (key in record) errors.push(...validate(subSchema, record[key], `${path}.${key}`));
-    }
-    return errors;
-  }
-
-  if (type === "array") {
-    if (!Array.isArray(value)) return [`${path}: expected array`];
-    const items = schema["items"] as Schema | undefined;
-    if (items !== undefined) {
-      value.forEach((item, index) => errors.push(...validate(items, item, `${path}[${index}]`)));
-    }
-    return errors;
-  }
-
-  if (type === "string") {
-    if (typeof value !== "string") return [`${path}: expected string`];
-    const pattern = schema["pattern"] as string | undefined;
-    if (pattern !== undefined && !new RegExp(pattern).test(value)) {
-      errors.push(`${path}: ${value} does not match ${pattern}`);
-    }
-    return errors;
-  }
-
-  if (type === "integer") {
-    if (!Number.isInteger(value)) return [`${path}: expected integer`];
-    const minimum = schema["minimum"] as number | undefined;
-    const maximum = schema["maximum"] as number | undefined;
-    if (minimum !== undefined && (value as number) < minimum) errors.push(`${path}: below minimum`);
-    if (maximum !== undefined && (value as number) > maximum) errors.push(`${path}: above maximum`);
-  }
-
-  return errors;
-}
 
 const SCHEMA = JSON.parse(readFileSync(SCHEMA_PATH, "utf8")) as Schema;
 
 const CONTEXT: BuildContext = {
   runtime: "node/20",
-  pid: 4711,
   entrypointHint: "billing-worker",
   bodyParseLimitBytes: 65536,
-  epochMillis: 1_764_000_000_000,
 };
 
 function observation(overrides: Partial<CallObservation> = {}): CallObservation {
@@ -151,10 +84,46 @@ test("a streaming body is sized from its header and declared unmeasured", () => 
   assert.ok(event.degraded_reasons?.includes("streaming_body_not_measured"));
 });
 
-test("the same call in the same second carries one identity", () => {
+test("the same call carries one identity, whenever and wherever it happened", () => {
+  // Two workers, a day apart, sending a bigger payload from another call site.
+  // It is still the same call, and the report has to say so once.
   const first = buildEgressEvent(observation(), CONTEXT);
-  const second = buildEgressEvent(observation(), { ...CONTEXT, epochMillis: CONTEXT.epochMillis + 400 });
+  const second = buildEgressEvent(
+    observation({
+      body: { byteSize: 900_000, streamed: false, sample: JSON.stringify({ model: "gpt-4" }) },
+      callSite: undefined,
+      port: 8443,
+    }),
+    { ...CONTEXT, entrypointHint: "nightly-batch", runtime: "node/24" },
+  );
   assert.equal(first.egress_event_id, second.egress_event_id);
+});
+
+test("the identity a real observation produces is the one the contract publishes", () => {
+  // The published example is an openai sdk_wrapper record; this hook sits on the
+  // transport and reports module node:https. Same four inputs, same identity, so
+  // the derivation here is provably the contract's and not a lookalike.
+  const event = buildEgressEvent(
+    observation({ module: "openai", method: "chat.completions.create" }),
+    CONTEXT,
+  );
+  assert.equal(event.egress_event_id, "ee_3dfe316616cd47b4");
+});
+
+test("a different destination or operation is a different call", () => {
+  const base = buildEgressEvent(observation(), CONTEXT).egress_event_id;
+  assert.notEqual(
+    base,
+    buildEgressEvent(observation({ host: "api.anthropic.com" }), CONTEXT).egress_event_id,
+  );
+  assert.notEqual(
+    base,
+    buildEgressEvent(observation({ method: "GET" }), CONTEXT).egress_event_id,
+  );
+  assert.notEqual(
+    base,
+    buildEgressEvent(observation({ path: "/v1/embeddings" }), CONTEXT).egress_event_id,
+  );
 });
 
 test("the published valid example still passes this validator", () => {

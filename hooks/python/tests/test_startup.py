@@ -4,6 +4,7 @@ These run real interpreters, because that is the only way to prove what happens
 before any application code exists.
 """
 
+import glob
 import json
 import os
 import shutil
@@ -12,7 +13,7 @@ import sys
 import tempfile
 import unittest
 
-from tests import support
+from tests import schema_check, support
 
 _STATUS_SCRIPT = """
 import json, sys
@@ -106,17 +107,22 @@ def _run(script_path, python_path, extra_env=None):
     )
 
 
+def _streams(event_dir):
+    """Event files in a directory, as the collector selects them."""
+    return sorted(glob.glob(os.path.join(event_dir, "*.jsonl")))
+
+
 class OffSwitchTest(unittest.TestCase):
     def setUp(self):
         self.sandbox = _Sandbox()
         self.script = self.sandbox.write("runner.py", _STATUS_SCRIPT)
-        self.output = self.sandbox.path("events.jsonl")
+        self.event_dir = self.sandbox.path("events")
 
     def tearDown(self):
         self.sandbox.remove()
 
     def _status(self, extra_env):
-        extra_env["PERISKOP_HOOK_OUTPUT"] = self.output
+        extra_env["PERISKOP_EVENT_DIR"] = self.event_dir
         result = _run(self.script, [support.HOOKS_PYTHON_DIR], extra_env)
         self.assertEqual(0, result.returncode, result.stderr)
         return json.loads(result.stdout)
@@ -126,8 +132,8 @@ class OffSwitchTest(unittest.TestCase):
         self.assertEqual("disabled", status["hook_status"])
         self.assertEqual("disabled_by_env", status["reason"])
         self.assertEqual([], status["finders"])
-        self.assertFalse(os.path.exists(self.output))
-        self.assertFalse(os.path.exists(self.output + ".status.json"))
+        # A disabled hook does not even create the directory it was pointed at.
+        self.assertFalse(os.path.exists(self.event_dir))
 
     def test_without_the_switch_the_hook_installs(self):
         status = self._status({})
@@ -179,37 +185,90 @@ class SitecustomizeChainTest(unittest.TestCase):
 
 
 class InstrumentedProcessTest(unittest.TestCase):
-    """One real interpreter, from startup to a written event."""
+    """One real interpreter, from startup to a file the collector can read."""
 
     def setUp(self):
         self.sandbox = _Sandbox()
         for relative_path, content in _FAKE_SDK.items():
             self.sandbox.write(relative_path, content)
         self.script = self.sandbox.write("worker.py", _SDK_CALL_SCRIPT)
-        self.output = self.sandbox.path("events.jsonl")
+        self.event_dir = self.sandbox.path("events")
 
     def tearDown(self):
         self.sandbox.remove()
 
-    def test_an_sdk_call_reaches_the_event_stream(self):
+    def _run_worker(self, extra_env):
         result = _run(
             self.script,
             [support.HOOKS_PYTHON_DIR, self.sandbox.path("libs")],
-            {"PERISKOP_HOOK_OUTPUT": self.output},
+            extra_env,
         )
         self.assertEqual(0, result.returncode, result.stderr)
-        payload = json.loads(result.stdout)
+        return json.loads(result.stdout)
+
+    def _read(self, path):
+        with open(path, encoding="utf-8") as stream:
+            return [json.loads(line) for line in stream if line.strip()]
+
+    def test_an_sdk_call_reaches_the_event_stream(self):
+        payload = self._run_worker({"PERISKOP_EVENT_DIR": self.event_dir})
         self.assertEqual("chat-response", payload["result"])
         self.assertEqual("active", payload["status"]["hook_status"])
         self.assertEqual(["openai"], payload["status"]["instrumented"])
 
-        with open(self.output, encoding="utf-8") as stream:
-            events = [json.loads(line) for line in stream if line.strip()]
+        streams = _streams(self.event_dir)
+        self.assertEqual(1, len(streams), streams)
+        events = self._read(streams[0])
         self.assertEqual(1, len(events))
         self.assertEqual("chat.completions.create", events[0]["operation"])
         self.assertEqual("api.openai.com", events[0]["target"]["host_id"])
         # The address travelled as a value and stayed out of the record.
         self.assertNotIn("ahmet@firma.com", json.dumps(events[0]))
+
+    def test_the_written_file_is_one_the_collector_would_read(self):
+        """End to end: what a real process leaves on disk satisfies the contract.
+
+        `periskop-runtime-collector` reads every `*.jsonl` file in the directory,
+        parses one JSON object per line and validates each against the event
+        schema. This asserts the same three things on the same bytes, so a hook
+        change that the collector would reject fails here first.
+        """
+        self._run_worker({"PERISKOP_EVENT_DIR": self.event_dir})
+
+        streams = _streams(self.event_dir)
+        self.assertEqual(1, len(streams), streams)
+        # One file per process, named so a second process cannot pick the same.
+        self.assertRegex(os.path.basename(streams[0]),
+                         r"^python-\d+-[0-9a-f]{8}\.jsonl$")
+
+        with open(streams[0], "rb") as stream:
+            raw = stream.read()
+        # Line delimited and newline terminated: the collector splits on lines,
+        # and a final line without a terminator is one it cannot trust.
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertEqual(1, raw.count(b"\n"))
+
+        schema = support.event_schema()
+        for record in self._read(streams[0]):
+            self.assertEqual([], schema_check.validate(record, schema))
+            self.assertEqual("ee_3dfe316616cd47b4", record["egress_event_id"])
+
+    def test_the_status_sidecar_is_not_mistaken_for_an_event_stream(self):
+        # The collector selects on the .jsonl extension. The sidecar has to fall
+        # outside that selection, or the run's own accounting would be read back
+        # as a malformed event.
+        self._run_worker({"PERISKOP_EVENT_DIR": self.event_dir})
+        sidecars = glob.glob(os.path.join(self.event_dir, "*.status.json"))
+        self.assertEqual(1, len(sidecars), sidecars)
+        self.assertEqual([], [path for path in _streams(self.event_dir)
+                              if path.endswith(".status.json")])
+
+    def test_the_legacy_output_variable_still_names_one_file(self):
+        # An existing deployment that sets the old variable keeps working; it
+        # just does not get the per process naming the directory model gives.
+        legacy = self.sandbox.path("legacy-events.jsonl")
+        self._run_worker({"PERISKOP_HOOK_OUTPUT": legacy})
+        self.assertEqual(1, len(self._read(legacy)))
 
 
 class PthLineTest(unittest.TestCase):

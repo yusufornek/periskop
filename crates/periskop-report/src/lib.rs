@@ -9,5 +9,5 @@ pub mod report;
 pub mod serialize;
 
 pub use coverage::CoverageStatement;
-pub use report::{Envelope, PolicyRef, ReportBuilder, RuleHit, ScanReport, Verdict, VerdictOrder};
+pub use report::{Envelope, PolicyRef, ReportBuilder, RuleHit, ScanReport, Verdict};
 pub use serialize::{body_hash, to_canonical_json};

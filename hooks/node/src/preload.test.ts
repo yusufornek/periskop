@@ -21,11 +21,30 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import type { EgressEvent } from "./egress-event";
+import { validate, type Schema } from "./schema-check";
 
 const PRELOAD = join(__dirname, "preload.js");
+
+const SCHEMA = JSON.parse(
+  readFileSync(join(__dirname, "..", "..", "..", "schemas", "egress-event.schema.json"), "utf8"),
+) as Schema;
+
+/**
+ * Event files as periskop-runtime-collector selects them.
+ *
+ * It reads every `*.jsonl` file in the directory and ignores everything else,
+ * so filtering the same way here is what makes this test a statement about the
+ * collector rather than about this package's own naming.
+ */
+function streamsIn(eventDir: string): string[] {
+  return readdirSync(eventDir)
+    .filter((name) => name.endsWith(".jsonl"))
+    .sort()
+    .map((name) => join(eventDir, name));
+}
 
 /** An application that makes one real call and says when it is done. */
 const APP_SOURCE = `
@@ -71,14 +90,12 @@ function sandbox(): Sandbox {
       return path;
     },
     eventsIn: (eventDir: string) =>
-      readdirSync(eventDir)
-        .filter((name) => name.endsWith(".ndjson"))
-        .flatMap((name) =>
-          readFileSync(join(eventDir, name), "utf8")
-            .split("\n")
-            .filter((line) => line.length > 0)
-            .map((line) => JSON.parse(line) as EgressEvent),
-        ),
+      streamsIn(eventDir).flatMap((path) =>
+        readFileSync(path, "utf8")
+          .split("\n")
+          .filter((line) => line.length > 0)
+          .map((line) => JSON.parse(line) as EgressEvent),
+      ),
     cleanup: () => rmSync(dir, { recursive: true, force: true }),
   };
 }
@@ -100,7 +117,7 @@ test("a hooked process records the call it actually made", (t) => {
   t.after(box.cleanup);
 
   const eventDir = join(box.dir, "events");
-  assert.equal(runApp(box.appPath("server.js"), { PERISKOP_HOOK_DIR: eventDir }), "app finished");
+  assert.equal(runApp(box.appPath("server.js"), { PERISKOP_EVENT_DIR: eventDir }), "app finished");
 
   const events = box.eventsIn(eventDir);
   assert.equal(events.length, 1);
@@ -134,7 +151,7 @@ test("NODE_OPTIONS installs the hook just as --require does", (t) => {
   const eventDir = join(box.dir, "events");
   const output = runApp(
     box.appPath("server.js"),
-    { PERISKOP_HOOK_DIR: eventDir, NODE_OPTIONS: `--require ${PRELOAD}` },
+    { PERISKOP_EVENT_DIR: eventDir, NODE_OPTIONS: `--require ${PRELOAD}` },
     [],
   );
 
@@ -148,7 +165,7 @@ test("PERISKOP_HOOK=0 turns the hook off entirely", (t) => {
 
   const eventDir = join(box.dir, "events");
   const output = runApp(box.appPath("server.js"), {
-    PERISKOP_HOOK_DIR: eventDir,
+    PERISKOP_EVENT_DIR: eventDir,
     PERISKOP_HOOK: "0",
   });
 
@@ -164,7 +181,7 @@ test("a process that is not a target exits the hook without building anything", 
   const eventDir = join(box.dir, "events");
   // The entrypoint name is what the gate reads, so the same script under a
   // build tool's name has to be left alone.
-  const output = runApp(box.appPath("npm-cli.js"), { PERISKOP_HOOK_DIR: eventDir });
+  const output = runApp(box.appPath("npm-cli.js"), { PERISKOP_EVENT_DIR: eventDir });
 
   assert.equal(output, "app finished");
   assert.throws(() => readdirSync(eventDir));
@@ -211,7 +228,7 @@ test("an event sink that cannot be created does not stop the application", (t) =
 
   // A path that cannot be a directory, which is what a misconfigured deployment
   // looks like from inside the process.
-  const output = runApp(box.appPath("server.js"), { PERISKOP_HOOK_DIR: "/dev/null/events" });
+  const output = runApp(box.appPath("server.js"), { PERISKOP_EVENT_DIR: "/dev/null/events" });
   assert.equal(output, "app finished");
 });
 
@@ -219,15 +236,62 @@ test("an unwritable event stream does not stop the application", (t) => {
   const box = sandbox();
   t.after(box.cleanup);
 
-  // The event file is taken by a directory, so every write to it fails. The
-  // call still goes out and the application never learns that anything did.
+  // The application makes its own event directory read only before calling, so
+  // every write the hook attempts fails. The call still goes out and the
+  // application never learns that anything did. Named after the process rather
+  // than fixed, the event file cannot be blocked by name any more.
   const eventDir = join(box.dir, "events");
   mkdirSync(eventDir, { recursive: true });
   const app = box.appPath("server.js");
-  const blocker = `const p = require("node:path");
-    require("node:fs").mkdirSync(p.join(process.env.PERISKOP_HOOK_DIR, "node-" + process.pid + ".ndjson"));`;
+  const blocker = `require("node:fs").chmodSync(process.env.PERISKOP_EVENT_DIR, 0o555);`;
   writeFileSync(app, `${blocker}\n${APP_SOURCE}`);
 
-  const output = runApp(app, { PERISKOP_HOOK_DIR: eventDir });
+  const output = runApp(app, { PERISKOP_EVENT_DIR: eventDir });
   assert.equal(output, "app finished");
+  // Nothing was recorded, which is the point: an unwritable stream costs an
+  // event, never a request.
+  assert.deepEqual(streamsIn(eventDir), []);
+});
+
+test("what a hooked process leaves on disk is what the collector reads", (t) => {
+  const box = sandbox();
+  t.after(box.cleanup);
+
+  // End to end. periskop-runtime-collector reads every *.jsonl file in the
+  // directory, splits it into lines, parses one JSON object per line and
+  // validates each against the event schema. This asserts the same things on
+  // the same bytes, so a hook change the collector would reject fails here
+  // first, in this package, rather than in another crate's integration run.
+  const eventDir = join(box.dir, "events");
+  assert.equal(runApp(box.appPath("server.js"), { PERISKOP_EVENT_DIR: eventDir }), "app finished");
+
+  const streams = streamsIn(eventDir);
+  assert.equal(streams.length, 1);
+  // One file per process, named so a second process cannot pick the same one.
+  assert.match(basename(streams[0] as string), /^node-\d+-[0-9a-f]{8}\.jsonl$/);
+
+  const raw = readFileSync(streams[0] as string, "utf8");
+  // Line delimited and newline terminated: the collector splits on lines, and a
+  // final line without a terminator is one it cannot trust.
+  assert.ok(raw.endsWith("\n"));
+
+  const lines = raw.split("\n").filter((line) => line.length > 0);
+  assert.equal(lines.length, 1);
+  for (const line of lines) {
+    assert.deepEqual(validate(SCHEMA, JSON.parse(line)), []);
+  }
+
+  // The status sidecar sits beside the stream and outside the selection, so a
+  // run's own accounting is never read back as a malformed event.
+  assert.ok(readdirSync(eventDir).some((name) => name.endsWith(".status.json")));
+});
+
+test("the previous variable name still points the hook at a directory", (t) => {
+  const box = sandbox();
+  t.after(box.cleanup);
+
+  // An existing deployment that sets the old name keeps working across upgrade.
+  const eventDir = join(box.dir, "events");
+  assert.equal(runApp(box.appPath("server.js"), { PERISKOP_HOOK_DIR: eventDir }), "app finished");
+  assert.equal(box.eventsIn(eventDir).length, 1);
 });

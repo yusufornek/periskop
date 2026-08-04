@@ -39,6 +39,66 @@ impl UnparsedReason {
     }
 }
 
+/// Why a target a finding points at could not be pinned down.
+///
+/// Lives here rather than next to the report types because the scanner produces
+/// these and the report only carries them. A vocabulary owned by the consumer
+/// would force the producer to describe its own blind spots in someone else's
+/// words, which is how the field ended up unwritten in the first place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnresolvedReason {
+    DynamicExpression,
+    EnvVar,
+    ConfigIndirection,
+    UnsupportedPattern,
+}
+
+/// An egress point whose destination the scan could not determine.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct UnresolvedTarget {
+    pub egress_point_id: String,
+    pub reason: UnresolvedReason,
+}
+
+/// The languages the coverage vocabulary knows about.
+///
+/// Closed on purpose, and closed here rather than only in the schema. The status
+/// of a language is the one place a reader learns that a hook does not exist for
+/// it, so a spelling the validator rejects would take that statement out of the
+/// report entirely and leave silence in its place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageLanguage {
+    Python,
+    Typescript,
+    Javascript,
+    Java,
+    Csharp,
+    Go,
+    Rust,
+    Kotlin,
+    Ruby,
+    Php,
+}
+
+impl CoverageLanguage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Python => "python",
+            Self::Typescript => "typescript",
+            Self::Javascript => "javascript",
+            Self::Java => "java",
+            Self::Csharp => "csharp",
+            Self::Go => "go",
+            Self::Rust => "rust",
+            Self::Kotlin => "kotlin",
+            Self::Ruby => "ruby",
+            Self::Php => "php",
+        }
+    }
+}
+
 /// Denominator in basis points, so the ratio stays integer arithmetic end to end.
 const BASIS_POINTS: u64 = 10_000;
 
@@ -51,18 +111,26 @@ const BASIS_POINTS: u64 = 10_000;
 /// A run with nothing to scan yields zero rather than an error: the ratio is
 /// undefined there and must not trip anything. That situation is already visible
 /// as `parsed_files = 0`.
+///
+/// The multiplication widens to `u128` before it is divided. Saturating in `u64`
+/// would have pulled the ratio *down*: a numerator large enough to clamp at
+/// `u64::MAX` divided by an equally large total came out near zero, so the one
+/// case where nothing at all was read would have printed as full coverage. The
+/// invariant that has to hold is that the ratio is never understated.
 pub fn unparsed_ratio_basis_points(parsed_files: u64, unparsed_counting: u64) -> u64 {
-    let total = parsed_files.saturating_add(unparsed_counting);
+    let total = u128::from(parsed_files) + u128::from(unparsed_counting);
     if total == 0 {
         return 0;
     }
     // Ceiling division, integer arithmetic throughout. No step produces a float.
-    unparsed_counting
-        .saturating_mul(BASIS_POINTS)
-        .div_ceil(total)
+    let ratio = (u128::from(unparsed_counting) * u128::from(BASIS_POINTS)).div_ceil(total);
+    // The quotient cannot exceed the denominator scale, but the clamp states the
+    // range the contract fixes instead of leaving it to be re-derived.
+    ratio.min(u128::from(BASIS_POINTS)) as u64
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -118,5 +186,67 @@ mod tests {
                 assert!(unparsed_ratio_basis_points(parsed, unparsed) <= BASIS_POINTS);
             }
         }
+    }
+
+    #[test]
+    fn a_count_too_large_for_the_multiplication_still_reads_as_a_full_gap() {
+        // The bug this pins: the numerator used to saturate in u64, so a file
+        // count past 1.8e15 clamped and then divided down to a handful of basis
+        // points. A run that read nothing at all reported as almost fully
+        // covered, which is the one direction this number may never move in.
+        let counted = u64::MAX / 4;
+        assert_eq!(unparsed_ratio_basis_points(0, counted), BASIS_POINTS);
+        assert_eq!(unparsed_ratio_basis_points(counted, counted), 5_000);
+    }
+
+    #[test]
+    fn coverage_language_spelling_matches_the_contract() {
+        // The schema fixes a closed list of ten. A value outside it serializes
+        // fine in Rust and is rejected by the validator, which would take the
+        // runtime status of that language out of the report altogether.
+        let spellings: Vec<&str> = [
+            CoverageLanguage::Python,
+            CoverageLanguage::Typescript,
+            CoverageLanguage::Javascript,
+            CoverageLanguage::Java,
+            CoverageLanguage::Csharp,
+            CoverageLanguage::Go,
+            CoverageLanguage::Rust,
+            CoverageLanguage::Kotlin,
+            CoverageLanguage::Ruby,
+            CoverageLanguage::Php,
+        ]
+        .into_iter()
+        .map(CoverageLanguage::as_str)
+        .collect();
+        assert_eq!(
+            spellings,
+            [
+                "python",
+                "typescript",
+                "javascript",
+                "java",
+                "csharp",
+                "go",
+                "rust",
+                "kotlin",
+                "ruby",
+                "php"
+            ]
+        );
+        for language in [CoverageLanguage::Python, CoverageLanguage::Csharp] {
+            let json = serde_json::to_string(&language).expect("enum serializes");
+            assert_eq!(json, format!("\"{}\"", language.as_str()));
+        }
+    }
+
+    #[test]
+    fn unresolved_reasons_use_the_contract_spellings() {
+        let json = serde_json::to_string(&UnresolvedTarget {
+            egress_point_id: "ep_0000000000000001".to_owned(),
+            reason: UnresolvedReason::EnvVar,
+        })
+        .expect("target serializes");
+        assert!(json.contains("\"env_var\""), "{json}");
     }
 }

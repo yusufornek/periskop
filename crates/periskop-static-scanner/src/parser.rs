@@ -11,6 +11,7 @@
 //! rounded up to success.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use periskop_core::coverage::UnparsedReason;
 
@@ -90,6 +91,16 @@ pub enum ParseFailure {
     #[error("grammar rejected by the parser: {detail}")]
     GrammarIncompatible { detail: String },
 
+    /// The file took longer than the budget allows.
+    ///
+    /// `parse_timeout` is one of the eight reasons the contract fixes, and until
+    /// this existed no code path could produce it. A generated file with deep
+    /// nesting can hold the parser for minutes; the process then looks hung, the
+    /// user kills it, and no report is written at all, so the coverage statement
+    /// never gets to say which file it was.
+    #[error("parsing exceeded the budget of {budget_ms} ms")]
+    Timeout { budget_ms: u64 },
+
     /// tree-sitter returned no tree. It does this on cancellation or on input past
     /// its size limit, never on ordinary syntax errors.
     #[error("parser returned no tree")]
@@ -106,10 +117,21 @@ impl ParseFailure {
             // file was not read. It is counted, and the diagnostics block carries
             // the engine level detail.
             Self::GrammarIncompatible { .. } => UnparsedReason::ParseError,
+            Self::Timeout { .. } => UnparsedReason::ParseTimeout,
             Self::NoTree => UnparsedReason::ParseError,
         }
     }
 }
+
+/// How long one file may occupy the parser.
+///
+/// Generous by design. Ordinary source parses in milliseconds, so the budget is
+/// only ever reached by input that would otherwise hang the run, and a value
+/// this far from normal keeps the outcome the same on a fast machine and a slow
+/// one. That matters: a budget is the one input to this scanner that is not a
+/// function of the source text, and a tight one would make two runs over the
+/// same tree disagree.
+pub const DEFAULT_PARSE_BUDGET: Duration = Duration::from_secs(10);
 
 /// Parses source text with the grammar chosen for `path`.
 ///
@@ -124,11 +146,21 @@ pub fn parse(
     parse_as(path, source, language)
 }
 
-/// Parses with an explicitly chosen grammar.
+/// Parses with an explicitly chosen grammar and the default time budget.
 pub fn parse_as(
     path: impl Into<PathBuf>,
     source: impl Into<String>,
     language: Language,
+) -> Result<ParsedFile, ParseFailure> {
+    parse_within(path, source, language, DEFAULT_PARSE_BUDGET)
+}
+
+/// Parses with an explicitly chosen grammar and an explicit time budget.
+pub fn parse_within(
+    path: impl Into<PathBuf>,
+    source: impl Into<String>,
+    language: Language,
+    budget: Duration,
 ) -> Result<ParsedFile, ParseFailure> {
     let path = path.into();
     let source = source.into();
@@ -140,7 +172,32 @@ pub fn parse_as(
             detail: e.to_string(),
         })?;
 
-    let tree = parser.parse(&source, None).ok_or(ParseFailure::NoTree)?;
+    // The progress callback is consulted while the parser works and halts it when
+    // it returns true. This is the only way to bound the work: tree-sitter has no
+    // notion of input size that would predict it, because the cost comes from
+    // nesting rather than from length.
+    let deadline = Instant::now() + budget;
+    let mut over_budget = false;
+    let mut halt = |_: &tree_sitter::ParseState| {
+        over_budget = Instant::now() >= deadline;
+        over_budget
+    };
+    let bytes = source.as_bytes();
+    let tree = parser.parse_with_options(
+        &mut |offset, _| bytes.get(offset..).unwrap_or_default(),
+        None,
+        Some(tree_sitter::ParseOptions::new().progress_callback(&mut halt)),
+    );
+
+    let tree = match tree {
+        Some(tree) => tree,
+        None if over_budget => {
+            return Err(ParseFailure::Timeout {
+                budget_ms: budget.as_millis().min(u128::from(u64::MAX)) as u64,
+            })
+        }
+        None => return Err(ParseFailure::NoTree),
+    };
     let error_node_count = count_error_nodes(tree.root_node());
 
     Ok(ParsedFile {
@@ -265,6 +322,37 @@ def summarize(record):
     fn javascript_parses_module_syntax() {
         let parsed = parse("client.mjs", "import OpenAI from 'openai';\n").unwrap();
         assert_eq!(parsed.language(), Language::JavaScript);
+        assert!(!parsed.is_partial());
+    }
+
+    #[test]
+    fn a_file_past_the_budget_is_reported_as_a_timeout() {
+        // The error class this test catches: no code path could produce
+        // `parse_timeout`, so a file that held the parser indefinitely hung the
+        // whole run. The user kills the process, no report is written, and the
+        // coverage statement never gets to name the file.
+        let deep = format!("x = {}1{}\n", "(".repeat(2_000), ")".repeat(2_000));
+        let failure =
+            parse_within("generated.py", deep, Language::Python, Duration::ZERO).unwrap_err();
+
+        assert!(
+            matches!(failure, ParseFailure::Timeout { .. }),
+            "{failure:?}"
+        );
+        assert_eq!(failure.coverage_reason(), UnparsedReason::ParseTimeout);
+    }
+
+    #[test]
+    fn an_ordinary_file_is_nowhere_near_the_budget() {
+        // The other half: the budget must not be reachable by normal source, or
+        // the scanner would report timeouts that say nothing about the code.
+        let parsed = parse_within(
+            "services/customer.py",
+            PYTHON_SAMPLE,
+            Language::Python,
+            DEFAULT_PARSE_BUDGET,
+        )
+        .unwrap();
         assert!(!parsed.is_partial());
     }
 

@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use periskop_core::coverage::UnparsedReason;
 
+/// Re-exported from the core vocabulary. The scanner produces these and the
+/// report only carries them, so the types live where the producer can reach them.
+pub use periskop_core::coverage::{CoverageLanguage, UnresolvedReason, UnresolvedTarget};
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct UnparsedFile {
     pub path: String,
@@ -26,9 +30,15 @@ pub enum RuntimeStatus {
     Unsupported,
 }
 
+/// Hook status for one language.
+///
+/// The language is an enum rather than a string because the schema closes the
+/// list at ten. A free string compiled and serialized happily and only failed in
+/// an external validator, which in this build runs over sample files rather than
+/// over real output, so a misspelling would have shipped.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RuntimeCoverage {
-    pub language: String,
+    pub language: CoverageLanguage,
     pub status: RuntimeStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hook_mechanism: Option<String>,
@@ -81,27 +91,17 @@ pub struct CoverageStatement {
     pub reconciliation_mode: ReconciliationMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct UnresolvedTarget {
-    pub egress_point_id: String,
-    pub reason: UnresolvedReason,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UnresolvedReason {
-    DynamicExpression,
-    EnvVar,
-    ConfigIndirection,
-    UnsupportedPattern,
-}
-
 impl CoverageStatement {
     /// A statement for a run with no runtime or network observation.
     ///
     /// The zeros are not placeholders. A static only scan genuinely observed no
     /// flows and hooked no processes, and saying so is different from leaving the
     /// fields out and letting a reader assume.
+    ///
+    /// What this is not is a report ready statement. `runtime_coverage` starts
+    /// empty and the caller fills it from the languages the scan actually saw; an
+    /// empty list would say nothing at all about any language, which is the
+    /// silence the field exists to break.
     pub fn static_only() -> Self {
         Self {
             parsed_files: 0,

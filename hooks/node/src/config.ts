@@ -10,6 +10,19 @@ import { join } from "node:path";
 
 import { entrypointName } from "./process-gate";
 
+/**
+ * Directory the event stream goes into, as the event schema fixes the transport.
+ *
+ * A directory rather than a file path because multi process work then needs no
+ * coordination: every process picks its own file inside it. A file path would
+ * make the caller responsible for inventing a unique name per process, and two
+ * processes appending to one file interleave their writes and corrupt lines.
+ */
+export const EVENT_DIR = "PERISKOP_EVENT_DIR";
+
+/** The name this hook used before the contract fixed one. Still honoured. */
+export const LEGACY_EVENT_DIR = "PERISKOP_HOOK_DIR";
+
 export interface HookConfig {
   /** Directory the event stream and the status file are written to. */
   readonly outputDir: string;
@@ -32,6 +45,15 @@ const DEFAULT_BODY_PARSE_LIMIT = 64 * 1024;
 // reported count, which is what overflow does.
 const DEFAULT_MAX_BUFFERED_EVENTS = 1024;
 
+/** An empty variable reads as unset, so an exported blank does not win. */
+function firstNonEmpty(...values: ReadonlyArray<string | undefined>): string | undefined {
+  for (const value of values) {
+    const trimmed = value?.trim();
+    if (trimmed !== undefined && trimmed.length > 0) return trimmed;
+  }
+  return undefined;
+}
+
 function positiveInteger(raw: string | undefined, fallback: number): number {
   if (raw === undefined) return fallback;
   const value = Number.parseInt(raw, 10);
@@ -42,12 +64,9 @@ export function readConfig(
   env: NodeJS.ProcessEnv,
   argv: readonly string[],
 ): HookConfig {
-  const configuredDir = env["PERISKOP_HOOK_DIR"];
+  const configuredDir = firstNonEmpty(env[EVENT_DIR], env[LEGACY_EVENT_DIR]);
   return {
-    outputDir:
-      configuredDir !== undefined && configuredDir.length > 0
-        ? configuredDir
-        : join(tmpdir(), "periskop-events"),
+    outputDir: configuredDir ?? join(tmpdir(), "periskop-events"),
     // An operator can name the process; otherwise the script names itself. The
     // event schema rejects absolute paths here, so only a basename is ever used.
     entrypointHint: env["PERISKOP_HOOK_ENTRYPOINT"] ?? entrypointName(argv),

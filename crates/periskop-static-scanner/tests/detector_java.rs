@@ -208,17 +208,22 @@ fn evasion_fixtures_match_nothing_and_that_is_recorded() {
 }
 
 #[test]
-fn a_literal_provider_endpoint_produces_a_confirmed_finding() {
+fn a_literal_provider_endpoint_produces_a_suspected_finding() {
     // The one rule family that is complete end to end today: it keys on the
     // destination, so it needs no binding and no resolver.
+    //
+    // Suspect rather than confirmed. The call shape comes from the syntax tree,
+    // but the claim that the destination belongs to a provider comes from
+    // matching the text of a string literal, and a text match cannot support a
+    // structural assertion.
     let source = fixture("positive", "HttpLiteralEndpoint.java");
     let hits = findings(&source, "HttpLiteralEndpoint.java");
     assert!(
         hits.iter().any(
             |(rule_id, confidence)| rule_id == "java.static.http-provider-endpoint"
-                && *confidence == Confidence::Confirmed
+                && *confidence == Confidence::Suspect
         ),
-        "expected a confirmed finding, got {hits:?}"
+        "expected a suspected finding, got {hits:?}"
     );
 }
 

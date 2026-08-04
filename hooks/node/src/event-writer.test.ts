@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
-import { FileEventSink } from "./event-writer";
+import { FileEventSink, streamName } from "./event-writer";
 import { resetStatus, snapshot } from "./hook-status";
 import type { EgressEvent } from "./egress-event";
 
@@ -84,13 +84,40 @@ test("the hook's own account of itself lands beside the events, not inside them"
   sink.record(event("ee_0000000000000004"));
   sink.close();
 
-  const status = JSON.parse(readFileSync(join(dir, "node-103.status.json"), "utf8")) as Record<
-    string,
-    unknown
-  >;
+  // .json, not .jsonl: the collector selects event files by extension, and a
+  // run's own accounting read back as an event would be a malformed record.
+  assert.ok(sink.statusPath.endsWith(".status.json"));
+  assert.ok(!sink.statusPath.endsWith(".jsonl"));
+  const status = JSON.parse(readFileSync(sink.statusPath, "utf8")) as Record<string, unknown>;
   assert.equal(status["status"], "active");
   assert.equal(status["recorded_events"], 1);
   assert.equal(status["dropped_events"], 0);
+});
+
+test("the stream is a .jsonl file named after the process that writes it", (t) => {
+  const { dir, cleanup } = sandbox();
+  t.after(cleanup);
+
+  const sink = new FileEventSink(dir, 105, 16);
+  // The extension is what periskop-runtime-collector selects on, so anything
+  // else is a stream it never reads.
+  assert.match(basename(sink.eventPath), /^node-105-[0-9a-f]{8}\.jsonl$/);
+});
+
+test("two processes writing into one directory never share a file", (t) => {
+  const { dir, cleanup } = sandbox();
+  t.after(cleanup);
+
+  // This is the whole reason the contract names a directory rather than a file:
+  // two writers appending to one file interleave and corrupt lines, and here
+  // nobody has to coordinate to avoid it.
+  const first = new FileEventSink(dir, 106, 16);
+  const second = new FileEventSink(dir, 107, 16);
+  assert.notEqual(first.eventPath, second.eventPath);
+
+  // Pids are reused, so the same pid twice has to be two files as well, or a
+  // new run would append to a finished one's stream.
+  assert.notEqual(streamName(106), streamName(106));
 });
 
 test("closing twice is harmless, and recording after close is a no-op", (t) => {

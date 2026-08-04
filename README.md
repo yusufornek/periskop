@@ -67,8 +67,11 @@ schemas/    JSON Schema contracts, single source for both sides
 rules/      Declarative detector rules, one directory per language
 ```
 
-Types are generated from `schemas/` on both sides. Hand written parallel type
-definitions are rejected in review.
+`schemas/` is the contract both sides are written against. Rust and TypeScript
+types mirror it by hand today, and every example under `schemas/examples/` is
+validated in CI, including negative ones that must fail for the stated reason.
+Generating the types instead is the plan; until that lands, a schema change and
+the code that reads it belong in the same commit.
 
 ## Building
 

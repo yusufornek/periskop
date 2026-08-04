@@ -16,10 +16,12 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use periskop_core::coverage::UnparsedReason;
-use periskop_report::coverage::{CoverageStatement, RuntimeCoverage, RuntimeStatus, UnparsedFile};
+use periskop_report::coverage::{
+    CoverageLanguage, CoverageStatement, RuntimeCoverage, RuntimeStatus, UnparsedFile,
+};
 use periskop_report::report::{
     Diagnostic, DiagnosticCode, DiagnosticComponent, Envelope, PolicyRef, ReportBuilder, RuleHit,
-    ScanInputs, ScanReport, VerdictOrder,
+    ScanInputs, ScanReport, Verdict,
 };
 use periskop_static_scanner::discovery::{discover, read_source, DiscoveryOptions};
 use periskop_static_scanner::engine::detect;
@@ -61,6 +63,11 @@ pub fn run(request: ScanRequest<'_>) -> ScanOutcome {
     let mut builder = ReportBuilder::new();
     let mut coverage = CoverageStatement::static_only();
     let mut unclaimed: BTreeSet<String> = BTreeSet::new();
+    // Engine faults, kept apart from rule problems because they are a different
+    // claim: a rule that will not load is a file someone wrote, an engine fault
+    // is the scanner disagreeing with itself. Both reach the report, neither
+    // reaches the coverage counters (K-10).
+    let mut engine_faults: BTreeSet<String> = discovery.diagnostics.iter().cloned().collect();
 
     coverage.unparsed_files = discovery
         .skipped
@@ -74,8 +81,13 @@ pub fn run(request: ScanRequest<'_>) -> ScanOutcome {
     let compiled = compile_rule_families(&rules, &mut rule_errors);
 
     let mut parsed_files = 0u64;
+    // Every grammar a file was found for, whether or not it could be scanned.
+    // The runtime block is built from this rather than from a fixed list, so a
+    // repository in a language the list forgot is not left unmentioned.
+    let mut languages_seen: BTreeSet<Language> = BTreeSet::new();
 
     for file in &discovery.files {
+        languages_seen.insert(file.language);
         // The rule lookup happens before the file is read, and that order is the
         // fix rather than an optimisation. A grammar with no usable detector was
         // never examined, so counting its files as parsed would turn "nobody
@@ -135,14 +147,18 @@ pub fn run(request: ScanRequest<'_>) -> ScanOutcome {
 
         let found = detect(&parsed, compiled_rules, family_rules);
         unclaimed.extend(found.unclaimed_imports);
+        coverage.unresolved_targets.extend(found.unresolved_targets);
+        engine_faults.extend(found.engine_faults);
         builder.add_findings(found.findings);
     }
 
     coverage.parsed_files = parsed_files;
     coverage.undetected_libraries = unclaimed.into_iter().collect();
-    coverage.runtime_coverage = runtime_coverage_for_static_scan();
-
-    builder.coverage(coverage);
+    coverage.runtime_coverage = if languages_seen.is_empty() {
+        every_coverage_language()
+    } else {
+        runtime_coverage_for(&languages_seen)
+    };
 
     // Without these the scan identity would rest on the findings alone, so two
     // unrelated trees that happen to produce the same result would share a
@@ -165,6 +181,14 @@ pub fn run(request: ScanRequest<'_>) -> ScanOutcome {
         });
     }
 
+    for detail in engine_faults {
+        builder.add_diagnostic(Diagnostic {
+            code: DiagnosticCode::Internal,
+            component: DiagnosticComponent::StaticScanner,
+            detail: Some(detail),
+        });
+    }
+
     let report = builder.build(
         Envelope {
             generated_at: request.generated_at,
@@ -177,6 +201,7 @@ pub fn run(request: ScanRequest<'_>) -> ScanOutcome {
             policy_hash: blake3::hash(b"default/1.0.0").to_hex().to_string(),
             rule_hits: rule_set_hits(&rule_errors),
         },
+        coverage,
     );
 
     ScanOutcome {
@@ -262,7 +287,7 @@ fn rule_set_hits(rule_errors: &[String]) -> Vec<RuleHit> {
     }
     vec![RuleHit {
         rule_id: RULE_SET_GATE.to_owned(),
-        verdict: VerdictOrder::Fail,
+        verdict: Verdict::Fail,
         finding_ids: None,
         coverage_condition: None,
     }]
@@ -277,17 +302,62 @@ fn report_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-/// What the runtime layer saw, which in a static scan is nothing.
+/// What the runtime layer saw, which in this build is nothing at all.
 ///
-/// Reported explicitly rather than left empty. "No hook was running" and "the
-/// hook found nothing" look the same in an empty list and mean opposite things.
-fn runtime_coverage_for_static_scan() -> Vec<RuntimeCoverage> {
-    ["python", "typescript", "javascript"]
-        .into_iter()
+/// Two things were wrong with the list this replaces, and both told the reader
+/// something untrue.
+///
+/// The status was `not_instrumented`, which the contract defines as a mechanism
+/// that exists and was not switched on. This build has no hook mechanism for any
+/// language, so the honest value is `unsupported`: the contract keeps the two
+/// apart precisely because the first is the user's choice and the second is a
+/// gap in the product, and a reader who saw `not_instrumented` would go looking
+/// for the switch. When a hook does arrive, its language moves to
+/// `not_instrumented` and the distinction starts carrying real information.
+///
+/// The list was also fixed at three languages, so a repository of Go or Java
+/// source had no runtime line at all. It is built from the grammars the scan
+/// actually saw instead.
+fn runtime_coverage_for(languages: &BTreeSet<Language>) -> Vec<RuntimeCoverage> {
+    let mut out: Vec<RuntimeCoverage> = languages
+        .iter()
         .map(|language| RuntimeCoverage {
-            language: language.to_owned(),
-            status: RuntimeStatus::NotInstrumented,
+            language: language.coverage_language(),
+            status: RuntimeStatus::Unsupported,
             hook_mechanism: None,
         })
-        .collect()
+        .collect();
+    // TypeScript and TSX report under one name, so the two grammars would
+    // otherwise produce the same line twice.
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Every language the coverage vocabulary can name, for a scan that found none.
+///
+/// A report with an empty runtime block says nothing about any language, which
+/// is the silence the block exists to break. When the walk turned up no source
+/// at all there is no observed set to build from, so the full vocabulary is
+/// declared unsupported.
+fn every_coverage_language() -> Vec<RuntimeCoverage> {
+    [
+        CoverageLanguage::Python,
+        CoverageLanguage::Typescript,
+        CoverageLanguage::Javascript,
+        CoverageLanguage::Java,
+        CoverageLanguage::Csharp,
+        CoverageLanguage::Go,
+        CoverageLanguage::Rust,
+        CoverageLanguage::Kotlin,
+        CoverageLanguage::Ruby,
+        CoverageLanguage::Php,
+    ]
+    .into_iter()
+    .map(|language| RuntimeCoverage {
+        language,
+        status: RuntimeStatus::Unsupported,
+        hook_mechanism: None,
+    })
+    .collect()
 }

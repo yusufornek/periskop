@@ -6,7 +6,7 @@
 // one. Fields are added to the schema first and to this file second.
 
 import { describeBody, type BodyObservation } from "./body-observation";
-import { egressEventId, processIdentity, targetCanonical } from "./event-id";
+import { egressEventId } from "./event-id";
 import { classifyHost } from "./provider-ref";
 import { pathTemplate } from "./path-template";
 import type { CallSite } from "./call-site";
@@ -68,10 +68,8 @@ export interface CallObservation {
 
 export interface BuildContext {
   readonly runtime: string;
-  readonly pid: number;
   readonly entrypointHint: string;
   readonly bodyParseLimitBytes: number;
-  readonly epochMillis: number;
 }
 
 /** The schema wants lower case, and a method is the only operation we can name. */
@@ -93,6 +91,7 @@ export function buildEgressEvent(
   const host = resolved ? (observation.host as string) : "unknown";
   const port = observation.port ?? 0;
   const template = pathTemplate(observation.path);
+  const operation = operationOf(observation.method);
 
   const described = describeBody(observation.body, context.bodyParseLimitBytes);
   degraded.push(...described.degraded);
@@ -101,11 +100,15 @@ export function buildEgressEvent(
 
   const event: EgressEvent = {
     schema_version: SCHEMA_VERSION,
+    // Only the four fields the schema names take part. The port, the payload,
+    // the entrypoint and the call site are excluded on purpose: the same call
+    // with a longer prompt, from a different worker, is the same call, and an
+    // identity that moved with any of them would defeat deduplication.
     egress_event_id: egressEventId({
-      processIdentity: processIdentity(context.runtime, context.pid),
-      targetCanonical: targetCanonical(host, port, template),
-      callShapeHash: undefined,
-      epochMillis: context.epochMillis,
+      module: observation.module,
+      operation,
+      hostId: host,
+      pathTemplate: template,
     }),
     process: {
       language: "javascript",
@@ -113,7 +116,7 @@ export function buildEgressEvent(
       entrypoint_hint: context.entrypointHint,
     },
     library: { module: observation.module, mechanism: "http_client" },
-    operation: operationOf(observation.method),
+    operation,
     target: {
       host_id: host,
       port,

@@ -14,11 +14,22 @@ use serde::Serialize;
 
 /// Serializes with sorted keys, two space indent and a trailing newline.
 pub fn to_canonical_json<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
+    let as_value = serde_json::to_value(value)?;
+    canonical_text(&as_value)
+}
+
+/// The one canonical form. Everything that writes or hashes a report goes here.
+///
+/// Two spellings of "canonical" used to exist: the file on disk ended in a
+/// newline and the hash was taken over the same text without it. The byte string
+/// the signature covered therefore appeared nowhere, and an independent verifier
+/// written the obvious way, read the report, drop the envelope, hash what is
+/// left, computed a different digest and failed a valid signature.
+fn canonical_text(value: &serde_json::Value) -> Result<String, serde_json::Error> {
     // serde_json's Map is a BTreeMap unless the preserve_order feature is on, so
     // going through Value is what applies the ordering. Serializing the struct
     // directly would emit fields in declaration order instead.
-    let as_value = serde_json::to_value(value)?;
-    let mut text = serde_json::to_string_pretty(&as_value)?;
+    let mut text = serde_json::to_string_pretty(value)?;
     text.push('\n');
     Ok(text)
 }
@@ -26,11 +37,14 @@ pub fn to_canonical_json<T: Serialize>(value: &T) -> Result<String, serde_json::
 /// blake3 over the canonical body, with the envelope excluded.
 pub fn body_hash<T: Serialize>(report: &T) -> Result<String, serde_json::Error> {
     let mut as_value = serde_json::to_value(report)?;
+    // A value that is not an object carries no envelope, so there is nothing to
+    // remove and hashing it whole is the same operation. Reports are objects; the
+    // branch exists because the function is generic, not because a report might
+    // arrive in some other shape.
     if let Some(object) = as_value.as_object_mut() {
         object.remove("envelope");
     }
-    let text = serde_json::to_string_pretty(&as_value)?;
-    Ok(short_hash_full(&text))
+    Ok(short_hash_full(&canonical_text(&as_value)?))
 }
 
 /// Full 64 character hash, as the signature envelope requires.
@@ -93,6 +107,29 @@ mod tests {
         let before = json!({ "envelope": {}, "findings": [] });
         let after = json!({ "envelope": {}, "findings": ["fnd_0000000000000001"] });
         assert_ne!(body_hash(&before).unwrap(), body_hash(&after).unwrap());
+    }
+
+    #[test]
+    fn an_outside_verifier_reaches_the_same_hash_from_the_written_document() {
+        // Written the way an independent implementation would: read the report as
+        // it was serialized, drop the envelope, canonicalize the rest the same
+        // way and hash it. The two paths used to differ by the trailing newline,
+        // so the bytes the signature covered existed in no file anywhere.
+        let report = json!({
+            "envelope": { "generated_at": "2026-08-04T09:00:00Z" },
+            "findings": ["fnd_0000000000000001"],
+            "verdict": "PASS"
+        });
+
+        let document = to_canonical_json(&report).unwrap();
+        let mut parsed: serde_json::Value = serde_json::from_str(&document).unwrap();
+        parsed.as_object_mut().unwrap().remove("envelope");
+        let recomputed = to_canonical_json(&parsed).unwrap();
+
+        assert_eq!(
+            body_hash(&report).unwrap(),
+            blake3::hash(recomputed.as_bytes()).to_hex().to_string()
+        );
     }
 
     #[test]

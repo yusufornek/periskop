@@ -5,6 +5,7 @@
 //! conclude "nothing found" from a scan that barely read anything, which is the
 //! single failure this tool is built to prevent.
 
+use periskop_report::coverage::{DnsObservation, RuntimeStatus, SensorPlatformClass};
 use periskop_report::report::ScanReport;
 use periskop_report::Verdict;
 
@@ -72,10 +73,8 @@ pub fn summary(report: &ScanReport) -> String {
         ));
     }
 
-    out.push_str(
-        "  runtime    not instrumented, so calls that only happen at run time were not seen\n",
-    );
-    out.push_str("  network    no sensor, so traffic with no matching call site was not seen\n");
+    out.push_str(&runtime_line(report));
+    out.push_str(&network_line(report));
 
     if !report.diagnostics.is_empty() {
         out.push_str("\nDiagnostics\n");
@@ -88,6 +87,74 @@ pub fn summary(report: &ScanReport) -> String {
     }
 
     out
+}
+
+/// The runtime line, read off the coverage block rather than asserted.
+///
+/// This used to be a fixed string saying the runtime layer was not instrumented.
+/// It happened to be close to what the report said, which is worse than being
+/// plainly wrong: the moment a hook lands and the report says `instrumented`,
+/// the terminal would keep printing the opposite, and the reader believes the
+/// screen.
+fn runtime_line(report: &ScanReport) -> String {
+    let coverage = &report.coverage;
+    if coverage.runtime_coverage.is_empty() {
+        return "  runtime    no status declared for any language\n".to_owned();
+    }
+
+    let mut instrumented = Vec::new();
+    let mut not_instrumented = Vec::new();
+    let mut degraded = Vec::new();
+    let mut unsupported = Vec::new();
+    for entry in &coverage.runtime_coverage {
+        let name = entry.language.as_str();
+        match entry.status {
+            RuntimeStatus::Instrumented => instrumented.push(name),
+            RuntimeStatus::NotInstrumented => not_instrumented.push(name),
+            RuntimeStatus::Degraded => degraded.push(name),
+            RuntimeStatus::Unsupported => unsupported.push(name),
+        }
+    }
+
+    let mut parts = Vec::new();
+    if !instrumented.is_empty() {
+        parts.push(format!("hooked: {}", instrumented.join(", ")));
+    }
+    if !degraded.is_empty() {
+        parts.push(format!("degraded: {}", degraded.join(", ")));
+    }
+    if !not_instrumented.is_empty() {
+        parts.push(format!(
+            "hook available but off: {}",
+            not_instrumented.join(", ")
+        ));
+    }
+    if !unsupported.is_empty() {
+        parts.push(format!("no hook exists: {}", unsupported.join(", ")));
+    }
+    format!("  runtime    {}\n", parts.join("; "))
+}
+
+/// The network line, likewise read off the coverage block.
+fn network_line(report: &ScanReport) -> String {
+    let coverage = &report.coverage;
+    let sensor = match coverage.sensor_platform_class {
+        SensorPlatformClass::None => {
+            return "  network    no sensor, so traffic with no matching call site was not seen\n"
+                .to_owned()
+        }
+        SensorPlatformClass::LinuxEbpf => "linux ebpf",
+        SensorPlatformClass::MacosPcap => "macos pcap",
+        SensorPlatformClass::WindowsPcapEtw => "windows pcap and etw",
+    };
+    let dns = match coverage.dns_observation {
+        DnsObservation::Available => "dns readable",
+        DnsObservation::UnavailableEncryptedDns => "dns encrypted, names not readable",
+    };
+    format!(
+        "  network    {sensor}, {dns}, {} ms observed\n",
+        coverage.observation_window_ms
+    )
 }
 
 fn describe(finding: &periskop_core::finding::Finding) -> String {
@@ -108,23 +175,73 @@ fn describe(finding: &periskop_core::finding::Finding) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use periskop_report::report::{Envelope, PolicyRef, ReportBuilder};
+    use periskop_core::finding::{
+        Component, Confidence, Detector, EntityRef, Evidence, EvidenceType, Finding, Kind,
+        Location, RefType, Span,
+    };
+    use periskop_report::coverage::{CoverageLanguage, CoverageStatement, RuntimeCoverage};
+    use periskop_report::report::{Envelope, PolicyRef, ReportBuilder, RuleHit};
+
+    fn envelope() -> Envelope {
+        Envelope {
+            generated_at: "2026-08-04T09:00:00Z".into(),
+            tool_version: "0.1.0".into(),
+            host: None,
+        }
+    }
+
+    fn policy(hits: Vec<RuleHit>) -> PolicyRef {
+        PolicyRef {
+            policy_id: "default".into(),
+            policy_version: "1.0.0".into(),
+            policy_hash: "a".repeat(64),
+            rule_hits: hits,
+        }
+    }
+
+    fn finding(confidence: Confidence, rule: &str, line: u32) -> Finding {
+        Finding::new(
+            Kind::DeclaredEgressPoint,
+            confidence,
+            "openai",
+            EntityRef {
+                ref_type: RefType::EgressPoint,
+                ref_id: format!("ep_{:016x}", u64::from(line)),
+            },
+            Evidence {
+                evidence_type: EvidenceType::AstNode,
+                r#ref: "call@services/summary.py".into(),
+                hash: None,
+            },
+            Detector {
+                component: Component::StaticScanner,
+                rule_id: rule.into(),
+                rule_version: "1.0.0".into(),
+                rule_hash: "0".repeat(64),
+            },
+        )
+        .unwrap()
+        .with_location(Location {
+            component: Component::StaticScanner,
+            path: Some("services/summary.py".into()),
+            span: Some(Span {
+                start_line: line,
+                start_col: 5,
+                end_line: line + 3,
+                end_col: 6,
+            }),
+            symbol: None,
+        })
+    }
 
     fn empty_report() -> ScanReport {
         ReportBuilder::new().build(
-            Envelope {
-                generated_at: "2026-08-04T09:00:00Z".into(),
-                tool_version: "0.1.0".into(),
-                host: None,
-            },
-            PolicyRef {
-                policy_id: "default".into(),
-                policy_version: "1.0.0".into(),
-                policy_hash: "a".repeat(64),
-                rule_hits: Vec::new(),
-            },
+            envelope(),
+            policy(Vec::new()),
+            CoverageStatement::static_only(),
         )
     }
 
@@ -142,5 +259,84 @@ mod tests {
     #[test]
     fn the_verdict_is_the_first_thing_shown() {
         assert!(summary(&empty_report()).starts_with("periskop PASS"));
+    }
+
+    #[test]
+    fn a_verdict_other_than_pass_is_shown_as_itself() {
+        // The old version of this test could only ever see PASS, because the
+        // verdict was fixed at PASS in every report the tool produced. It
+        // therefore proved nothing about the rendering.
+        let report = ReportBuilder::new().build(
+            envelope(),
+            policy(vec![RuleHit {
+                rule_id: "policy.confirmed-egress".into(),
+                verdict: Verdict::Fail,
+                finding_ids: None,
+                coverage_condition: None,
+            }]),
+            CoverageStatement::static_only(),
+        );
+        assert!(summary(&report).starts_with("periskop FAIL"), "{report:?}");
+    }
+
+    #[test]
+    fn a_finding_is_printed_with_its_location_provider_and_rule() {
+        // Nothing used to look at this path: the only fixture was an empty
+        // report, so the location formatting could break without a red test.
+        let mut builder = ReportBuilder::new();
+        builder.add_findings([
+            finding(
+                Confidence::Confirmed,
+                "python.static.openai-client-call",
+                10,
+            ),
+            finding(
+                Confidence::Suspect,
+                "python.static.http-provider-endpoint",
+                200,
+            ),
+        ]);
+        let text = summary(&builder.build(
+            envelope(),
+            policy(Vec::new()),
+            CoverageStatement::static_only(),
+        ));
+
+        assert!(text.contains("1 confirmed:"), "{text}");
+        assert!(text.contains("services/summary.py:10"), "{text}");
+        assert!(
+            text.contains("openai via python.static.openai-client-call"),
+            "{text}"
+        );
+        assert!(text.contains("1 suspected"), "{text}");
+        assert!(text.contains("services/summary.py:200"), "{text}");
+    }
+
+    #[test]
+    fn the_runtime_line_reports_what_the_coverage_block_says() {
+        // The bug this pins: the line was a fixed string. It agreed with the
+        // report by coincidence, and would have kept printing "not instrumented"
+        // on the day a hook started reporting otherwise.
+        let mut coverage = CoverageStatement::static_only();
+        coverage.runtime_coverage = vec![
+            RuntimeCoverage {
+                language: CoverageLanguage::Python,
+                status: RuntimeStatus::Instrumented,
+                hook_mechanism: Some("sitecustomize".into()),
+            },
+            RuntimeCoverage {
+                language: CoverageLanguage::Go,
+                status: RuntimeStatus::Unsupported,
+                hook_mechanism: None,
+            },
+        ];
+        let text = summary(&ReportBuilder::new().build(envelope(), policy(Vec::new()), coverage));
+
+        assert!(text.contains("hooked: python"), "{text}");
+        assert!(text.contains("no hook exists: go"), "{text}");
+        assert!(
+            !text.contains("not instrumented, so calls"),
+            "the fixed string is back: {text}"
+        );
     }
 }

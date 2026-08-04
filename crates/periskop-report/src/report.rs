@@ -16,7 +16,14 @@ use periskop_core::finding::{Confidence, Finding};
 
 use crate::coverage::CoverageStatement;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The three outcomes a run may report, ordered from weakest to strongest.
+///
+/// One enum, not two. A second copy existed only to carry an `Ord` derive for
+/// sorting rule hits, and the schema binds both `RuleHit.verdict` and
+/// `ScanReport.verdict` to the same list: a fourth value added to one copy and
+/// not the other would have given the two fields different vocabularies while
+/// the contract said they shared one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Verdict {
     #[serde(rename = "PASS")]
     Pass,
@@ -38,23 +45,12 @@ pub struct Envelope {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RuleHit {
     pub rule_id: String,
-    pub verdict: VerdictOrder,
+    pub verdict: Verdict,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finding_ids: Option<Vec<String>>,
     /// Present when the hit came from a coverage threshold rather than a finding.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coverage_condition: Option<String>,
-}
-
-/// Same values as [`Verdict`], with an ordering so rule hits can be sorted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum VerdictOrder {
-    #[serde(rename = "PASS")]
-    Pass,
-    #[serde(rename = "WARN")]
-    Warn,
-    #[serde(rename = "FAIL")]
-    Fail,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,10 +180,17 @@ pub struct ScanReport {
 pub const SCHEMA_VERSION: &str = "1.0";
 
 /// Collects findings and produces a report.
+///
+/// The coverage statement is not held here. It is an argument to [`build`], so a
+/// caller that forgets it does not compile. It used to default to an invented
+/// statement claiming nought files read and nothing skipped, which reads as a
+/// full clean scan of an empty tree and is indistinguishable from a caller that
+/// never produced a statement at all.
+///
+/// [`build`]: ReportBuilder::build
 #[derive(Debug, Default)]
 pub struct ReportBuilder {
     findings: Vec<Finding>,
-    coverage: Option<CoverageStatement>,
     diagnostics: Vec<Diagnostic>,
     policy: Policy,
     inputs: ScanInputs,
@@ -215,12 +218,6 @@ impl ReportBuilder {
         self
     }
 
-    pub fn coverage(&mut self, mut coverage: CoverageStatement) -> &mut Self {
-        coverage.normalize();
-        self.coverage = Some(coverage);
-        self
-    }
-
     pub fn add_diagnostic(&mut self, diagnostic: Diagnostic) -> &mut Self {
         self.diagnostics.push(diagnostic);
         self
@@ -232,7 +229,12 @@ impl ReportBuilder {
     /// match sitting in the same list as a structural one would let a reader treat
     /// them as equally certain, which is exactly the collapse this product argues
     /// against.
-    pub fn build(mut self, envelope: Envelope, policy_ref: PolicyRef) -> ScanReport {
+    pub fn build(
+        mut self,
+        envelope: Envelope,
+        policy_ref: PolicyRef,
+        mut coverage: CoverageStatement,
+    ) -> ScanReport {
         self.findings
             .sort_by(|a, b| a.finding_id.cmp(&b.finding_id));
         self.findings.dedup_by(|a, b| a.finding_id == b.finding_id);
@@ -242,7 +244,6 @@ impl ReportBuilder {
             .into_iter()
             .partition(|f| f.confidence == Confidence::Suspect);
 
-        let mut coverage = self.coverage.unwrap_or_else(CoverageStatement::static_only);
         coverage.normalize();
 
         let coverage_digest = match coverage_digest(&coverage) {
@@ -335,15 +336,15 @@ fn evaluate_policy(
     let ratio = coverage.unparsed_ratio_basis_points();
     let (coverage_verdict, condition) = match policy.unparsed_ratio_warn {
         Some(limit) if ratio > limit => (
-            VerdictOrder::Warn,
+            Verdict::Warn,
             format!("coverage_unparsed_ratio {ratio} greater_than {limit}"),
         ),
         Some(limit) => (
-            VerdictOrder::Pass,
+            Verdict::Pass,
             format!("coverage_unparsed_ratio {ratio} within declared limit {limit}"),
         ),
         None => (
-            VerdictOrder::Pass,
+            Verdict::Pass,
             format!("coverage_unparsed_ratio {ratio}, policy declares no limit"),
         ),
     };
@@ -351,21 +352,13 @@ fn evaluate_policy(
     vec![
         RuleHit {
             rule_id: "policy.confirmed-egress".to_owned(),
-            verdict: if fails {
-                VerdictOrder::Fail
-            } else {
-                VerdictOrder::Pass
-            },
+            verdict: if fails { Verdict::Fail } else { Verdict::Pass },
             finding_ids: (!confirmed_ids.is_empty()).then_some(confirmed_ids),
             coverage_condition: None,
         },
         RuleHit {
             rule_id: "policy.suspect-egress".to_owned(),
-            verdict: if warns {
-                VerdictOrder::Warn
-            } else {
-                VerdictOrder::Pass
-            },
+            verdict: if warns { Verdict::Warn } else { Verdict::Pass },
             finding_ids: (!suspect_ids.is_empty()).then_some(suspect_ids),
             coverage_condition: None,
         },
@@ -389,18 +382,10 @@ fn evaluate_policy(
 /// decision has already been written into the report by the time it runs, so the
 /// verdict can be recomputed from the report alone by anyone who doubts it.
 fn decide_verdict(policy: &PolicyRef) -> Verdict {
-    if policy
-        .rule_hits
-        .iter()
-        .any(|h| h.verdict == VerdictOrder::Fail)
-    {
+    if policy.rule_hits.iter().any(|h| h.verdict == Verdict::Fail) {
         return Verdict::Fail;
     }
-    if policy
-        .rule_hits
-        .iter()
-        .any(|h| h.verdict == VerdictOrder::Warn)
-    {
+    if policy.rule_hits.iter().any(|h| h.verdict == Verdict::Warn) {
         return Verdict::Warn;
     }
     Verdict::Pass
@@ -512,7 +497,7 @@ mod tests {
             finding(Confidence::Confirmed, "python.static.a"),
             finding(Confidence::Suspect, "python.static.b"),
         ]);
-        let report = b.build(envelope(), policy(vec![]));
+        let report = b.build(envelope(), policy(vec![]), CoverageStatement::static_only());
 
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.suspect_findings.len(), 1);
@@ -528,19 +513,46 @@ mod tests {
 
     #[test]
     fn a_coverage_gap_alone_does_not_warn() {
-        let mut b = ReportBuilder::new();
+        let b = ReportBuilder::new();
         let mut coverage = CoverageStatement::static_only();
         coverage.parsed_files = 1;
         coverage.unparsed_files = vec![crate::coverage::UnparsedFile {
             path: "x.py".into(),
             reason: periskop_core::coverage::UnparsedReason::ParseError,
         }];
-        b.coverage(coverage);
-        let report = b.build(envelope(), policy(vec![]));
+        let report = b.build(envelope(), policy(vec![]), coverage);
 
         assert_eq!(report.verdict, Verdict::Pass);
         // The gap is not hidden by passing. It is still there to read.
         assert_eq!(report.coverage.unparsed_files.len(), 1);
+    }
+
+    #[test]
+    fn the_report_verdict_and_a_rule_hit_speak_one_vocabulary() {
+        // Two byte identical enums used to exist, one of them only so rule hits
+        // could be sorted. The schema binds both fields to the same list, so a
+        // value added to one and not the other would have split the vocabulary
+        // in a way nothing in the build would have caught.
+        let hit = RuleHit {
+            rule_id: "policy.confirmed-egress".into(),
+            verdict: Verdict::Fail,
+            finding_ids: None,
+            coverage_condition: None,
+        };
+        let report = ReportBuilder::new().build(
+            envelope(),
+            policy(vec![hit.clone()]),
+            CoverageStatement::static_only(),
+        );
+
+        assert_eq!(report.verdict, hit.verdict);
+        assert_eq!(
+            serde_json::to_value(report.verdict).unwrap(),
+            serde_json::to_value(hit.verdict).unwrap()
+        );
+        // Ordering runs from weakest to strongest, which is what lets the verdict
+        // be read off the strongest hit.
+        assert!(Verdict::Pass < Verdict::Warn && Verdict::Warn < Verdict::Fail);
     }
 
     #[test]
@@ -549,10 +561,11 @@ mod tests {
             envelope(),
             policy(vec![RuleHit {
                 rule_id: "coverage.unparsed-ratio".into(),
-                verdict: VerdictOrder::Warn,
+                verdict: Verdict::Warn,
                 finding_ids: None,
                 coverage_condition: Some("coverage_unparsed_ratio > 500".into()),
             }]),
+            CoverageStatement::static_only(),
         );
         assert_eq!(report.verdict, Verdict::Warn);
     }
@@ -570,8 +583,7 @@ mod tests {
             path: "x.py".into(),
             reason: periskop_core::coverage::UnparsedReason::ParseError,
         }];
-        b.coverage(coverage);
-        let report = b.build(envelope(), policy(vec![]));
+        let report = b.build(envelope(), policy(vec![]), coverage);
 
         assert_eq!(report.verdict, Verdict::Warn);
         // K-20's other half: the threshold that produced the warning is written
@@ -582,7 +594,7 @@ mod tests {
             .iter()
             .find(|h| h.rule_id == "policy.coverage-unparsed-ratio")
             .unwrap();
-        assert_eq!(hit.verdict, VerdictOrder::Warn);
+        assert_eq!(hit.verdict, Verdict::Warn);
         assert_eq!(
             hit.coverage_condition.as_deref(),
             Some("coverage_unparsed_ratio 5000 greater_than 500")
@@ -596,7 +608,7 @@ mod tests {
         // whatever the findings said.
         let mut b = ReportBuilder::new();
         b.add_findings([finding(Confidence::Confirmed, "python.static.a")]);
-        let report = b.build(envelope(), policy(vec![]));
+        let report = b.build(envelope(), policy(vec![]), CoverageStatement::static_only());
 
         assert_eq!(report.verdict, Verdict::Pass);
         let hit = report
@@ -605,7 +617,7 @@ mod tests {
             .iter()
             .find(|h| h.rule_id == "policy.confirmed-egress")
             .unwrap();
-        assert_eq!(hit.verdict, VerdictOrder::Pass);
+        assert_eq!(hit.verdict, Verdict::Pass);
         assert_eq!(
             hit.finding_ids.as_deref(),
             Some(&[report.findings[0].finding_id.clone()][..]),
@@ -621,7 +633,7 @@ mod tests {
             ..Policy::default()
         });
         b.add_findings([finding(Confidence::Confirmed, "python.static.a")]);
-        let report = b.build(envelope(), policy(vec![]));
+        let report = b.build(envelope(), policy(vec![]), CoverageStatement::static_only());
 
         assert_eq!(report.verdict, Verdict::Fail);
     }
@@ -632,7 +644,7 @@ mod tests {
         // could not prove, which is the case a human is meant to look at.
         let mut b = ReportBuilder::new();
         b.add_findings([finding(Confidence::Suspect, "python.static.b")]);
-        let report = b.build(envelope(), policy(vec![]));
+        let report = b.build(envelope(), policy(vec![]), CoverageStatement::static_only());
 
         assert_eq!(report.verdict, Verdict::Warn);
     }
@@ -642,7 +654,7 @@ mod tests {
         let build = || {
             let mut b = ReportBuilder::new();
             b.add_findings([finding(Confidence::Confirmed, "python.static.a")]);
-            b.build(envelope(), policy(vec![]))
+            b.build(envelope(), policy(vec![]), CoverageStatement::static_only())
         };
         let a = build();
         let b = build();
@@ -659,7 +671,7 @@ mod tests {
         let build = |rule: &str| {
             let mut b = ReportBuilder::new();
             b.add_findings([finding(Confidence::Confirmed, rule)]);
-            b.build(envelope(), policy(vec![]))
+            b.build(envelope(), policy(vec![]), CoverageStatement::static_only())
         };
         let a = build("python.static.openai");
         let b = build("typescript.static.anthropic");
@@ -679,8 +691,7 @@ mod tests {
             b.add_findings([finding(Confidence::Confirmed, "python.static.a")]);
             let mut coverage = CoverageStatement::static_only();
             coverage.parsed_files = parsed_files;
-            b.coverage(coverage);
-            b.build(envelope(), policy(vec![]))
+            b.build(envelope(), policy(vec![]), coverage)
         };
         assert_ne!(build(400).scan_run_id, build(4).scan_run_id);
     }
@@ -693,7 +704,7 @@ mod tests {
                 scan_root_id: root.into(),
                 rule_set_hash: "c".repeat(64),
             });
-            b.build(envelope(), policy(vec![]))
+            b.build(envelope(), policy(vec![]), CoverageStatement::static_only())
         };
         assert_ne!(build("repo-a").scan_run_id, build("repo-b").scan_run_id);
     }
@@ -703,7 +714,8 @@ mod tests {
         let make = |order: [&str; 2]| {
             let mut b = ReportBuilder::new();
             b.add_findings(order.map(|r| finding(Confidence::Confirmed, r)));
-            b.build(envelope(), policy(vec![])).findings
+            b.build(envelope(), policy(vec![]), CoverageStatement::static_only())
+                .findings
         };
         let forward = make(["python.static.a", "python.static.b"]);
         let reverse = make(["python.static.b", "python.static.a"]);
@@ -717,6 +729,11 @@ mod tests {
             finding(Confidence::Confirmed, "python.static.a"),
             finding(Confidence::Confirmed, "python.static.a"),
         ]);
-        assert_eq!(b.build(envelope(), policy(vec![])).findings.len(), 1);
+        assert_eq!(
+            b.build(envelope(), policy(vec![]), CoverageStatement::static_only())
+                .findings
+                .len(),
+            1
+        );
     }
 }

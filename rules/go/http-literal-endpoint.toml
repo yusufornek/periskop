@@ -16,6 +16,21 @@
 #
 # A URL assembled at runtime does not match here at all. That is a known gap
 # rather than a silent one: it belongs to the catalogue, not to a looser rule.
+#
+# Why this rule reports `suspect` while the SDK rules report `confirmed`. Go
+# proves more than its Python and TypeScript siblings do: the binding below
+# resolves the receiver to `net/http`, so "an HTTP request was constructed" is a
+# structural fact here. What is not structural is the claim about where the
+# request goes. That comes from a regular expression run over the text of the URL
+# literal, and reading the contents of a string is a text match rather than a
+# fact the tree states. A constant holding a provider host for an allowlist
+# satisfies it exactly as well as a real request does.
+#
+# The two halves cannot be reported separately, and the weaker one decides: the
+# egress kind claimed below is the part the regex is carrying. So the call is
+# still reported and the claim about it is what weakens. Restoring `confirmed`
+# needs the destination resolved rather than matched, which is the extraction
+# work `target_url` is declared for.
 
 schema_version = "1.0"
 language = "go"
@@ -111,7 +126,7 @@ target_url = { from = "url" }
 
 [classify]
 egress_kind = "llm_chat"
-default_confidence = "confirmed"
+default_confidence = "suspect"
 
 [[classify.downgrade]]
 when = "target_url.unresolved"

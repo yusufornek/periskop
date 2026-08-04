@@ -11,15 +11,46 @@
 //! not track a client passed in as a parameter. Those are real limits, they are
 //! catalogued, and the honest response to them is a weaker confidence rather than
 //! a confident guess.
+//!
+//! One assignment step means two spellings, not one. A client kept in a local is
+//! the shape a small script has; a client kept in an instance field is the shape
+//! almost every class has, and a resolver that only understood locals walked past
+//! all of it. Field assignments are therefore tracked too, under a qualified key
+//! (`self.client`, `this.client`) so that a field and a local of the same name
+//! never answer for each other. The file boundary still holds: a field assigned
+//! in another file or inherited from a base class is out of reach, and that
+//! remains catalogued rather than guessed at.
 
 use std::collections::BTreeMap;
 
 use tree_sitter::Node;
 
+/// The name a Python method uses for the instance it was called on.
+///
+/// Convention rather than syntax: the grammar sees an ordinary parameter. Keying
+/// on the conventional spelling is what keeps the qualified key readable, and a
+/// method that spells its receiver otherwise is a catalogued gap.
+const PYTHON_SELF: &str = "self";
+
+/// The JavaScript equivalent. Here the grammar does give it a node of its own,
+/// which is why the two languages need different branches to reach the same key.
+pub(crate) const JS_THIS: &str = "this";
+
+/// The table key an instance field is stored under.
+///
+/// Qualified on purpose. A file can hold both a local named `client` and a field
+/// named `client` that point at different packages, and a flat key would let one
+/// answer for the other.
+pub(crate) fn field_key(receiver: &str, field: &str) -> String {
+    format!("{receiver}.{field}")
+}
+
 /// Names visible in a file and the dotted paths they resolve to.
 #[derive(Debug, Default, Clone)]
 pub struct BindingTable {
-    /// Local name to fully qualified path, for example `client` to `openai.OpenAI`.
+    /// Visible name to fully qualified path, for example `client` to
+    /// `openai.OpenAI`. An instance field is keyed by its qualified spelling
+    /// (`self.client`, `this.client`), which is also how a call site reaches it.
     resolved: BTreeMap<String, String>,
     /// Modules the file imported, whether or not anything was bound from them.
     /// Used to report a library nobody has a detector for.
@@ -177,7 +208,7 @@ fn collect_import_from(node: Node<'_>, source: &str, table: &mut BindingTable) {
     }
 }
 
-/// One assignment step: `client = OpenAI()` or `client = genai.Client()`.
+/// One assignment step: `client = OpenAI()`, `genai.Client()` or `self.client = OpenAI()`.
 ///
 /// Only direct constructor calls are followed. A value returned from a factory or
 /// arriving as a parameter is not resolved, and pretending otherwise would put a
@@ -189,7 +220,10 @@ fn collect_assignment(node: Node<'_>, source: &str, table: &mut BindingTable) {
     ) else {
         return;
     };
-    if left.kind() != "identifier" || right.kind() != "call" {
+    let Some(target) = assignment_target(left, source) else {
+        return;
+    };
+    if right.kind() != "call" {
         return;
     }
     let Some(function) = right.child_by_field_name("function") else {
@@ -218,29 +252,70 @@ fn collect_assignment(node: Node<'_>, source: &str, table: &mut BindingTable) {
     };
 
     if let Some(path) = constructed {
-        table.resolved.insert(text(left, source), path);
+        table.resolved.insert(target, path);
     }
 }
 
-/// Leftmost identifier of an attribute chain: `a.b.c` yields `a`.
+/// The table key an assignment target writes, if it is one this pass can key on.
+///
+/// A plain name is itself. `self.<field>` is the other case that matters, because
+/// holding the client in an instance field is how a Python class is ordinarily
+/// written and skipping it meant skipping the calls that read it.
+///
+/// Nothing else is a target. `other.field = OpenAI()` assigns into an object this
+/// file may not own, and the call sites reading it are reached through a name
+/// this pass never sees, so binding it would be a guess rather than a step.
+fn assignment_target(left: Node<'_>, source: &str) -> Option<String> {
+    match left.kind() {
+        "identifier" => Some(text(left, source)),
+        "attribute" => {
+            let object = left.child_by_field_name("object")?;
+            let attribute = left.child_by_field_name("attribute")?;
+            let is_self = object.kind() == "identifier" && text(object, source) == PYTHON_SELF;
+            is_self.then(|| field_key(PYTHON_SELF, &text(attribute, source)))
+        }
+        _ => None,
+    }
+}
+
+/// The table key an attribute chain reads from: `a.b.c` yields `a`.
 ///
 /// Node names differ per grammar, so both vocabularies are listed. Python calls
 /// the node `attribute`, JavaScript calls it `member_expression`, and a resolver
 /// that only knows one of them silently stops resolving in the other language.
+///
+/// A chain rooted at the instance receiver yields the qualified field key instead
+/// of the receiver itself. `self` and `this` name no value on their own, so
+/// stopping at them resolved nothing and the whole field-held-client shape fell
+/// through; the field directly attached to the receiver is what was bound, and it
+/// is what has to be looked up.
 pub fn root_identifier(node: Node<'_>, source: &str) -> Option<String> {
     let mut current = node;
+    // The member stepped over most recently. Once the walk bottoms out at the
+    // receiver, this holds the field being read, because each step overwrites it
+    // and the last step is the one nearest the receiver.
+    let mut field: Option<String> = None;
     loop {
         match current.kind() {
-            "identifier" | "shorthand_property_identifier" => return Some(text(current, source)),
-            "attribute"
-            | "call"
-            | "member_expression"
-            | "call_expression"
-            | "new_expression"
-            | "parenthesized_expression" => {
-                current = current
-                    .child_by_field_name("object")
-                    .or_else(|| current.child_by_field_name("function"))?;
+            "identifier" | "shorthand_property_identifier" => {
+                let name = text(current, source);
+                return match field {
+                    Some(f) if name == PYTHON_SELF => Some(field_key(PYTHON_SELF, &f)),
+                    _ => Some(name),
+                };
+            }
+            // A bare `this` carries no binding, so a chain that stops there
+            // resolves to nothing rather than to the enclosing object.
+            "this" => return field.map(|f| field_key(JS_THIS, &f)),
+            "attribute" | "member_expression" => {
+                field = current
+                    .child_by_field_name("attribute")
+                    .or_else(|| current.child_by_field_name("property"))
+                    .map(|n| text(n, source));
+                current = current.child_by_field_name("object")?;
+            }
+            "call" | "call_expression" | "new_expression" | "parenthesized_expression" => {
+                current = current.child_by_field_name("function")?;
             }
             _ => return None,
         }
@@ -328,5 +403,99 @@ mod tests {
     fn imported_modules_are_listed_for_coverage() {
         let t = table_for("import openai\nfrom anthropic import Anthropic\n");
         assert_eq!(t.imported_modules(), ["anthropic", "openai"]);
+    }
+
+    #[test]
+    fn a_client_kept_in_an_instance_field_is_bound() {
+        // The shape almost every Python class uses. Before this it resolved to
+        // nothing, so a file making plain OpenAI calls reported no egress at all.
+        let t = table_for(
+            "from openai import OpenAI\n\
+             class Summarizer:\n    def __init__(self):\n        self.client = OpenAI()\n",
+        );
+        assert!(t.satisfies("self.client", "openai", &["OpenAI".to_owned()]));
+    }
+
+    #[test]
+    fn a_field_holding_a_local_class_resolves_to_nothing() {
+        let t = table_for(
+            "class Store:\n    pass\n\n\
+             class S:\n    def __init__(self):\n        self.client = Store()\n",
+        );
+        assert!(!t.satisfies("self.client", "openai", &["OpenAI".to_owned()]));
+    }
+
+    #[test]
+    fn a_field_on_another_object_is_not_bound() {
+        // `ctx` may belong to a caller in another file, and nothing here can say
+        // which name its call sites reach the field through.
+        let t = table_for(
+            "from openai import OpenAI\n\
+             def boot(ctx):\n    ctx.client = OpenAI()\n",
+        );
+        assert_eq!(t.resolve("ctx.client"), None);
+        assert_eq!(t.resolve("self.client"), None);
+    }
+
+    #[test]
+    fn a_local_and_a_field_of_the_same_name_stay_apart() {
+        let t = table_for(
+            "from openai import OpenAI\n\
+             class Store:\n    pass\n\n\
+             client = Store()\n\
+             class S:\n    def __init__(self):\n        self.client = OpenAI()\n",
+        );
+        assert_eq!(t.resolve("client"), None);
+        assert!(t.satisfies("self.client", "openai", &["OpenAI".to_owned()]));
+    }
+
+    /// The receiver chain a call site hands to the resolver, resolved to a key.
+    fn root_of(source: &str, language: Language) -> Option<String> {
+        let parsed = parse_as("t", source, language).unwrap();
+        // The expression statement at the end of the file is the call under test.
+        let mut stack = vec![parsed.root_node()];
+        let mut cursor = parsed.root_node().walk();
+        let mut receiver = None;
+        while let Some(node) = stack.pop() {
+            if matches!(node.kind(), "attribute" | "member_expression") {
+                let parent_is_call = node
+                    .parent()
+                    .is_some_and(|p| matches!(p.kind(), "call" | "call_expression"));
+                if parent_is_call {
+                    receiver = node.child_by_field_name("object");
+                }
+            }
+            stack.extend(node.children(&mut cursor));
+        }
+        root_identifier(receiver?, parsed.source())
+    }
+
+    #[test]
+    fn a_chain_rooted_at_self_resolves_to_the_field_key() {
+        // What the call site actually reads. Stopping at `self` was what made the
+        // field binding unreachable even once it existed.
+        let key = root_of(
+            "class S:\n    def run(self):\n        self.client.chat.completions.create(model='x')\n",
+            Language::Python,
+        );
+        assert_eq!(key.as_deref(), Some("self.client"));
+    }
+
+    #[test]
+    fn a_chain_rooted_at_this_resolves_to_the_field_key() {
+        let key = root_of(
+            "class S { run() { this.client.chat.completions.create({}); } }\n",
+            Language::TypeScript,
+        );
+        assert_eq!(key.as_deref(), Some("this.client"));
+    }
+
+    #[test]
+    fn an_ordinary_chain_still_resolves_to_its_leftmost_name() {
+        let key = root_of(
+            "client.chat.completions.create(model='x')\n",
+            Language::Python,
+        );
+        assert_eq!(key.as_deref(), Some("client"));
     }
 }

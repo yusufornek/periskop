@@ -86,16 +86,53 @@ fn every_fixture_parses_cleanly() {
     }
 }
 
+/// The confidence each positive fixture is expected to come back with.
+///
+/// Named per fixture rather than asserted in bulk, because they no longer agree.
+/// A rule whose distinguishing condition is a regular expression over the text of
+/// a URL cannot claim a structural fact, so it reports `suspect` and its fixture
+/// comes back weaker by design. Loosening the assertion to "some finding exists"
+/// would let that pass and would stop watching the fixtures that must stay
+/// confirmed, so both statements are kept.
+const EXPECTED_CONFIDENCE: &[(&str, Confidence)] = &[
+    ("http_literal_post.go", Confidence::Suspect),
+    ("http_new_request.go", Confidence::Suspect),
+    ("openai_go_chat.go", Confidence::Confirmed),
+    ("openai_go_responses.go", Confidence::Confirmed),
+    ("sashabaranov_chat.go", Confidence::Confirmed),
+];
+
 #[test]
-fn positive_fixtures_produce_confirmed_findings() {
+fn every_positive_fixture_produces_the_confidence_it_is_listed_with() {
     for (name, source) in fixtures("positive") {
         let hits = scan(&source, &name);
         assert!(!hits.is_empty(), "{name} produced no finding");
+        let Some((_, expected)) = EXPECTED_CONFIDENCE.iter().find(|(f, _)| *f == name) else {
+            panic!(
+                "{name} is a positive fixture with no entry in EXPECTED_CONFIDENCE; \
+                 a new fixture states what it expects rather than inheriting it"
+            );
+        };
+        let unexpected: Vec<&(String, Confidence)> =
+            hits.iter().filter(|(_, c)| c != expected).collect();
         assert!(
-            hits.iter().any(|(_, c)| *c == Confidence::Confirmed),
-            "{name} produced only weak findings: {hits:?}"
+            unexpected.is_empty(),
+            "{name} is listed as {expected:?} but also produced {unexpected:?}"
         );
     }
+}
+
+#[test]
+fn every_listed_fixture_still_exists() {
+    // Stops the table above from outliving the files it describes, which would
+    // leave a fixture silently unasserted.
+    let present: Vec<String> = fixtures("positive").into_iter().map(|(n, _)| n).collect();
+    let missing: Vec<&str> = EXPECTED_CONFIDENCE
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !present.iter().any(|p| p == name))
+        .collect();
+    assert!(missing.is_empty(), "listed but absent: {missing:?}");
 }
 
 #[test]
@@ -167,7 +204,10 @@ fn an_aliased_standard_library_import_still_resolves() {
     let source = "package main\n\nimport nethttp \"net/http\"\n\nfunc f(body any) {\n\tnethttp.Post(\"https://api.openai.com/v1/chat/completions\", \"application/json\", body)\n}\n";
     let hits = scan(source, "aliased.go");
     assert_eq!(hits.len(), 1, "{hits:?}");
-    assert_eq!(hits[0].1, Confidence::Confirmed);
+    // Suspect rather than confirmed: the receiver is resolved structurally, which
+    // is what this test is about, but the provider claim still rests on matching
+    // the text of the URL.
+    assert_eq!(hits[0].1, Confidence::Suspect);
 }
 
 #[test]

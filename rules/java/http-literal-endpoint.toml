@@ -18,6 +18,23 @@
 #
 # A URL assembled at runtime does not match here at all. That is a known gap
 # rather than a silent one: it belongs to the catalogue, not to a looser rule.
+#
+# Why this rule reports `suspect` while the SDK rules report `confirmed`. The
+# call shape is structural: the tree says a URI was built, or that a builder was
+# handed a URL. But the shape alone describes any URI in any codebase, and what
+# narrows it to a provider is a regular expression run over the text of the
+# string literal. Reading the contents of a string is a text match rather than a
+# fact the tree states, and a constant holding a provider host for an allowlist
+# satisfies it exactly as well as a real request does.
+#
+# The third pattern is looser still: its receiver is left unconstrained because
+# the OkHttp builder is reached through a chain of varying length, so the URL
+# predicate is doing all of the narrowing on its own.
+#
+# The project forbids a text match from reaching the confirmed list, so the call
+# is still reported and the claim about where it goes is what weakens. Restoring
+# `confirmed` needs the destination resolved rather than matched, which is the
+# extraction work `target_url` is declared for.
 
 schema_version = "1.0"
 language = "java"
@@ -93,7 +110,7 @@ target_url = { from = "url" }
 
 [classify]
 egress_kind = "llm_chat"
-default_confidence = "confirmed"
+default_confidence = "suspect"
 
 [[classify.downgrade]]
 when = "target_url.unresolved"

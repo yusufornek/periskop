@@ -135,6 +135,19 @@ pub fn compile_partial(language: Language, rules: &[RuleFile]) -> PartialCompile
             if let Some(method) = &spec.method {
                 absent.extend(missing(&method.capture));
             }
+            // The anchor is what a finding points at. A query that captures
+            // neither used to fall back to the root of the file, so a typo in a
+            // capture name produced a finding spanning four thousand lines whose
+            // evidence hash covered the whole file: an edit anywhere in it
+            // changed the report. One missing name is a rule defect, and it is
+            // caught here rather than at the call site of every match.
+            if !capture_names.contains(&"call") && !capture_names.contains(&"import") {
+                absent.push(CompileError::MissingCapture {
+                    rule_id: rule.rule_id.clone(),
+                    match_index,
+                    capture: "call or @import".to_owned(),
+                });
+            }
             if !absent.is_empty() {
                 errors.append(&mut absent);
                 continue;
@@ -261,6 +274,15 @@ default_confidence = "confirmed"
     }
 
     #[test]
+    fn a_query_with_no_anchor_capture_is_rejected() {
+        // Without this the finding would anchor on the file root: the whole file
+        // as its span, and the whole file in its evidence hash.
+        let rules = vec![rule("anchorless", "(call) @callsite", "")];
+        let err = compile(Language::Python, &rules).unwrap_err();
+        assert!(err.to_string().contains("call"), "{err}");
+    }
+
+    #[test]
     fn empty_rule_set_compiles_to_an_empty_query() {
         let compiled = compile(Language::Python, &[]).unwrap();
         assert_eq!(compiled.pattern_count(), 0);
@@ -307,7 +329,7 @@ default_confidence = "confirmed"
     fn each_language_compiles_against_its_own_grammar() {
         // A query valid for Python is not automatically valid for TypeScript.
         // Compiling per language is what keeps that mistake from reaching a scan.
-        let python_only = vec![rule("py", "(import_from_statement) @i", "")];
+        let python_only = vec![rule("py", "(import_from_statement) @import", "")];
         assert!(compile(Language::Python, &python_only).is_ok());
         assert!(compile(Language::TypeScript, &python_only).is_err());
     }

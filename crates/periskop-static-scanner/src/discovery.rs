@@ -50,9 +50,14 @@ pub struct SkippedFile {
 pub struct Discovery {
     pub files: Vec<DiscoveredFile>,
     pub skipped: Vec<SkippedFile>,
-    /// Symbolic links that were not followed. Loops make following them unsafe,
-    /// and a link left unvisited is still something the reader should know about.
-    pub unfollowed_links: Vec<PathBuf>,
+    /// Problems with the walk itself rather than with any one file: an ignore
+    /// file the walker could not parse, or a path that cannot be written into a
+    /// report at all.
+    ///
+    /// Kept apart from `skipped` on purpose. These are engine level faults and
+    /// belong in the report diagnostics block; folding them into the coverage
+    /// counters would make a threshold over those counters meaningless (K-10).
+    pub diagnostics: Vec<String>,
 }
 
 /// Knobs a caller may turn. Defaults match the specification.
@@ -131,11 +136,12 @@ pub fn discover(root: &Path, options: &DiscoveryOptions) -> Discovery {
     let mut discovery = Discovery::default();
 
     for entry in builder.build() {
-        let Ok(entry) = entry else {
-            // A directory that cannot be read is a real gap. It is not attributed
-            // to any single file, so it is counted as an io_error at the path the
-            // walker was able to name.
-            continue;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                record_walk_error(root, &error, &mut discovery);
+                continue;
+            }
         };
 
         let path = entry.path();
@@ -145,10 +151,25 @@ pub fn discover(root: &Path, options: &DiscoveryOptions) -> Discovery {
         if relative.as_os_str().is_empty() {
             continue;
         }
+        if relative.to_str().is_none() {
+            // A path that is not valid UTF-8 cannot be written into a report
+            // without being altered, and two different names can collapse onto
+            // one string once the invalid bytes are replaced. Two findings would
+            // then share an identity, so the file leaves the scan here and says
+            // so rather than being converted quietly.
+            discovery.diagnostics.push(format!(
+                "path is not valid UTF-8 and was left out of the scan: {}",
+                relative.display()
+            ));
+            continue;
+        }
 
         let file_type = entry.file_type();
         if file_type.is_some_and(|t| t.is_symlink()) {
-            discovery.unfollowed_links.push(relative.to_path_buf());
+            discovery.skipped.push(SkippedFile {
+                path: relative.to_path_buf(),
+                reason: unfollowed_link_reason(path, relative),
+            });
             continue;
         }
         if !file_type.is_some_and(|t| t.is_file()) {
@@ -160,8 +181,77 @@ pub fn discover(root: &Path, options: &DiscoveryOptions) -> Discovery {
 
     discovery.files.sort_by(|a, b| a.path.cmp(&b.path));
     discovery.skipped.sort_by(|a, b| a.path.cmp(&b.path));
-    discovery.unfollowed_links.sort();
+    discovery.skipped.dedup();
+    discovery.diagnostics.sort();
+    discovery.diagnostics.dedup();
     discovery
+}
+
+/// Records a path the walk could not read.
+///
+/// The path comes from the error when the walker managed to name one and falls
+/// back to the scan root when it did not, which is the most specific thing that
+/// can be said in that case. Either way the gap reaches the coverage statement.
+/// An unreadable directory used to be dropped with `continue` while a comment
+/// claimed it was counted, so every source file underneath it left no trace in
+/// any list or counter, the ratio still read zero, and the coverage gate passed.
+///
+/// Errors that are not about reading a path are a different thing: an ignore
+/// file with a pattern the walker rejects does not mean a file went unread, so
+/// it goes to diagnostics rather than to the coverage counters.
+fn record_walk_error(root: &Path, error: &ignore::Error, discovery: &mut Discovery) {
+    if !error.is_io() && !matches!(error, ignore::Error::Loop { .. }) {
+        discovery.diagnostics.push(format!("walk problem: {error}"));
+        return;
+    }
+
+    let path = walk_error_path(error)
+        .and_then(|p| p.strip_prefix(root).ok())
+        .filter(|p| !p.as_os_str().is_empty() && p.to_str().is_some())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    discovery.skipped.push(SkippedFile {
+        path,
+        reason: UnparsedReason::IoError,
+    });
+}
+
+/// The path a walk error is about, when it names one.
+///
+/// The walker wraps errors in layers that carry the depth or the line number, so
+/// the path sits underneath rather than on the outside.
+fn walk_error_path(error: &ignore::Error) -> Option<&Path> {
+    match error {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::Loop { child, .. } => Some(child),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            walk_error_path(err)
+        }
+        _ => None,
+    }
+}
+
+/// How a link the walk refused to follow is counted.
+///
+/// Links are not followed because a link back to an ancestor makes the walk
+/// unbounded and the walker cannot tell one from a shortcut before walking it.
+/// The consequence is that whatever the link points at went unread, and that has
+/// to be stated: a monorepo whose `services/shared` is a link into `libs/shared`
+/// used to produce a clean report with the linked tree never scanned, and the
+/// list that collected the links was written and never read by anything.
+///
+/// Of the eight reasons the contract fixes, `io_error` is the only one that says
+/// "this path belongs to the code surface and its contents were not obtained".
+/// A link whose own name is not a code file is counted the way a plain file of
+/// that name would be, so a linked README does not move the ratio.
+fn unfollowed_link_reason(absolute: &Path, relative: &Path) -> UnparsedReason {
+    let points_at_a_directory = std::fs::metadata(absolute).is_ok_and(|m| m.is_dir());
+    if points_at_a_directory || Language::from_path(relative).is_some() {
+        UnparsedReason::IoError
+    } else {
+        UnparsedReason::UnknownLanguage
+    }
 }
 
 fn classify_file(
@@ -250,7 +340,12 @@ mod tests {
 
     impl TempTree {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("periskop-discovery-{name}"));
+            // The process id is part of the name because the first thing this
+            // does is delete the directory. Two runs on one machine, or two
+            // users on a shared one, would otherwise remove each other's tree
+            // mid-test and produce a red result with no visible cause.
+            let dir = std::env::temp_dir()
+                .join(format!("periskop-discovery-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
             Self(dir)
@@ -417,6 +512,120 @@ mod tests {
         let found = discover(tree.path(), &DiscoveryOptions::default());
         assert!(found.files.is_empty());
         assert!(found.skipped.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_link_the_walk_will_not_follow_reaches_the_coverage_statement() {
+        // The error class this test catches: a linked source tree that is never
+        // scanned and never mentioned. The links used to be collected into a
+        // field that nothing in the workspace read, so the report came back
+        // clean with an entire subtree unvisited.
+        use std::os::unix::fs::symlink;
+
+        let tree = TempTree::new("links");
+        tree.write("real/app.py", b"pass\n");
+        tree.write("lib/client.py", b"pass\n");
+        tree.write("notes.txt", b"text\n");
+        symlink(tree.path().join("lib"), tree.path().join("shared")).unwrap();
+        symlink(
+            tree.path().join("real/app.py"),
+            tree.path().join("alias.py"),
+        )
+        .unwrap();
+        symlink(tree.path().join("notes.txt"), tree.path().join("alias.txt")).unwrap();
+
+        let found = discover(tree.path(), &DiscoveryOptions::default());
+        let reason_for = |name: &str| {
+            found
+                .skipped
+                .iter()
+                .find(|s| s.path == Path::new(name))
+                .map(|s| s.reason)
+        };
+
+        assert_eq!(reason_for("shared"), Some(UnparsedReason::IoError));
+        assert_eq!(reason_for("alias.py"), Some(UnparsedReason::IoError));
+        // A link to something that is not code is counted the way a plain file
+        // of that name would be, so it does not inflate the ratio.
+        assert_eq!(
+            reason_for("alias.txt"),
+            Some(UnparsedReason::UnknownLanguage)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_directory_that_cannot_be_read_moves_the_ratio() {
+        // The error class this test catches: an unreadable directory was skipped
+        // with `continue` while the comment beside it claimed the opposite. Every
+        // source file under it reached no list and no counter, the ratio stayed
+        // at zero, and the coverage gate passed on a tree nobody had read.
+        use std::os::unix::fs::PermissionsExt;
+
+        let tree = TempTree::new("unreadable");
+        tree.write("open/app.py", b"pass\n");
+        tree.write("closed/secret.py", b"pass\n");
+        let closed = tree.path().join("closed");
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let readable_anyway = fs::read_dir(&closed).is_ok();
+        let found = discover(tree.path(), &DiscoveryOptions::default());
+        // Restore before asserting, so a failure does not leave a directory the
+        // cleanup cannot remove.
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o755)).unwrap();
+
+        if readable_anyway {
+            // Running as a user that ignores the permission bits, so there is no
+            // walk error to observe. Saying so is better than asserting nothing.
+            assert!(found
+                .files
+                .iter()
+                .any(|f| f.path == Path::new("open/app.py")));
+            return;
+        }
+
+        assert!(
+            found
+                .skipped
+                .iter()
+                .any(|s| s.reason == UnparsedReason::IoError),
+            "the unreadable directory left no trace: {found:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_path_that_is_not_utf8_is_declared_rather_than_converted() {
+        // Lossy conversion maps different byte sequences onto one string, and
+        // that string feeds an egress point identity, so two files could collapse
+        // into one finding.
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tree = TempTree::new("nonutf8");
+        tree.write("fine.py", b"pass\n");
+        let bad = tree.path().join(OsStr::from_bytes(b"br\xffoken.py"));
+        let created = fs::write(&bad, b"pass\n").is_ok();
+
+        let found = discover(tree.path(), &DiscoveryOptions::default());
+        assert!(found.files.iter().any(|f| f.path == Path::new("fine.py")));
+
+        if !created {
+            // Some filesystems, APFS among them, reject a name that is not valid
+            // UTF-8 outright. There is nothing to observe here on those, and
+            // saying so beats asserting something that would always hold.
+            return;
+        }
+        assert_eq!(found.files.len(), 1, "{:?}", found.files);
+        assert!(
+            found
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("not valid UTF-8")),
+            "{:?}",
+            found.diagnostics
+        );
     }
 
     #[test]

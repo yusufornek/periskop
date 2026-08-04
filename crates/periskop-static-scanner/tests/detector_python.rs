@@ -5,11 +5,12 @@
 //! carries a different obligation, and the three together are what the project
 //! calls a complete test case for a detector.
 //!
-//! Positive fixtures must yield a confirmed finding. Negative fixtures must yield
-//! none, and this is the layer where that assertion becomes meaningful, because
-//! bindings are applied here rather than in the query. Evasion fixtures must yield
-//! nothing and are expected to: they record the limits of static analysis in a
-//! form that fails loudly if the limits ever move.
+//! Positive fixtures must yield a finding at the confidence they are listed with,
+//! which is not the same as "confirmed" for all of them. Negative fixtures must
+//! yield none, and this is the layer where that assertion becomes meaningful,
+//! because bindings are applied here rather than in the query. Evasion fixtures
+//! must yield nothing and are expected to: they record the limits of static
+//! analysis in a form that fails loudly if the limits ever move.
 
 use std::path::{Path, PathBuf};
 
@@ -64,19 +65,104 @@ fn fixtures(group: &str) -> Vec<(String, String)> {
         }
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
+    // An empty group would let every assertion below pass without running once.
+    assert!(!out.is_empty(), "no fixtures under {}", dir.display());
     out
 }
 
+/// The confidence each positive fixture is expected to come back with.
+///
+/// Named per fixture rather than asserted in bulk, because the fixtures no longer
+/// agree. A rule whose distinguishing condition is a regular expression over the
+/// text of a string literal cannot claim a structural fact, so it reports
+/// `suspect` and the fixture exercising it comes back weaker by design. A blanket
+/// "every positive fixture is confirmed" would have to be loosened to a "some
+/// finding exists" check to let that pass, and loosening it would stop watching
+/// the fixtures that must stay confirmed. This table keeps both statements.
+const EXPECTED_CONFIDENCE: &[(&str, Confidence)] = &[
+    ("anthropic_messages.py", Confidence::Confirmed),
+    ("google_genai.py", Confidence::Confirmed),
+    // Matched on the text of a URL, so the provider claim is a text coincidence
+    // away from being wrong.
+    ("http_literal.py", Confidence::Suspect),
+    ("openai_client.py", Confidence::Confirmed),
+    // The client held in an instance field: resolved through the binding table,
+    // so this is a structural fact and stays confirmed.
+    ("openai_client_field.py", Confidence::Confirmed),
+    ("openai_legacy.py", Confidence::Confirmed),
+];
+
 #[test]
-fn positive_fixtures_produce_confirmed_findings() {
+fn every_positive_fixture_produces_the_confidence_it_is_listed_with() {
     for (name, source) in fixtures("positive") {
         let hits = scan(&source, &name);
         assert!(!hits.is_empty(), "{name} produced no finding");
+        let Some((_, expected)) = EXPECTED_CONFIDENCE.iter().find(|(f, _)| *f == name) else {
+            panic!(
+                "{name} is a positive fixture with no entry in EXPECTED_CONFIDENCE; \
+                 a new fixture states what it expects rather than inheriting it"
+            );
+        };
+        // Every finding, not merely one of them. "At least one is confirmed" was
+        // what let a weaker finding hide behind a stronger one from another rule;
+        // naming the whole set is what makes the http fixture's downgrade visible
+        // here instead of only in the benchmark.
+        let unexpected: Vec<&(String, Confidence)> =
+            hits.iter().filter(|(_, c)| c != expected).collect();
         assert!(
-            hits.iter().any(|(_, c)| *c == Confidence::Confirmed),
-            "{name} produced only weak findings: {hits:?}"
+            unexpected.is_empty(),
+            "{name} is listed as {expected:?} but also produced {unexpected:?}"
         );
     }
+}
+
+#[test]
+fn every_listed_fixture_still_exists() {
+    // Stops the table above from outliving the files it describes, which would
+    // leave a fixture silently unasserted.
+    let present: Vec<String> = fixtures("positive").into_iter().map(|(n, _)| n).collect();
+    let missing: Vec<&str> = EXPECTED_CONFIDENCE
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !present.iter().any(|p| p == name))
+        .collect();
+    assert!(missing.is_empty(), "listed but absent: {missing:?}");
+}
+
+#[test]
+fn a_client_kept_in_an_instance_field_is_reported() {
+    // The shape most Python classes use. It resolved to nothing before, so a file
+    // making plain OpenAI calls through a field reported no egress at all: not a
+    // weaker finding, no finding, and no coverage entry either.
+    let source = "from openai import OpenAI\n\
+                  class Summarizer:\n\
+                  \x20   def __init__(self):\n\
+                  \x20       self.client = OpenAI()\n\
+                  \x20   def run(self, text):\n\
+                  \x20       return self.client.chat.completions.create(model='x', messages=text)\n";
+    let hits = scan(source, "field.py");
+    assert!(
+        hits.iter().any(
+            |(rule_id, confidence)| rule_id == "python.static.openai-client-call"
+                && *confidence == Confidence::Confirmed
+        ),
+        "expected a confirmed finding for the field held client, got {hits:?}"
+    );
+}
+
+#[test]
+fn a_field_holding_an_unrelated_class_is_not_reported() {
+    // The other half of the field case. Tracking fields must not turn every
+    // `self.<name>.create(...)` in a codebase into a provider finding.
+    let source = "class Store:\n\
+                  \x20   def create(self, **fields):\n\
+                  \x20       return fields\n\
+                  class Repo:\n\
+                  \x20   def __init__(self):\n\
+                  \x20       self.client = Store()\n\
+                  \x20   def run(self, text):\n\
+                  \x20       return self.client.create(payload=text)\n";
+    assert!(scan(source, "field_negative.py").is_empty());
 }
 
 #[test]

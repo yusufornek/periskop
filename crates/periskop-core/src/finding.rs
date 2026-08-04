@@ -25,6 +25,24 @@ pub enum Source {
     Reconciled,
 }
 
+impl Source {
+    /// The spelling the contract fixes, and the one the identity is derived from.
+    ///
+    /// One function rather than a `match` at each use site. The finding identity
+    /// hashes this string, so a second hand written copy that fell out of step
+    /// with the serde name would keep emitting the old spelling into the hash
+    /// while the JSON carried the new one. Findings would then stop matching
+    /// across versions with nothing in the report to show why.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Declared => "declared",
+            Self::ObservedApp => "observed-app",
+            Self::ObservedWire => "observed-wire",
+            Self::Reconciled => "reconciled",
+        }
+    }
+}
+
 /// What kind of claim this is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -89,6 +107,23 @@ pub enum RefType {
 pub struct EntityRef {
     pub ref_type: RefType,
     pub ref_id: String,
+}
+
+impl EntityRef {
+    /// Rejects a reference whose identity does not match the type it declares.
+    ///
+    /// The schema pins each reference type to its own prefix, but nothing
+    /// validates a report against the schema while it is being built, so a
+    /// mismatch used to travel all the way into the finding identity and out to
+    /// disk. The only place it would have surfaced is an external validator run
+    /// against sample files rather than against real output.
+    pub fn validate(&self) -> crate::Result<()> {
+        match self.ref_type {
+            RefType::EgressPoint => crate::ids::EgressPointId::parse(&self.ref_id).map(drop),
+            RefType::EgressEvent => crate::ids::EgressEventId::parse(&self.ref_id).map(drop),
+            RefType::Flow => crate::ids::FlowId::parse(&self.ref_id).map(drop),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -196,15 +231,10 @@ impl Finding {
         detector: Detector,
     ) -> crate::Result<Self> {
         let source = kind.required_source();
-        let source_str = match source {
-            Source::Declared => "declared",
-            Source::ObservedApp => "observed-app",
-            Source::ObservedWire => "observed-wire",
-            Source::Reconciled => "reconciled",
-        };
+        primary_ref.validate()?;
         let finding_id = crate::ids::derive_finding_id(
             kind.as_str(),
-            source_str,
+            source.as_str(),
             &primary_ref.ref_id,
             &detector.rule_id,
         )?;
@@ -326,6 +356,57 @@ mod tests {
         // forbids unknown shapes and a null would fail validation.
         assert!(json.get("egress_kind").is_none());
         assert!(json.get("location").is_none());
+    }
+
+    #[test]
+    fn every_source_serializes_to_the_string_the_identity_uses() {
+        // The bug this pins: the identity used to be derived from a second hand
+        // written copy of these four spellings. Renaming one on the serde side
+        // would have changed the JSON while the hash kept the old value, and the
+        // existing shape test only ever looked at `declared`.
+        for source in [
+            Source::Declared,
+            Source::ObservedApp,
+            Source::ObservedWire,
+            Source::Reconciled,
+        ] {
+            let json = serde_json::to_value(source).unwrap();
+            assert_eq!(json, serde_json::Value::String(source.as_str().to_owned()));
+        }
+    }
+
+    #[test]
+    fn a_reference_id_that_contradicts_its_type_is_refused() {
+        // An egress point identity under a flow reference passed straight through
+        // and became part of the finding identity, so the report carried an
+        // identifier the contract forbids and nothing in the run noticed.
+        let build = |ref_type: RefType, ref_id: &str| {
+            Finding::new(
+                Kind::DeclaredEgressPoint,
+                Confidence::Confirmed,
+                "openai",
+                EntityRef {
+                    ref_type,
+                    ref_id: ref_id.to_owned(),
+                },
+                Evidence {
+                    evidence_type: EvidenceType::AstNode,
+                    r#ref: "call@a.py".to_owned(),
+                    hash: None,
+                },
+                Detector {
+                    component: Component::StaticScanner,
+                    rule_id: "python.static.x".to_owned(),
+                    rule_version: "1.0.0".to_owned(),
+                    rule_hash: "0".repeat(64),
+                },
+            )
+        };
+
+        assert!(build(RefType::Flow, "ep_3f0a91c7d4e28b56").is_err());
+        assert!(build(RefType::EgressPoint, "ep_QQ").is_err());
+        assert!(build(RefType::EgressPoint, "ep_3f0a91c7d4e28b56").is_ok());
+        assert!(build(RefType::Flow, "fl_3f0a91c7d4e28b56").is_ok());
     }
 
     #[test]

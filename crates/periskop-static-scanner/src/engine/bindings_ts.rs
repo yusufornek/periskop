@@ -9,10 +9,17 @@
 //! Instantiation is also spelled differently. `new OpenAI()` is a distinct node
 //! from an ordinary call, so following it needs its own branch rather than
 //! falling out of the call handling for free.
+//!
+//! And it is written in three places, not one. A module level `const` is what a
+//! script does; a class holds the client in a field, and the field is written
+//! either as a class property or as an assignment to `this` in the constructor.
+//! The two class spellings are different node kinds and neither falls out of the
+//! declaration handling, so each needs its own branch. Skipping them meant
+//! skipping the shape most application code is actually written in.
 
 use tree_sitter::Node;
 
-use crate::engine::bindings::BindingTable;
+use crate::engine::bindings::{field_key, BindingTable, JS_THIS};
 
 /// Builds the binding table for one parsed TypeScript or JavaScript file.
 pub fn collect(root: Node<'_>, source: &str) -> BindingTable {
@@ -35,8 +42,8 @@ pub fn collect(root: Node<'_>, source: &str) -> BindingTable {
     // depend on are already known regardless of source order.
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if matches!(node.kind(), "lexical_declaration" | "variable_declaration") {
-            collect_instantiation(node, source, &mut table);
+        for (key, value) in instantiation_targets(node, source) {
+            bind_instantiation(key, value, source, &mut table);
         }
         stack.extend(node.children(&mut cursor));
     }
@@ -122,35 +129,89 @@ fn collect_declaration(node: Node<'_>, source: &str, table: &mut BindingTable) {
     }
 }
 
-/// `const client = new OpenAI()` and `const client = new genai.Client()`.
-fn collect_instantiation(node: Node<'_>, source: &str, table: &mut BindingTable) {
-    for (name, value) in declarators(node) {
-        if value.kind() != "new_expression" {
-            continue;
+/// Every name this node assigns to, paired with the value it assigns.
+///
+/// Three shapes reach the same place. `const client = new OpenAI()` binds a local.
+/// `client = new OpenAI()` written in a class body and `this.client = new OpenAI()`
+/// written in a constructor both bind the same field, so both produce the same
+/// qualified key and a call site does not have to know which spelling was used.
+fn instantiation_targets<'t>(node: Node<'t>, source: &str) -> Vec<(String, Node<'t>)> {
+    match node.kind() {
+        "lexical_declaration" | "variable_declaration" => declarators(node)
+            .into_iter()
+            .map(|(name, value)| (text(name, source), value))
+            .collect(),
+        "public_field_definition" | "field_definition" => {
+            class_field_target(node, source).into_iter().collect()
         }
-        let Some(constructor) = value.child_by_field_name("constructor") else {
-            continue;
-        };
-        let resolved = match constructor.kind() {
-            "identifier" => table
-                .resolve(&text(constructor, source))
-                .map(|path| as_constructed(path, table)),
-            "member_expression" => {
-                let (Some(object), Some(property)) = (
-                    constructor.child_by_field_name("object"),
-                    constructor.child_by_field_name("property"),
-                ) else {
-                    continue;
-                };
-                table
-                    .resolve(&text(object, source))
-                    .map(|base| format!("{base}.{}", text(property, source)))
-            }
-            _ => None,
-        };
-        if let Some(path) = resolved {
-            table.bind(text(name, source), path);
+        "assignment_expression" => this_field_target(node, source).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `class S { private client = new OpenAI(); }`
+///
+/// TypeScript calls the field's name `name` and JavaScript calls it `property`,
+/// so both are tried. A resolver that knew only one of the two would keep seeing
+/// class fields in one language and silently stop in the other.
+fn class_field_target<'t>(node: Node<'t>, source: &str) -> Option<(String, Node<'t>)> {
+    let name = node
+        .child_by_field_name("name")
+        .or_else(|| node.child_by_field_name("property"))?;
+    let value = node.child_by_field_name("value")?;
+    Some((field_key(JS_THIS, &text(name, source)), value))
+}
+
+/// `this.client = new OpenAI()`, the constructor spelling of the same field.
+///
+/// Only `this` is followed. An assignment into any other object writes a field
+/// whose readers reach it through a name this pass never sees, so binding it
+/// would be a guess rather than one more resolution step.
+fn this_field_target<'t>(node: Node<'t>, source: &str) -> Option<(String, Node<'t>)> {
+    let left = node.child_by_field_name("left")?;
+    let right = node.child_by_field_name("right")?;
+    if left.kind() != "member_expression" {
+        return None;
+    }
+    // The grammar gives `this` a node kind of its own, named after the keyword.
+    if left.child_by_field_name("object")?.kind() != "this" {
+        return None;
+    }
+    let property = left.child_by_field_name("property")?;
+    Some((field_key(JS_THIS, &text(property, source)), right))
+}
+
+/// Binds one name to what `new` on the right hand side constructs.
+///
+/// Anything other than a direct `new` is left unresolved. A value handed back by
+/// a factory says nothing about which package built it, and guessing there would
+/// put an unearned provider behind a confirmed finding.
+fn bind_instantiation(key: String, value: Node<'_>, source: &str, table: &mut BindingTable) {
+    if value.kind() != "new_expression" {
+        return;
+    }
+    let Some(constructor) = value.child_by_field_name("constructor") else {
+        return;
+    };
+    let resolved = match constructor.kind() {
+        "identifier" => table
+            .resolve(&text(constructor, source))
+            .map(|path| as_constructed(path, table)),
+        "member_expression" => {
+            let (Some(object), Some(property)) = (
+                constructor.child_by_field_name("object"),
+                constructor.child_by_field_name("property"),
+            ) else {
+                return;
+            };
+            table
+                .resolve(&text(object, source))
+                .map(|base| format!("{base}.{}", text(property, source)))
         }
+        _ => None,
+    };
+    if let Some(path) = resolved {
+        table.bind(key, path);
     }
 }
 
@@ -285,5 +346,74 @@ mod tests {
     fn namespace_import_binds_the_module() {
         let t = table_for("import * as openai from 'openai';\n", Language::TypeScript);
         assert_eq!(t.resolve("openai"), Some("openai"));
+    }
+
+    #[test]
+    fn a_field_assigned_in_the_constructor_binds_under_this() {
+        let t = table_for(
+            "import OpenAI from 'openai';\n\
+             class Summariser {\n  constructor() { this.client = new OpenAI(); }\n}\n",
+            Language::TypeScript,
+        );
+        assert!(t.satisfies("this.client", "openai", &["default".to_owned()]));
+    }
+
+    #[test]
+    fn a_class_property_binds_under_the_same_key_as_the_constructor_form() {
+        // The two spellings are different node kinds and the same value. A call
+        // site cannot tell them apart, so neither may the table.
+        let t = table_for(
+            "import OpenAI from 'openai';\n\
+             class Summariser {\n  private client = new OpenAI();\n}\n",
+            Language::TypeScript,
+        );
+        assert!(t.satisfies("this.client", "openai", &["default".to_owned()]));
+    }
+
+    #[test]
+    fn a_javascript_class_field_binds_too() {
+        // JavaScript names the field node differently from TypeScript, so this is
+        // a separate branch rather than the same one seen twice.
+        let t = table_for(
+            "const OpenAI = require('openai');\n\
+             class Summariser {\n  client = new OpenAI();\n}\n",
+            Language::JavaScript,
+        );
+        assert!(t.satisfies("this.client", "openai", &["default".to_owned()]));
+    }
+
+    #[test]
+    fn a_field_holding_a_local_class_resolves_to_nothing() {
+        let t = table_for(
+            "class Store {}\nclass S {\n  constructor() { this.client = new Store(); }\n}\n",
+            Language::TypeScript,
+        );
+        assert!(!t.satisfies("this.client", "openai", &["default".to_owned()]));
+    }
+
+    #[test]
+    fn a_field_on_another_object_is_not_bound() {
+        // `ctx` may not even be owned by this file, and the call sites reading it
+        // are reached through a name this pass never sees.
+        let t = table_for(
+            "import OpenAI from 'openai';\n\
+             function boot(ctx) { ctx.client = new OpenAI(); }\n",
+            Language::TypeScript,
+        );
+        assert_eq!(t.resolve("ctx.client"), None);
+        assert_eq!(t.resolve("this.client"), None);
+    }
+
+    #[test]
+    fn a_local_and_a_field_of_the_same_name_stay_apart() {
+        let t = table_for(
+            "import OpenAI from 'openai';\n\
+             class Store {}\n\
+             const client = new Store();\n\
+             class S {\n  constructor() { this.client = new OpenAI(); }\n}\n",
+            Language::TypeScript,
+        );
+        assert_eq!(t.resolve("client"), None);
+        assert!(t.satisfies("this.client", "openai", &["default".to_owned()]));
     }
 }

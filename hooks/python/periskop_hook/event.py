@@ -7,20 +7,20 @@ rejected downstream rather than quietly accepted.
 `egress_event_id` is derived from the call shape and not from a counter. Two
 processes recording the same call therefore agree on its identity, which is what
 lets reconciliation join runtime events with static findings, and what keeps the
-output diffable (CLAUDE.md: deterministic output).
+output diffable (CLAUDE.md: deterministic output). The derivation itself is
+normative and lives in `event_id.py`, not here: it has to be byte identical
+across the python hook, the node hook and the collector.
 """
 
-import hashlib
 import os
 import sys
 
+from . import event_id
 from .target import TARGET_NOT_RESOLVED, UNRESOLVED_HOST
 
 SCHEMA_VERSION = "1.0"
 CALL_SITE_UNAVAILABLE = "call_site_unavailable"
 
-_ID_PREFIX = "ee_"
-_ID_BYTES = 8            # 16 hex characters, as the schema pattern requires
 _MAX_STACK_FRAMES = 12
 
 
@@ -57,29 +57,6 @@ def call_site(package_root, root):
     return None
 
 
-def _identity(process, library, operation, target, field_paths, site):
-    """Canonical string the event id hashes.
-
-    Size is excluded: the same call with a longer prompt is the same call, and
-    an id that changed with the payload would defeat deduplication.
-    """
-    parts = [
-        process.get("entrypoint_hint", ""),
-        process.get("language", ""),
-        library.get("module", ""),
-        library.get("mechanism", ""),
-        operation,
-        target.get("host_id", ""),
-        str(target.get("port", "")),
-        target.get("path_template", ""),
-        target.get("provider_ref", ""),
-        ";".join(field_paths),
-        (site or {}).get("path", ""),
-        (site or {}).get("symbol", ""),
-    ]
-    return "|".join(parts)
-
-
 def build(module, mechanism, operation, target, payload_shape, entrypoint_hint,
           site=None, extra_reasons=()):
     """Assemble an egress event dictionary."""
@@ -97,8 +74,12 @@ def build(module, mechanism, operation, target, payload_shape, entrypoint_hint,
 
     event = {
         "schema_version": SCHEMA_VERSION,
-        "egress_event_id": _event_id(
-            process, library, operation, target, payload_shape.field_paths, site
+        # Only the four fields the schema names take part. Size, entrypoint and
+        # call site are excluded on purpose: the same call with a longer prompt,
+        # from a different worker, is the same call, and an identity that moved
+        # with any of them would defeat deduplication.
+        "egress_event_id": event_id.derive(
+            module, operation, target.get("host_id"), target.get("path_template")
         ),
         "process": process,
         "library": library,
@@ -115,9 +96,3 @@ def build(module, mechanism, operation, target, payload_shape, entrypoint_hint,
     if reasons:
         event["degraded_reasons"] = sorted(reasons)
     return event
-
-
-def _event_id(process, library, operation, target, field_paths, site):
-    identity = _identity(process, library, operation, target, field_paths, site)
-    digest = hashlib.blake2b(identity.encode("utf-8"), digest_size=_ID_BYTES)
-    return _ID_PREFIX + digest.hexdigest()

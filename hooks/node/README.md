@@ -52,8 +52,20 @@ One directory, two files per process:
 
 | File | Contents |
 |---|---|
-| `node-<pid>.ndjson` | One egress event per line, each valid against `egress-event.schema.json` |
-| `node-<pid>.status.json` | What the hook itself did: whether it was active, how many events it recorded, how many it dropped, how many internal failures it swallowed |
+| `node-<pid>-<random>.jsonl` | One egress event per line, each valid against `egress-event.schema.json` |
+| `node-<pid>-<random>.jsonl.status.json` | What the hook itself did: whether it was active, how many events it recorded, how many it dropped, how many internal failures it swallowed |
+
+The destination is a **directory**, not a file path, because that is what the
+event schema fixes and because multi process work then needs no coordination:
+every process picks its own file inside it. A file path would make the caller
+responsible for inventing a unique name per worker, and two processes appending
+to one file interleave their writes and corrupt lines. The name carries a random
+suffix as well as the pid, because pids are reused and a new run must not append
+to a finished one's stream.
+
+The `.jsonl` extension is load bearing: `periskop-runtime-collector` selects
+event files by it and ignores everything else. That is also why the status file
+ends in `.json` rather than `.jsonl`.
 
 The status file is separate on purpose. The event schema is a closed set of
 properties, so a status line written into the event stream would make that
@@ -61,12 +73,32 @@ stream fail its own contract. Keeping the two apart also preserves the
 difference between "no calls were made" and "the hook never ran", which is a
 difference a coverage report has to be able to state.
 
+## Event identity
+
+`egress_event_id` is derived, never counted, and the derivation is fixed by
+`schemas/egress-event.schema.json`:
+
+```
+ee_ + blake3("ee/v1" | library.module | operation | target.host_id
+             | target.path_template)[:8] as lowercase hex
+```
+
+with byte `0x1F` between the fields and an absent field written as the empty
+string. Nothing else takes part: not the clock, not the pid, not the payload
+size, not the call site. The same call recorded twice therefore carries one
+identity, in this hook, in the python hook and in the collector. BLAKE3 is
+written out in `src/blake3.ts` because `node:crypto` does not have it and a hook
+loaded into somebody else's process may not drag in an npm package; it is held
+to the official reference vectors in `src/blake3.test.ts`, and the identity
+itself is pinned to vectors shared with the python suite in `src/event-id.test.ts`.
+
 ## Environment variables
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `PERISKOP_HOOK` | unset | Set to `0` to turn the hook off completely. Checked before anything else, so a disabled hook costs one lookup |
-| `PERISKOP_HOOK_DIR` | `<tmpdir>/periskop-events` | Directory the event stream and status file are written to |
+| `PERISKOP_EVENT_DIR` | `<tmpdir>/periskop-events` | Directory the event stream and status file are written to, one `.jsonl` file per process |
+| `PERISKOP_HOOK_DIR` | unset | Legacy name for the same directory. Kept so an existing deployment survives an upgrade; `PERISKOP_EVENT_DIR` wins when both are set |
 | `PERISKOP_HOOK_ENTRYPOINT` | basename of `argv[1]` | Name for this process in the event. Never a path; the schema rejects absolute paths in this field |
 | `PERISKOP_HOOK_BODY_LIMIT` | `65536` | Bodies larger than this are not parsed for field paths. The event declares the omission rather than reporting an empty shape |
 | `PERISKOP_HOOK_BUFFER` | `1024` | Events held in memory before the oldest are dropped. Drops are counted in the status file |
@@ -164,9 +196,11 @@ an egress source.
 - A client that bypasses these layers, for example one built directly on
   `node:tls` or a native module, is not seen. Detection for that case falls to
   the network sensor.
-- `call_shape_hash` cannot be produced here: it is defined over a syntax tree,
-  and a transport hook sees a socket. It is left empty in the identity input
-  rather than invented.
+- `library.module` is the transport this hook sat on (`node:http`, `node:https`
+  or `undici`), not the SDK the application called. The identity is derived from
+  it, so an event recorded here and an event recorded by an SDK level hook for
+  the same call carry different identities. Reconciliation joins them through the
+  target and the operation, which is why both are in the derivation.
 - A body written in more than one piece is counted but not reassembled, so its
   field paths are unavailable. Putting the pieces back together is exactly the
   copy this hook exists to avoid.

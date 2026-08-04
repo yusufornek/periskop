@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::clock::ClockError;
 use crate::scan;
 
 /// Error codes from the JSON-RPC specification, plus one of our own.
@@ -85,7 +86,7 @@ pub fn serve(
     mut output: impl Write,
     rules_root: PathBuf,
     tool_version: &str,
-    now: impl Fn() -> String,
+    now: impl Fn() -> Result<String, ClockError>,
 ) -> std::io::Result<()> {
     for line in input.lines() {
         let line = line?;
@@ -108,7 +109,7 @@ fn handle(
     line: &str,
     rules_root: &Path,
     tool_version: &str,
-    now: &impl Fn() -> String,
+    now: &impl Fn() -> Result<String, ClockError>,
 ) -> Option<Response> {
     let request: Request = match serde_json::from_str(line) {
         Ok(request) => request,
@@ -156,7 +157,7 @@ fn scan_method(
     params: &Value,
     rules_root: &Path,
     tool_version: &str,
-    now: &impl Fn() -> String,
+    now: &impl Fn() -> Result<String, ClockError>,
 ) -> Response {
     let Some(path) = params.get("path").and_then(Value::as_str) else {
         return Response::err(id, code::INVALID_PARAMS, "params.path is required");
@@ -166,11 +167,19 @@ fn scan_method(
         return Response::err(id, code::SCAN_FAILED, format!("{path} is not a directory"));
     }
 
+    // A clock the machine cannot express is answered rather than papered over.
+    // Stamping the report with the epoch would put an invented date in the
+    // envelope and the editor would show it as fact.
+    let generated_at = match now() {
+        Ok(now) => now,
+        Err(e) => return Response::err(id, code::SCAN_FAILED, e.to_string()),
+    };
+
     let outcome = scan::run(scan::ScanRequest {
         project_root: &project_root,
         rules_root,
         tool_version,
-        generated_at: now(),
+        generated_at,
     });
 
     match serde_json::to_value(&outcome.report) {
@@ -196,7 +205,7 @@ mod tests {
             &mut out,
             PathBuf::from("rules"),
             "0.0.0-test",
-            || "2026-08-04T09:00:00Z".to_owned(),
+            || Ok("2026-08-04T09:00:00Z".to_owned()),
         )
         .unwrap();
         String::from_utf8(out).unwrap()
@@ -252,6 +261,55 @@ mod tests {
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"scan\",\"params\":{\"path\":\"/nonexistent-xyz\"}}\n",
         );
         assert!(out.contains("-32000"), "{out}");
+    }
+
+    #[test]
+    fn a_rule_set_that_did_not_load_reaches_the_editor() {
+        // The error class this test catches: the bridge used to drop the rule
+        // errors on the floor. On the command line they printed to stderr; over
+        // this path they went nowhere, so an editor showed zero findings, no
+        // warning, and no way for the user to know detection never ran.
+        let project = std::env::temp_dir().join(format!("periskop-rpc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&project);
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("app.py"), "import openai\n").unwrap();
+
+        let mut out = Vec::new();
+        serve(
+            Cursor::new(format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"scan\",\"params\":{{\"path\":{}}}}}\n",
+                serde_json::to_string(&project.to_string_lossy()).unwrap()
+            )),
+            &mut out,
+            PathBuf::from("this-rule-directory-does-not-exist"),
+            "0.0.0-test",
+            || Ok("2026-08-04T09:00:00Z".to_owned()),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&project);
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("RULE_LOAD_ERROR"), "{text}");
+        assert!(text.contains("\"verdict\":\"FAIL\""), "{text}");
+    }
+
+    #[test]
+    fn a_clock_that_cannot_be_read_is_answered_rather_than_stamped() {
+        let mut out = Vec::new();
+        serve(
+            Cursor::new(
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"scan\",\"params\":{\"path\":\".\"}}\n",
+            ),
+            &mut out,
+            PathBuf::from("rules"),
+            "0.0.0-test",
+            || Err(ClockError::BeforeEpoch),
+        )
+        .unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("-32000"), "{text}");
+        assert!(text.contains("unix epoch"), "{text}");
     }
 
     #[test]

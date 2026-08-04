@@ -9,11 +9,16 @@
 use std::path::{Path, PathBuf};
 
 use periskop_core::coverage::UnparsedReason;
+use periskop_report::coverage::RuntimeStatus;
 use periskop_report::report::DiagnosticCode;
 use periskop_report::{to_canonical_json, Verdict};
 
-#[path = "../src/scan.rs"]
-mod scan;
+// The crate's own module, not a second copy of the file. A `#[path]` include
+// compiled `scan.rs` again inside this binary, so the tests exercised a
+// duplicate rather than the surface the binary and the rpc bridge use, and the
+// day that module touched something only `main.rs` provides they would have
+// stopped compiling for a reason that reads as unrelated.
+use periskop_cli::scan;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -155,10 +160,95 @@ fn the_coverage_block_is_filled_in_not_just_present() {
         !coverage.runtime_coverage.is_empty(),
         "runtime status must be stated, since an empty list reads as though a hook ran and found nothing"
     );
-    assert!(coverage
+
+    // What this pins is that a status is declared for every language the scan
+    // saw. The value itself is not pinned any more: the old assertion demanded
+    // `not_instrumented`, which the contract defines as a mechanism that exists
+    // and was not switched on. No hook mechanism exists in this build, so that
+    // was a false statement held in place by a test, and correcting the code
+    // would have looked like breaking it.
+    let languages: Vec<&str> = coverage
         .runtime_coverage
         .iter()
-        .all(|r| r.status == periskop_report::coverage::RuntimeStatus::NotInstrumented));
+        .map(|r| r.language.as_str())
+        .collect();
+    assert!(
+        languages.contains(&"python"),
+        "the fixtures are Python and no Python line was declared: {languages:?}"
+    );
+    assert!(
+        coverage
+            .runtime_coverage
+            .iter()
+            .all(|r| r.status == RuntimeStatus::Unsupported),
+        "this build defines no hook mechanism, so every language is unsupported \
+         rather than merely uninstrumented: {:?}",
+        coverage.runtime_coverage
+    );
+}
+
+#[test]
+fn a_call_whose_destination_cannot_be_read_is_declared_unresolved() {
+    // The error class this test catches: `[extract]` and `[[classify.downgrade]]`
+    // were parsed, validated, and then read by nothing. A client pointed at a
+    // base_url the scanner cannot see was reported as confirmed anyway, and
+    // coverage.unresolved_targets came back empty in every report the tool had
+    // ever produced, so one of the three coverage promises went unkept.
+    let tree = TempTree::new("unresolved-target");
+    tree.write(
+        "project/app.py",
+        "import os\nfrom openai import OpenAI\n\nclient = OpenAI(base_url=os.environ[\"LLM_URL\"])\n\n\ndef ask(record):\n    return client.chat.completions.create(model=\"gpt-4\", messages=[{\"content\": record}])\n",
+    );
+
+    let outcome = run_in(
+        &tree.path("project"),
+        &repo_root().join("rules"),
+        "2026-08-04T09:00:00Z",
+    );
+    let report = &outcome.report;
+
+    assert!(
+        report.findings.is_empty(),
+        "a destination the scanner cannot read must not stay confirmed: {:?}",
+        report.findings
+    );
+    assert_eq!(report.suspect_findings.len(), 1, "{:?}", report);
+    assert_eq!(
+        report.coverage.unresolved_targets.len(),
+        1,
+        "{:?}",
+        report.coverage.unresolved_targets
+    );
+    let target = &report.coverage.unresolved_targets[0];
+    assert_eq!(
+        target.reason,
+        periskop_report::coverage::UnresolvedReason::EnvVar
+    );
+    assert_eq!(
+        target.egress_point_id, report.suspect_findings[0].refs[0].ref_id,
+        "the coverage entry has to name the egress point it is about"
+    );
+}
+
+#[test]
+fn a_destination_the_scanner_can_read_stays_confirmed() {
+    // The other half of the downgrade: a client that does not override the base
+    // url uses the library default, which is a determinate destination. Treating
+    // an absent keyword as unresolved would weaken every ordinary call.
+    let tree = TempTree::new("resolved-target");
+    tree.write(
+        "project/app.py",
+        "from openai import OpenAI\n\nclient = OpenAI()\n\n\ndef ask(record):\n    return client.chat.completions.create(model=\"gpt-4\", messages=[{\"content\": record}])\n",
+    );
+
+    let outcome = run_in(
+        &tree.path("project"),
+        &repo_root().join("rules"),
+        "2026-08-04T09:00:00Z",
+    );
+
+    assert_eq!(outcome.report.findings.len(), 1, "{:?}", outcome.report);
+    assert!(outcome.report.coverage.unresolved_targets.is_empty());
 }
 
 #[test]
@@ -289,10 +379,41 @@ fn files_of_a_language_with_no_rules_are_declared_unparsed_not_counted_as_scanne
 fn no_absolute_path_reaches_the_report() {
     // An absolute path would embed the build machine into output that is supposed
     // to compare equal across machines.
-    let json = to_canonical_json(&run("2026-08-04T09:00:00Z").report).unwrap();
-    assert!(
-        !json.contains("/Users/"),
-        "absolute path leaked into report"
+    //
+    // Checked structurally rather than by searching for `/Users/` and `/home/`.
+    // Those two strings are the layout of two operating systems; a leak under
+    // `/root`, `/var/lib` or `C:\Users` went straight through.
+    let report = run("2026-08-04T09:00:00Z").report;
+
+    let mut paths: Vec<String> = report
+        .findings
+        .iter()
+        .chain(report.suspect_findings.iter())
+        .filter_map(|f| f.location.as_ref())
+        .filter_map(|l| l.path.clone())
+        .collect();
+    paths.extend(
+        report
+            .coverage
+            .unparsed_files
+            .iter()
+            .map(|f| f.path.clone()),
     );
-    assert!(!json.contains("/home/"), "absolute path leaked into report");
+    assert!(!paths.is_empty(), "nothing to check");
+
+    for path in &paths {
+        assert!(
+            Path::new(path).is_relative(),
+            "absolute path leaked into report: {path}"
+        );
+        assert!(
+            !path.starts_with('/') && !path.starts_with('\\'),
+            "rooted path leaked into report: {path}"
+        );
+        let windows_drive = path
+            .as_bytes()
+            .get(1)
+            .is_some_and(|b| *b == b':' && path.is_char_boundary(1));
+        assert!(!windows_drive, "drive qualified path leaked: {path}");
+    }
 }

@@ -37,32 +37,36 @@ class ActivationTest(unittest.TestCase):
 
 
 class ConfigTest(unittest.TestCase):
+    """The parts of the configuration that are not about the destination.
+
+    The transport itself is covered in test_config.py.
+    """
+
+    def _environ(self, **extra):
+        environ = {config.EVENT_DIR: "/tmp/periskop-events"}
+        environ.update(extra)
+        return environ
+
     def test_no_output_means_no_hook(self):
         self.assertIsNone(config.load({}, ["/app/worker.py"]))
 
     def test_entrypoint_hint_is_never_an_absolute_path(self):
         settings = config.load(
-            {"PERISKOP_HOOK_OUTPUT": "/tmp/events.jsonl"},
-            ["/srv/app/billing_worker.py"],
-        )
+            self._environ(), ["/srv/app/billing_worker.py"])
         self.assertEqual("billing_worker", settings.entrypoint_hint)
 
     def test_explicit_entrypoint_wins(self):
         settings = config.load(
-            {"PERISKOP_HOOK_OUTPUT": "/tmp/events.jsonl",
-             "PERISKOP_HOOK_ENTRYPOINT": "billing-worker"},
+            self._environ(PERISKOP_HOOK_ENTRYPOINT="billing-worker"),
             ["/srv/app/main.py"],
         )
         self.assertEqual("billing-worker", settings.entrypoint_hint)
 
     def test_a_broken_buffer_size_falls_back_instead_of_failing(self):
         for raw in ("nonsense", "0", "-4", None):
-            settings = config.load(
-                {"PERISKOP_HOOK_OUTPUT": "/tmp/events.jsonl",
-                 "PERISKOP_HOOK_BUFFER": raw} if raw is not None
-                else {"PERISKOP_HOOK_OUTPUT": "/tmp/events.jsonl"},
-                ["/app/worker.py"],
-            )
+            environ = (self._environ() if raw is None
+                       else self._environ(PERISKOP_HOOK_BUFFER=raw))
+            settings = config.load(environ, ["/app/worker.py"])
             self.assertGreater(settings.buffer_capacity, 0)
 
 

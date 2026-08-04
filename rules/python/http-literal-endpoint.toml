@@ -12,6 +12,20 @@
 #
 # A URL assembled at runtime does not match here at all. That is a known gap
 # rather than a silent one: it belongs to the catalogue, not to a looser rule.
+#
+# Why this rule reports `suspect` while the SDK rules report `confirmed`. The
+# call shape is structural: the tree says a method was invoked on a receiver with
+# a leading string argument. But the shape alone describes an enormous amount of
+# unrelated code, and what narrows it to a provider is a regular expression run
+# over the text of that string. Reading a string literal is a text match, not a
+# structural fact, and `cache.get("api.openai.com")` satisfies it exactly as well
+# as a real request does. The project forbids a text match from reaching the
+# confirmed list, so the finding is still reported and the claim about it is what
+# weakens.
+#
+# Restoring `confirmed` needs the receiver proven to be an HTTP client, which is
+# a binding rather than a stronger regex. The libraries in `covers_modules` are
+# the set that binding would have to accept.
 
 schema_version = "1.0"
 language = "python"
@@ -47,7 +61,7 @@ target_url = { from = "url" }
 
 [classify]
 egress_kind = "llm_chat"
-default_confidence = "confirmed"
+default_confidence = "suspect"
 
 [[classify.downgrade]]
 when = "target_url.unresolved"

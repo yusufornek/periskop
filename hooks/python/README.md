@@ -13,13 +13,40 @@ One JSON object per line, each conforming to
 [`schemas/egress-event.schema.json`](../../schemas/egress-event.schema.json):
 
 ```json
-{"schema_version":"1.0","egress_event_id":"ee_253a554a4f499513","process":{"language":"python","runtime":"cpython/3.12","entrypoint_hint":"billing-worker"},"library":{"module":"openai","mechanism":"sdk_wrapper"},"operation":"chat.completions.create","target":{"host_id":"api.openai.com","port":443,"path_template":"/v1/chat/completions","provider_ref":"openai"},"payload_shape":{"field_paths":["messages[].content","messages[].role","model"],"byte_size_estimate":346,"truncated_depth":0}}
+{"schema_version":"1.0","egress_event_id":"ee_3dfe316616cd47b4","process":{"language":"python","runtime":"cpython/3.12","entrypoint_hint":"billing-worker"},"library":{"module":"openai","mechanism":"sdk_wrapper"},"operation":"chat.completions.create","target":{"host_id":"api.openai.com","port":443,"path_template":"/v1/chat/completions","provider_ref":"openai"},"payload_shape":{"field_paths":["messages[].content","messages[].role","model"],"byte_size_estimate":346,"truncated_depth":0}}
 ```
 
-Next to the stream, a `<output>.status.json` sidecar declares what the run was:
-`hook_status`, `reason`, `dropped_events_count`, `written_events_count` and the
-failures that were swallowed. A file of zero events and a hook that never ran
-are different facts, and the sidecar is what keeps them apart.
+The stream goes into the directory named by `PERISKOP_EVENT_DIR`, as one
+`python-<pid>-<random>.jsonl` file per process. A directory rather than a file
+path because multi process work then needs no coordination: two processes
+appending to one file interleave their writes and corrupt lines, and a file
+model would make the caller responsible for inventing a unique name for every
+worker. The `.jsonl` extension is what `periskop-runtime-collector` selects on.
+
+Next to the stream, a `<stream>.jsonl.status.json` sidecar declares what the run
+was: `hook_status`, `reason`, `dropped_events_count`, `written_events_count` and
+the failures that were swallowed. A file of zero events and a hook that never
+ran are different facts, and the sidecar is what keeps them apart. It ends in
+`.json` rather than `.jsonl` so the collector never reads a run's own accounting
+back as an event.
+
+### Identity
+
+`egress_event_id` is derived, never counted, and the derivation is fixed by
+`schemas/egress-event.schema.json`:
+
+```
+ee_ + blake3("ee/v1" | library.module | operation | target.host_id
+             | target.path_template)[:8] as lowercase hex
+```
+
+with `0x1F` between the fields and an absent field written as the empty string.
+Nothing else takes part: not the clock, not the pid, not the payload size, not
+the call site. The same call recorded twice therefore carries one identity, in
+this hook, in the node hook and in the collector. blake3 is written out in
+`periskop_hook/blake3.py` because CPython ships no blake3 and a hook may not add
+a third party dependency to somebody else's interpreter; it is held to the
+official reference vectors in `tests/test_blake3.py`.
 
 ## Installation
 
@@ -59,16 +86,18 @@ the one installation mistake that would break another tool silently; use the
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `PERISKOP_HOOK_OUTPUT` | Path of the JSON lines event stream. **Without it the hook stays off.** | unset, hook disabled |
+| `PERISKOP_EVENT_DIR` | **Directory** the event stream is written into, one `.jsonl` file per process. **Without it the hook stays off.** | unset, hook disabled |
+| `PERISKOP_HOOK_OUTPUT` | Legacy: path of one exact event file. Kept so an existing deployment survives an upgrade; `PERISKOP_EVENT_DIR` wins when both are set. | unset |
 | `PERISKOP_HOOK` | `0`, `false`, `off` or `no` disables the hook completely | unset, enabled |
 | `PERISKOP_HOOK_BUFFER` | Ring buffer capacity in events | `1024` |
 | `PERISKOP_HOOK_ENTRYPOINT` | `process.entrypoint_hint` in the event | basename of `sys.argv[0]` |
 | `PERISKOP_HOOK_DEBUG` | Writes swallowed failures to stderr | unset, silent |
 | `PERISKOP_HOOK_STATUS` | **Written by the hook**, not read: `active` or `disabled:<reason>` | set at startup |
 
-There is no configuration file, and no default output path. Writing an event
+There is no configuration file, and no default destination. Writing an event
 stream somewhere the operator did not ask for is a side effect an observation
-tool should not have.
+tool should not have. The directory is created on first write, not at startup,
+so a process that records nothing leaves nothing behind.
 
 ## What is instrumented
 

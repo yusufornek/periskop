@@ -1,65 +1,49 @@
 // The identity of an event, derived rather than counted.
 //
-// data-model.md section 2 fixes the formula and the serialisation:
+// schemas/egress-event.schema.json states the derivation and calls it normative:
 //
-//   egress_event_id = H("ee/v1" | process_identity | t_start_bucket
-//                       | target_canonical | call_shape_hash?)
+//   ee_ + blake3("ee/v1" | library.module | operation | target.host_id
+//                | target.path_template)[:8] as lowercase hex
 //
-// with fields joined by U+001F, text in NFC, an absent field written as the
-// empty string, blake3 as the hash and the first eight bytes as lowercase hex.
-// A counter would have been simpler and wrong: the same call seen twice has to
-// carry one identity, or reconciliation counts it twice.
+// with the fields in that order, byte 0x1F between them, and an absent field
+// written as the empty string. Nothing else takes part. No clock, no pid and no
+// counter, which is what lets the same call, recorded twice in two processes or
+// in two runs, collapse to one identity instead of inflating a count.
+//
+// The reason this lives in the contract rather than in each hook: two hooks that
+// derive it differently give one call two identities, and reconciliation then
+// reports one call as two observations. This hook, the python hook and
+// periskop-runtime-collector all produce the same bytes for the same call, and
+// event-id.test.ts pins that with a vector shared across the languages.
+//
+// Deliberately not normalised to NFC. data-model.md mentions NFC for the general
+// canonical serialisation, but the collector that reads these files hashes the
+// UTF-8 bytes as given, and matching the reader byte for byte is what the
+// identity is for. Every field that takes part is ASCII in practice: a module
+// name, a lower cased operation, a host and a path template.
 
 import { blake3Short } from "./blake3";
 
-const UNIT_SEPARATOR = "\u001f";
+const ID_PREFIX = "ee_";
 const DOMAIN_TAG = "ee/v1";
 
-/** Fixed width bucket, so a call reported twice does not slide into two ids. */
-const BUCKET_MILLIS = 1000;
+/** Unit separator, so two fields cannot be confused for one longer field. */
+const FIELD_SEPARATOR = Buffer.from([0x1f]);
 
-export interface EventIdInput {
-  readonly processIdentity: string;
-  readonly targetCanonical: string;
-  /**
-   * Hash of the call shape as the static scanner computes it. A transport level
-   * hook cannot produce one: it sees a socket, not the syntax tree the hash is
-   * defined over. The formula marks the field optional, so it is written as the
-   * empty string rather than invented.
-   */
-  readonly callShapeHash: string | undefined;
-  readonly epochMillis: number;
+/** The four fields that answer "which call is this", and no others. */
+export interface CallShape {
+  readonly module: string;
+  readonly operation: string;
+  readonly hostId: string;
+  /** Optional in the schema. An absent one hashes as the empty string. */
+  readonly pathTemplate: string | undefined;
 }
 
-function canonical(field: string | undefined): string {
-  return field === undefined ? "" : field.normalize("NFC");
-}
-
-/**
- * Process identity as this hook can observe it.
- *
- * The contracts name the field without defining it for an in-process hook. The
- * narrowest reading that still serves its purpose is used: enough to separate
- * two processes on one machine, and nothing that would make the identity depend
- * on what the process was doing.
- */
-export function processIdentity(runtime: string, pid: number): string {
-  return `${runtime}/${pid}`;
-}
-
-export function targetCanonical(host: string, port: number, pathTemplate: string): string {
-  return `${host.toLowerCase()}:${port}${pathTemplate}`;
-}
-
-export function egressEventId(input: EventIdInput): string {
-  const bucket = Math.floor(input.epochMillis / BUCKET_MILLIS);
-  const serialised = [
-    DOMAIN_TAG,
-    canonical(input.processIdentity),
-    String(bucket),
-    canonical(input.targetCanonical),
-    canonical(input.callShapeHash),
-  ].join(UNIT_SEPARATOR);
-
-  return `ee_${blake3Short(Buffer.from(serialised, "utf8"))}`;
+export function egressEventId(shape: CallShape): string {
+  const fields = [shape.module, shape.operation, shape.hostId, shape.pathTemplate ?? ""];
+  const chunks = [Buffer.from(DOMAIN_TAG, "utf8")];
+  for (const field of fields) {
+    chunks.push(FIELD_SEPARATOR, Buffer.from(field, "utf8"));
+  }
+  return `${ID_PREFIX}${blake3Short(Buffer.concat(chunks))}`;
 }
