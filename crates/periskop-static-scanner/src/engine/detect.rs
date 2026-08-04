@@ -40,6 +40,11 @@ fn collect_bindings(parsed: &ParsedFile) -> BindingTable {
         Language::TypeScript | Language::Tsx | Language::JavaScript => {
             bindings_ts::collect(parsed.root_node(), parsed.source())
         }
+        // Grammars are linked ahead of their resolvers so that a file in these
+        // languages is parsed and counted rather than reported as unreadable.
+        // An empty table means every bound rule declines, which is the correct
+        // answer while the resolver is missing: no claim is better than a guess.
+        Language::Go | Language::Java => BindingTable::default(),
     }
 }
 

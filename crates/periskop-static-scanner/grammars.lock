@@ -27,3 +27,13 @@ provides = "typescript, tsx"
 crate = "tree-sitter-javascript"
 version = "0.25.0"
 provides = "javascript"
+
+[[grammar]]
+crate = "tree-sitter-go"
+version = "0.25.0"
+provides = "go"
+
+[[grammar]]
+crate = "tree-sitter-java"
+version = "0.23.5"
+provides = "java"

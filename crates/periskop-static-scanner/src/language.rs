@@ -18,6 +18,8 @@ pub enum Language {
     TypeScript,
     Tsx,
     JavaScript,
+    Go,
+    Java,
 }
 
 impl Language {
@@ -30,6 +32,8 @@ impl Language {
             Self::Python => "python",
             Self::TypeScript | Self::Tsx => "typescript",
             Self::JavaScript => "javascript",
+            Self::Go => "go",
+            Self::Java => "java",
         }
     }
 
@@ -41,6 +45,8 @@ impl Language {
         match self {
             Self::Python => "python",
             Self::TypeScript | Self::Tsx | Self::JavaScript => "typescript",
+            Self::Go => "go",
+            Self::Java => "java",
         }
     }
 
@@ -50,6 +56,8 @@ impl Language {
             Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Self::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+            Self::Go => tree_sitter_go::LANGUAGE.into(),
+            Self::Java => tree_sitter_java::LANGUAGE.into(),
         }
     }
 
@@ -69,16 +77,20 @@ impl Language {
             "ts" | "mts" | "cts" => Some(Self::TypeScript),
             "tsx" => Some(Self::Tsx),
             "js" | "mjs" | "cjs" | "jsx" => Some(Self::JavaScript),
+            "go" => Some(Self::Go),
+            "java" => Some(Self::Java),
             _ => None,
         }
     }
 
     /// Every grammar the build links against, in a stable order.
-    pub const ALL: [Language; 4] = [
+    pub const ALL: [Language; 6] = [
         Language::Python,
         Language::TypeScript,
         Language::Tsx,
         Language::JavaScript,
+        Language::Go,
+        Language::Java,
     ];
 }
 
@@ -137,6 +149,8 @@ mod tests {
             ("js", Language::JavaScript),
             ("mjs", Language::JavaScript),
             ("cjs", Language::JavaScript),
+            ("go", Language::Go),
+            ("java", Language::Java),
         ];
         for (ext, expected) in cases {
             assert_eq!(Language::from_extension(ext), Some(expected), "{ext}");

@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://periskop.dev/schemas/egress-event.schema.json",
+  "title": "EgressEvent",
+  "type": "object",
+  "description": "One call that actually happened, recorded by a runtime hook. Where a declared egress point says the code can reach a provider, an event says it did.",
+  "$comment": "The hook records the shape of a payload and never its content. A tool that exists to stop data leaving must not become the thing that copies it.",
+  "required": [
+    "schema_version",
+    "egress_event_id",
+    "process",
+    "library",
+    "operation",
+    "target",
+    "payload_shape"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^\\d+\\.\\d+$" },
+    "egress_event_id": {
+      "type": "string",
+      "pattern": "^ee_[0-9a-f]{16}$",
+      "description": "Deterministic, derived from the call shape rather than from a counter, so the same call recorded twice carries one identity."
+    },
+
+    "process": {
+      "type": "object",
+      "required": ["language", "runtime"],
+      "additionalProperties": false,
+      "properties": {
+        "language": { "enum": ["python", "javascript", "typescript"] },
+        "runtime": {
+          "type": "string",
+          "description": "Interpreter and version, for example cpython/3.12 or node/20."
+        },
+        "entrypoint_hint": {
+          "type": "string",
+          "description": "Best effort name of what is running. Never an absolute path."
+        }
+      }
+    },
+
+    "library": {
+      "type": "object",
+      "required": ["module", "mechanism"],
+      "additionalProperties": false,
+      "properties": {
+        "module": {
+          "type": "string",
+          "description": "Package the call went through, for example openai or httpx."
+        },
+        "mechanism": {
+          "enum": ["sdk_wrapper", "http_client", "raw_socket"],
+          "description": "Which layer the hook sat at. An sdk_wrapper observation is stronger evidence than an http_client one, because the latter cannot tell a provider call from any other request without the target."
+        }
+      }
+    },
+
+    "operation": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_.]*$",
+      "description": "Method or endpoint that was invoked, normalised to lower case."
+    },
+
+    "target": {
+      "type": "object",
+      "required": ["host_id"],
+      "additionalProperties": false,
+      "properties": {
+        "host_id": {
+          "type": "string",
+          "description": "Destination host. Recorded as written, since a scan needs to compare it against what the code declared."
+        },
+        "port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "path_template": {
+          "type": "string",
+          "description": "Request path with identifiers removed, so two calls to the same endpoint compare equal."
+        },
+        "provider_ref": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "description": "Classified provider, or unknown. Never omitted to hide an unclassified destination."
+        }
+      }
+    },
+
+    "payload_shape": {
+      "type": "object",
+      "description": "Structure of what was sent. Content is not recorded and cannot be recovered from these fields.",
+      "required": ["field_paths", "byte_size_estimate"],
+      "additionalProperties": false,
+      "properties": {
+        "field_paths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Normalised field paths, sorted. Dynamic keys are replaced by a placeholder, because a key can carry data as readily as a value: a map keyed by customer email would otherwise copy those addresses into the record."
+        },
+        "byte_size_estimate": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Approximate size. An estimate rather than a measurement, since materialising a streaming body to measure it would change the behaviour of the program under observation."
+        },
+        "truncated_depth": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Depth at which traversal stopped. Present so a shallow record is not mistaken for a small payload."
+        }
+      }
+    },
+
+    "call_site_hint": {
+      "type": "object",
+      "description": "Best effort link back to source. Advisory only: reconciliation joins on the call shape, not on this.",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Relative to the project root. Absolute paths are rejected."
+        },
+        "symbol": { "type": "string" }
+      }
+    },
+
+    "degraded_reasons": {
+      "type": "array",
+      "description": "Why this record is less complete than a full one. Present so a thin event is read as thin rather than as evidence of a small call.",
+      "items": {
+        "enum": [
+          "streaming_body_not_measured",
+          "payload_traversal_truncated",
+          "target_not_resolved",
+          "call_site_unavailable",
+          "sampling_applied"
+        ]
+      }
+    }
+  }
+}

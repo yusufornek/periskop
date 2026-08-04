@@ -14,6 +14,13 @@
       "violates": "coverage statement is mandatory",
       "expected_error_contains": "coverage",
       "rationale": "A report without a coverage statement must be rejected at schema level. This is the honest coverage principle made unbreakable rather than merely documented."
+    },
+    {
+      "file": "egress-event.invalid.json",
+      "schema": "egress-event.schema.json",
+      "violates": "payload shape may not carry content",
+      "expected_error_contains": "raw_body",
+      "rationale": "The hook records structure, never content. A raw_body field would turn an observation tool into a copy of the data it was deployed to protect, so the schema refuses the field outright rather than trusting every caller to leave it out."
     }
   ]
 }
