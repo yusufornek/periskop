@@ -11,13 +11,28 @@
 //! as read. And a run whose rules did not all load refuses to report a pass,
 //! because a clean report produced by an engine with no rules in it is the exact
 //! failure this tool exists to find elsewhere.
+//!
+//! When the caller points the run at a directory of runtime events the same walk
+//! gains a second half: the events are read, reconciled against the code points
+//! the walk found, and whatever the two sources disagree about reaches the report
+//! as a derived finding. That half is opt in, and deliberately so. A run with no
+//! event directory produces the report it always produced, declares itself
+//! `static_only`, and derives nothing, because a source that did not run is never
+//! compensated for.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
 use periskop_core::coverage::UnparsedReason;
+use periskop_core::finding::{Finding, Kind};
+use periskop_reconcile::capability::Suppression;
+use periskop_reconcile::{
+    reconcile, DeclaredPoint, DeclaredSource, ObservationWindow, ReconcileInputs, RuntimeSource,
+    Sources, WireSource,
+};
 use periskop_report::coverage::{
-    CoverageLanguage, CoverageStatement, RuntimeCoverage, RuntimeStatus, UnparsedFile,
+    CoverageLanguage, CoverageStatement, ReconciliationMode, RuntimeCoverage, RuntimeStatus,
+    UnparsedFile,
 };
 use periskop_report::report::{
     Diagnostic, DiagnosticCode, DiagnosticComponent, Envelope, PolicyRef, ReportBuilder, RuleHit,
@@ -54,7 +69,24 @@ pub struct ScanOutcome {
     pub rule_errors: Vec<String>,
 }
 
+/// A static only scan, which is what a run without runtime hooks can support.
+///
+/// Kept as its own entry point rather than folded into [`run_with_events`] with
+/// an extra field on [`ScanRequest`]. The request is built by more than one
+/// caller, and a new required field would make every one of them state a runtime
+/// source it does not have.
 pub fn run(request: ScanRequest<'_>) -> ScanOutcome {
+    run_with_events(request, None)
+}
+
+/// The same scan, reconciled against what the runtime hooks recorded.
+///
+/// `None` is not "an empty event directory". It is the absence of the runtime
+/// source altogether, and the two produce different reports on purpose: an empty
+/// directory means the hooks were watching and saw no calls, while no directory
+/// means nobody was watching. Reading the first as the second is how a tool ends
+/// up reporting a live codebase as dead.
+pub fn run_with_events(request: ScanRequest<'_>, event_dir: Option<&Path>) -> ScanOutcome {
     let (rules, load_errors) = load_directory(request.rules_root);
     let mut rule_errors: Vec<String> = load_errors.iter().map(|e| e.to_string()).collect();
 
@@ -85,6 +117,11 @@ pub fn run(request: ScanRequest<'_>) -> ScanOutcome {
     // The runtime block is built from this rather than from a fixed list, so a
     // repository in a language the list forgot is not left unmentioned.
     let mut languages_seen: BTreeSet<Language> = BTreeSet::new();
+    // Held here rather than handed straight to the builder, because
+    // reconciliation reads the code side out of these findings and the builder
+    // does not give them back. The builder still decides their order and their
+    // identity; this is only where they wait.
+    let mut static_findings: Vec<Finding> = Vec::new();
 
     for file in &discovery.files {
         languages_seen.insert(file.language);
@@ -149,8 +186,26 @@ pub fn run(request: ScanRequest<'_>) -> ScanOutcome {
         unclaimed.extend(found.unclaimed_imports);
         coverage.unresolved_targets.extend(found.unresolved_targets);
         engine_faults.extend(found.engine_faults);
-        builder.add_findings(found.findings);
+        static_findings.extend(found.findings);
     }
+
+    // The runtime half runs on the complete code side, so it sits after the walk
+    // rather than inside it. A point reconciled file by file would be compared
+    // against whichever events happened to have been read by then, and the
+    // result would depend on the walk order.
+    if let Some(event_dir) = event_dir {
+        let stage = reconcile_stage(event_dir, &static_findings);
+        coverage.dropped_events = stage.dropped_events;
+        coverage.unlinked_events = stage.unlinked_events;
+        coverage.observation_window_ms = stage.observation_window_ms;
+        coverage.reconciliation_mode = stage.reconciliation_mode;
+        for diagnostic in stage.diagnostics {
+            builder.add_diagnostic(diagnostic);
+        }
+        builder.add_findings(stage.findings);
+    }
+
+    builder.add_findings(static_findings);
 
     coverage.parsed_files = parsed_files;
     coverage.undetected_libraries = unclaimed.into_iter().collect();
@@ -182,11 +237,10 @@ pub fn run(request: ScanRequest<'_>) -> ScanOutcome {
     }
 
     for detail in engine_faults {
-        builder.add_diagnostic(Diagnostic {
-            code: DiagnosticCode::Internal,
-            component: DiagnosticComponent::StaticScanner,
-            detail: Some(detail),
-        });
+        builder.add_diagnostic(internal_diagnostic(
+            DiagnosticComponent::StaticScanner,
+            detail,
+        ));
     }
 
     let report = builder.build(
@@ -207,6 +261,167 @@ pub fn run(request: ScanRequest<'_>) -> ScanOutcome {
     ScanOutcome {
         report,
         rule_errors,
+    }
+}
+
+/// What the runtime half of a run contributed.
+///
+/// Collected into one value rather than written into the report as it is
+/// produced, so the static path cannot be reached by any of it. A run with no
+/// event directory never builds one of these, and therefore its coverage
+/// counters and its diagnostics come out exactly as they did before this half
+/// existed.
+struct ReconciledStage {
+    findings: Vec<Finding>,
+    diagnostics: Vec<Diagnostic>,
+    dropped_events: u64,
+    unlinked_events: u64,
+    observation_window_ms: u64,
+    reconciliation_mode: ReconciliationMode,
+}
+
+/// Reads the hook's event stream and reconciles it against the code side.
+///
+/// Returns a stage rather than a `Result` for the reason the collector states
+/// one layer down: damaged events are data. A scan that abandoned its report
+/// because an event file was truncated would hand any misbehaving hook the power
+/// to blind the whole run.
+fn reconcile_stage(event_dir: &Path, static_findings: &[Finding]) -> ReconciledStage {
+    let collected = periskop_runtime_collector::collect(event_dir);
+
+    // Every line the collector could not read is named here. The count alone
+    // reaches `dropped_events` below, and a count with no location is a number
+    // nobody can act on. Files it could not open at all raise no count, so
+    // without this they would leave no trace anywhere.
+    let mut diagnostics: Vec<Diagnostic> = collected
+        .malformed
+        .iter()
+        .map(|loss| {
+            internal_diagnostic(
+                DiagnosticComponent::RuntimeHooks,
+                format!("event stream: {loss}"),
+            )
+        })
+        .collect();
+
+    let points = declared_points(static_findings, &mut diagnostics);
+
+    // The wire source is absent by construction, not by configuration: this
+    // build ships no network sensor, so there is no value a caller could pass
+    // that would make it present. That is what keeps `reconciliation_mode` from
+    // ever being written as `full` here, and the two kinds that need the wire
+    // are reported as suppressed rather than left as silence.
+    let sources = Sources::new(
+        DeclaredSource::Present(points),
+        RuntimeSource::Present(collected.events),
+        WireSource::Absent,
+    );
+
+    // No window is claimed. `schemas/egress-event.schema.json` carries no clock
+    // value, by design, so nothing in the event stream says how long the hooks
+    // were watching, and the command line has no second source to read it from.
+    // Declaring a duration it did not measure would be inventing the one fact
+    // every `dormant_egress_point` finding rests on, so the run declares none
+    // and the suppression that follows says exactly that.
+    let outcome = reconcile(&ReconcileInputs::new(sources, ObservationWindow::NONE));
+
+    diagnostics.extend(outcome.suppressed.iter().map(suppression_diagnostic));
+    // The engine disagreeing with itself. A diagnostic, never a coverage
+    // counter: a derivation that failed is a different thing from something the
+    // run could not see.
+    diagnostics.extend(
+        outcome
+            .faults
+            .iter()
+            .map(|fault| internal_diagnostic(DiagnosticComponent::Reconciliation, fault.clone())),
+    );
+
+    // Two parts of the outcome have no home in the report contract and are
+    // therefore not written anywhere. `resolved_targets` is the destination an
+    // observation supplied for a point the scanner could not read: dropping the
+    // point from `coverage.unresolved_targets` on the strength of it would
+    // delete a declared gap without recording what replaced it, since no field
+    // carries the observed value. `matches` is the join ladder, which the derived
+    // findings already carry in their own evidence. Both are filed as contract
+    // requests in `hub/memory/interfaces.md` rather than approximated here.
+    ReconciledStage {
+        findings: outcome.findings,
+        diagnostics,
+        dropped_events: collected.dropped,
+        unlinked_events: outcome.unlinked_events,
+        observation_window_ms: outcome.observation_window_ms,
+        reconciliation_mode: outcome.reconciliation_mode,
+    }
+}
+
+/// The code side of the join, read out of the findings the walk produced.
+///
+/// Suspected findings are included. A call site the scanner could not fully
+/// prove is still a place in the code, and leaving it out would make it
+/// invisible to reconciliation entirely; what it cannot do is strengthen a
+/// derived claim, because a downgraded point carries no destination and the
+/// drift rule has nothing to compare.
+fn declared_points(findings: &[Finding], diagnostics: &mut Vec<Diagnostic>) -> Vec<DeclaredPoint> {
+    findings
+        .iter()
+        .filter(|finding| finding.kind == Kind::DeclaredEgressPoint)
+        .filter_map(|finding| match DeclaredPoint::from_finding(finding) {
+            Ok(point) => Some(point),
+            // A finding this build produced and cannot read back is the scanner
+            // and the reconciler disagreeing about the contract between them.
+            // Skipping it silently would drop a code point out of reconciliation
+            // with nothing in the report to show it was ever there.
+            Err(error) => {
+                diagnostics.push(internal_diagnostic(
+                    DiagnosticComponent::Reconciliation,
+                    format!(
+                        "{} could not be read as a code point: {error}",
+                        finding.finding_id
+                    ),
+                ));
+                None
+            }
+        })
+        .collect()
+}
+
+/// A derived kind this run did not produce, written where a reader will find it.
+///
+/// The report has two places a statement like this can go and neither was built
+/// for it. The coverage statement counts what the scan could not read and its
+/// field list is closed, so a suppression has no counter there; `diagnostics[]`
+/// is the block for everything the engine has to say about its own run, and its
+/// `detail` field is free text. `INTERNAL` is the only code in the closed enum
+/// not already claimed by a specific failure, so it is the one used, and the
+/// detail carries the contract spelling of both the kind and the reason. A
+/// dedicated code is filed against the contract owner in
+/// `hub/memory/interfaces.md`; until it exists, this is the choice that loses
+/// nothing.
+fn suppression_diagnostic(suppression: &Suppression) -> Diagnostic {
+    // Serialized rather than matched on, so a reason renamed in the contract
+    // cannot leave this line reporting a vocabulary that no longer exists. The
+    // fallback keeps the reason readable if it ever stops being a plain string.
+    let reason = serde_json::to_value(suppression.reason)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{:?}", suppression.reason));
+
+    internal_diagnostic(
+        DiagnosticComponent::Reconciliation,
+        format!(
+            "not derived: {} ({reason})",
+            suppression.kind.kind().as_str()
+        ),
+    )
+}
+
+/// The engine reporting on its own run, in the one code the contract leaves for
+/// anything that is not a named load failure.
+fn internal_diagnostic(component: DiagnosticComponent, detail: String) -> Diagnostic {
+    Diagnostic {
+        code: DiagnosticCode::Internal,
+        component,
+        detail: Some(detail),
     }
 }
 

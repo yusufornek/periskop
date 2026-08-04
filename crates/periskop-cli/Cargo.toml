@@ -19,15 +19,15 @@ path = "src/main.rs"
 periskop-core = { workspace = true }
 blake3 = { workspace = true }
 clap = { workspace = true }
+periskop-reconcile = { workspace = true }
 periskop-report = { workspace = true }
+# The reading half of the hook contract. A binary dependency since F2-L: the
+# scan reads the event stream back through the component that owns that half of
+# the contract, so the same code path serves the pipeline and the gate test.
+periskop-runtime-collector = { workspace = true }
 periskop-static-scanner = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
 periskop-static-scanner = { workspace = true }
-# Test only, and deliberately not a dependency of the binary. The F2 gate test
-# reads the hook's event stream back through the component that owns that half
-# of the contract; letting the test parse the JSON Lines itself would prove the
-# test could read them, not that periskop can.
-periskop-runtime-collector = { workspace = true }

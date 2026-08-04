@@ -305,6 +305,7 @@ dependencies = [
  "blake3",
  "clap",
  "periskop-core",
+ "periskop-reconcile",
  "periskop-report",
  "periskop-runtime-collector",
  "periskop-static-scanner",

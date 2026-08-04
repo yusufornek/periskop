@@ -52,6 +52,17 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         rules: Option<PathBuf>,
 
+        /// Directory the runtime hook wrote its event stream into.
+        ///
+        /// Optional, and the report says which it was. Without it the scan reads
+        /// code alone and declares itself static_only; with it the code side and
+        /// the observed calls are reconciled and their disagreements become
+        /// findings. Also read from PERISKOP_EVENT_DIR, which is what `hook
+        /// install` prints, so a hooked project does not have to repeat the path
+        /// on every run.
+        #[arg(long, value_name = "DIR")]
+        events: Option<PathBuf>,
+
         /// Fail when the share of unreadable files exceeds this many basis points.
         #[arg(long, value_name = "BASIS_POINTS")]
         max_unparsed_ratio: Option<u64>,
@@ -118,8 +129,15 @@ fn main() -> ExitCode {
             path,
             json,
             rules,
+            events,
             max_unparsed_ratio,
-        } => run_scan(path, json, rules, max_unparsed_ratio),
+        } => run_scan(ScanArgs {
+            path,
+            json,
+            rules,
+            events,
+            max_unparsed_ratio,
+        }),
         Command::ServeRpc { rules } => run_serve_rpc(rules),
         Command::Hook {
             command: HookCommand::Install(args),
@@ -204,12 +222,28 @@ fn run_serve_rpc(rules: Option<PathBuf>) -> ExitCode {
     }
 }
 
-fn run_scan(
+/// What one `scan` invocation was asked for.
+///
+/// Grouped rather than passed as five positional arguments, where two of the
+/// three optional paths have the same type and swapping them at a call site
+/// would compile.
+struct ScanArgs {
     path: PathBuf,
     json: bool,
     rules: Option<PathBuf>,
+    events: Option<PathBuf>,
     max_unparsed_ratio: Option<u64>,
-) -> ExitCode {
+}
+
+fn run_scan(args: ScanArgs) -> ExitCode {
+    let ScanArgs {
+        path,
+        json,
+        rules,
+        events,
+        max_unparsed_ratio,
+    } = args;
+
     if !path.is_dir() {
         eprintln!("periskop: {} is not a directory", path.display());
         return ExitCode::from(exit::ERROR);
@@ -224,6 +258,22 @@ fn run_scan(
         return ExitCode::from(exit::ERROR);
     }
 
+    // A path that does not resolve stops the run rather than being read as an
+    // empty stream. The difference matters more here than anywhere else in this
+    // command: a mistyped directory would otherwise produce a report claiming
+    // static_plus_runtime with nothing observed, which reads as a hooked
+    // application that made no calls.
+    let event_dir = match resolve_event_dir(events) {
+        Ok(dir) => dir,
+        Err(given) => {
+            eprintln!(
+                "periskop: no event directory at {}. Run `periskop hook install` first, or drop --events for a static scan.",
+                given.display()
+            );
+            return ExitCode::from(exit::ERROR);
+        }
+    };
+
     // The clock is read before anything else runs. A report whose envelope
     // carries an invented timestamp is not auditable, and the previous behaviour
     // was to fall back to the epoch, which prints as a real date and reads as
@@ -236,12 +286,15 @@ fn run_scan(
         }
     };
 
-    let outcome = scan::run(scan::ScanRequest {
-        project_root: &path,
-        rules_root: &rules_root,
-        tool_version: env!("CARGO_PKG_VERSION"),
-        generated_at,
-    });
+    let outcome = scan::run_with_events(
+        scan::ScanRequest {
+            project_root: &path,
+            rules_root: &rules_root,
+            tool_version: env!("CARGO_PKG_VERSION"),
+            generated_at,
+        },
+        event_dir.as_deref(),
+    );
 
     for error in &outcome.rule_errors {
         eprintln!("periskop: rule problem: {error}");
@@ -276,6 +329,32 @@ fn run_scan(
     match outcome.report.verdict {
         periskop_report::Verdict::Fail => ExitCode::from(exit::FAIL),
         _ => ExitCode::from(exit::PASS),
+    }
+}
+
+/// Environment variable naming the hook's event directory.
+///
+/// The same name `hook install` prints, so the two commands agree without the
+/// user carrying a path between them.
+const EVENT_DIR_VAR: &str = "PERISKOP_EVENT_DIR";
+
+/// Decides whether this run has a runtime source, and refuses a path that is not
+/// there.
+///
+/// `Ok(None)` is the static only run: no flag, no variable, and no directory is
+/// looked for. An empty variable counts as unset, because an exported name with
+/// no value is how a shell says nothing rather than how it says "here".
+fn resolve_event_dir(flag: Option<PathBuf>) -> Result<Option<PathBuf>, PathBuf> {
+    let requested = flag.or_else(|| {
+        std::env::var_os(EVENT_DIR_VAR)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    });
+
+    match requested {
+        Some(dir) if dir.is_dir() => Ok(Some(dir)),
+        Some(dir) => Err(dir),
+        None => Ok(None),
     }
 }
 
