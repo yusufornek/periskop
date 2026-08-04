@@ -1,0 +1,50 @@
+# Raw HTTP calls to a provider endpoint, no SDK involved.
+#
+# This pattern matters more than it looks. Plenty of production code posts
+# straight to an API URL, and an SDK aware scanner that only knows client objects
+# walks past it. The rule fires on the destination rather than on any library, so
+# it holds for requests, httpx and anything else with the same call shape.
+#
+# The URL predicate is what keeps this rule from firing on every HTTP call in a
+# codebase. Matching any post with a literal argument would report every internal
+# service call as an egress finding, and a report full of those teaches the reader
+# to skim past the real ones.
+#
+# A URL assembled at runtime does not match here at all. That is a known gap
+# rather than a silent one: it belongs to the catalogue, not to a looser rule.
+
+schema_version = "1.0"
+language = "python"
+provider = "unknown"
+rule_id = "python.static.http-provider-endpoint"
+rule_version = "1.0.0"
+
+[[match]]
+kind = "http_request"
+query = '''
+(call
+  function: (attribute
+    object: (identifier) @client
+    attribute: (identifier) @verb)
+  arguments: (argument_list
+    .
+    (string) @url)
+  (#match? @verb "^(post|get|put|request)$")
+  (#match? @url "(api\\.openai\\.com|api\\.anthropic\\.com|generativelanguage\\.googleapis\\.com|openai\\.azure\\.com|bedrock-runtime\\.[a-z0-9-]+\\.amazonaws\\.com)")) @call
+'''
+
+[match.method]
+capture = "verb"
+one_of = ["post", "get", "put", "request"]
+
+[extract]
+target_url = { from = "url" }
+
+[classify]
+egress_kind = "llm_chat"
+default_confidence = "confirmed"
+
+[[classify.downgrade]]
+when = "target_url.unresolved"
+to = "suspect"
+coverage_note = "target_host_unresolved"

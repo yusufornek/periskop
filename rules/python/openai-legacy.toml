@@ -1,0 +1,38 @@
+# OpenAI Python SDK, pre 1.0 module level interface.
+#
+# openai.ChatCompletion.create(...) and its siblings. Kept as its own rule because
+# the call shape shares no structure with the client based interface: matching both
+# from one pattern would mean loosening it until it fires on unrelated code.
+
+schema_version = "1.0"
+language = "python"
+provider = "openai"
+rule_id = "python.static.openai-legacy-module-call"
+rule_version = "1.0.0"
+
+[[match]]
+kind = "call"
+query = '''
+(call
+  function: (attribute
+    object: (attribute
+      object: (identifier) @pkg
+      attribute: (identifier) @resource)
+    attribute: (identifier) @method)
+  arguments: (argument_list) @args
+  (#eq? @pkg "openai")
+  (#match? @resource "^(ChatCompletion|Completion|Embedding|Image|Audio)$")
+  (#match? @method "^(create|acreate)$")) @call
+'''
+
+[match.method]
+capture = "method"
+one_of = ["create", "acreate"]
+
+[extract]
+model = { from = "args", keyword = "model" }
+payload_ref = { from = "args", keyword = "messages" }
+
+[classify]
+egress_kind = "llm_chat"
+default_confidence = "confirmed"

@@ -1,0 +1,37 @@
+# Google unified Gemini SDK, package google-genai.
+#
+# The superseded google-generativeai package has a different call shape and is
+# matched by its own rule, because plenty of code still runs it.
+
+schema_version = "1.0"
+language = "python"
+provider = "google-gemini"
+rule_id = "python.static.google-genai-generate"
+rule_version = "1.0.0"
+
+[[match]]
+kind = "call"
+query = '''
+(call
+  function: (attribute
+    object: (_) @recv
+    attribute: (identifier) @method)
+  arguments: (argument_list) @args
+  (#match? @method "^(generate_content|generate_content_stream)$")) @call
+'''
+
+[match.binding]
+capture = "recv"
+resolves_to = { module = "google.genai", symbol_path = ["Client"] }
+
+[match.method]
+capture = "method"
+one_of = ["generate_content", "generate_content_stream"]
+
+[extract]
+model = { from = "args", keyword = "model" }
+payload_ref = { from = "args", keyword = "contents" }
+
+[classify]
+egress_kind = "llm_chat"
+default_confidence = "confirmed"

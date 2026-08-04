@@ -220,6 +220,7 @@ dependencies = [
  "ignore",
  "periskop-core",
  "serde",
+ "streaming-iterator",
  "thiserror",
  "toml",
  "tree-sitter",

@@ -1,3 +1,4 @@
+#![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 //! Rule lint.
 //!
 //! Loads every shipped rule file and compiles it against the grammar it targets.

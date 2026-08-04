@@ -1,0 +1,53 @@
+# OpenAI Python SDK.
+#
+# Two interfaces exist and they look nothing alike in the syntax tree. The v1 line
+# builds a client object and calls through it; the v0 line called module level
+# classes directly. Old code is still in production, so both are matched, and the
+# legacy pattern is kept separate rather than widened into one loose rule.
+
+schema_version = "1.0"
+language = "python"
+provider = "openai"
+rule_id = "python.static.openai-client-call"
+rule_version = "1.0.0"
+
+# client.chat.completions.create(...) and the responses API.
+#
+# The receiver is left open here and constrained by the binding instead. Writing
+# the full attribute chain into the pattern would break the moment someone keeps
+# an intermediate handle, which is ordinary style rather than evasion.
+[[match]]
+kind = "call"
+query = '''
+(call
+  function: (attribute
+    object: (_) @recv
+    attribute: (identifier) @method)
+  arguments: (argument_list) @args
+  (#match? @method "^(create|acreate|parse|stream)$")) @call
+'''
+
+[match.binding]
+capture = "recv"
+resolves_to = { module = "openai", symbol_path = ["OpenAI", "AsyncOpenAI", "AzureOpenAI"] }
+
+[match.method]
+capture = "method"
+one_of = ["create", "acreate", "parse", "stream"]
+
+[extract]
+model = { from = "args", keyword = "model" }
+payload_ref = { from = "args", keyword = "messages" }
+base_url = { from = "recv", constructor_keyword = "base_url" }
+
+[classify]
+egress_kind = "llm_chat"
+default_confidence = "confirmed"
+
+# A client pointed at a base_url the scanner cannot read may not be talking to
+# OpenAI at all. The call is still reported; the claim about where it goes is
+# what weakens.
+[[classify.downgrade]]
+when = "base_url.unresolved"
+to = "suspect"
+coverage_note = "target_host_unresolved"

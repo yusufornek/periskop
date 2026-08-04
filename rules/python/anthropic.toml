@@ -1,0 +1,40 @@
+# Anthropic Python SDK.
+
+schema_version = "1.0"
+language = "python"
+provider = "anthropic"
+rule_id = "python.static.anthropic-messages-call"
+rule_version = "1.0.0"
+
+[[match]]
+kind = "call"
+query = '''
+(call
+  function: (attribute
+    object: (_) @recv
+    attribute: (identifier) @method)
+  arguments: (argument_list) @args
+  (#match? @method "^(create|stream)$")) @call
+'''
+
+[match.binding]
+capture = "recv"
+resolves_to = { module = "anthropic", symbol_path = ["Anthropic", "AsyncAnthropic"] }
+
+[match.method]
+capture = "method"
+one_of = ["create", "stream"]
+
+[extract]
+model = { from = "args", keyword = "model" }
+payload_ref = { from = "args", keyword = "messages" }
+base_url = { from = "recv", constructor_keyword = "base_url" }
+
+[classify]
+egress_kind = "llm_chat"
+default_confidence = "confirmed"
+
+[[classify.downgrade]]
+when = "base_url.unresolved"
+to = "suspect"
+coverage_note = "target_host_unresolved"
