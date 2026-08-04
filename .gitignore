@@ -21,3 +21,6 @@ test-corpus/checkouts/
 .idea/
 .vscode/
 *.swp
+
+# TypeScript build output
+packages/*/dist/

@@ -1,0 +1,23 @@
+{
+  "name": "@periskop/mcp-server",
+  "version": "0.1.0",
+  "description": "Model Context Protocol server for periskop. A thin client over the engine, so detection lives in one place.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": { "periskop-mcp": "dist/index.js" },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "lint": "tsc --noEmit",
+    "test": "node --test dist/*.test.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.21.1",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "typescript": "5.7.2"
+  },
+  "engines": { "node": ">=20" }
+}

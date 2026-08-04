@@ -82,6 +82,55 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+## Using it
+
+Scan a project and read the summary:
+
+```bash
+periskop scan path/to/project
+```
+
+The output leads with a verdict, lists confirmed findings, keeps weaker ones in
+their own section, and ends with what the scan could not see. That last part is
+not decoration. A run with no findings over a tree it could barely read is a
+different result from a clean one, and the coverage block is how you tell them
+apart.
+
+For a machine readable report:
+
+```bash
+periskop scan path/to/project --json
+```
+
+The JSON validates against `schemas/report.schema.json`. Two runs over an
+unchanged tree produce identical bytes apart from the envelope, which holds the
+timestamp, so reports can be committed and diffed.
+
+In continuous integration, coverage can gate the result:
+
+```bash
+periskop scan . --max-unparsed-ratio 500
+```
+
+That exits with code 3 when more than five percent of the code surface was
+unreadable, which is distinct from the code for a policy failure. A pipeline
+needs to tell "clean" apart from "did not look".
+
+### Editor integration
+
+The MCP server exposes the scanner to an editor. It is a thin client over the
+same engine, so detection has one implementation rather than two.
+
+```bash
+cd packages/mcp-server && npm install && npx tsc
+```
+
+Point it at the binary with `PERISKOP_BINARY`. Three tools are available:
+`scan_project` returns a summary with a first page of findings, and
+`get_finding_detail` and `get_coverage_report` fetch what the reader asks for
+next. Results are paginated on purpose; a scan of a large repository should not
+consume a context window in one response.
+
 ## Contributing
 
 Issues and pull requests are welcome. Two expectations worth stating up front.

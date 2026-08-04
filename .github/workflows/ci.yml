@@ -92,3 +92,37 @@ jobs:
           cargo run --quiet -p periskop-cli -- scan "$FIX" --rules rules --json > /tmp/a.json
           cargo run --quiet -p periskop-cli -- scan "$FIX" --rules rules --json > /tmp/b.json
           python3 -c "import json,sys; a=json.load(open('/tmp/a.json')); b=json.load(open('/tmp/b.json')); a.pop('envelope'); b.pop('envelope'); sys.exit(0 if a==b else 'two scans of the same tree disagreed')"
+
+  mcp:
+    name: MCP server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The smoke tests drive the real binary, so the engine is built first.
+      - name: Build the engine
+        run: cargo build -p periskop-cli
+
+      - name: Install
+        working-directory: packages/mcp-server
+        run: npm ci
+
+      - name: Types
+        working-directory: packages/mcp-server
+        run: npx tsc --noEmit
+
+      - name: Build
+        working-directory: packages/mcp-server
+        run: npx tsc
+
+      # Both sides pass their own tests without agreeing on the wire. This is
+      # where a renamed field or a framing mismatch surfaces.
+      - name: Cross language smoke tests
+        working-directory: packages/mcp-server
+        run: node --test dist/smoke.test.js

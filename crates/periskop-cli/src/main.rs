@@ -10,6 +10,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 mod render;
+mod rpc;
 mod scan;
 
 /// Exit codes, fixed by the command line contract.
@@ -55,6 +56,16 @@ enum Command {
         #[arg(long, value_name = "BASIS_POINTS")]
         max_unparsed_ratio: Option<u64>,
     },
+
+    /// Serve the engine over JSON-RPC on stdin and stdout.
+    ///
+    /// Used by the MCP server, which stays a thin client so that detection lives
+    /// in one place rather than being reimplemented in a second language.
+    ServeRpc {
+        /// Directory holding detector rules.
+        #[arg(long, value_name = "DIR")]
+        rules: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -66,6 +77,27 @@ fn main() -> ExitCode {
             rules,
             max_unparsed_ratio,
         } => run_scan(path, json, rules, max_unparsed_ratio),
+        Command::ServeRpc { rules } => run_serve_rpc(rules),
+    }
+}
+
+fn run_serve_rpc(rules: Option<PathBuf>) -> ExitCode {
+    let rules_root = rules.unwrap_or_else(default_rules_root);
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+
+    match rpc::serve(
+        stdin.lock(),
+        stdout.lock(),
+        rules_root,
+        env!("CARGO_PKG_VERSION"),
+        now_rfc3339,
+    ) {
+        Ok(()) => ExitCode::from(exit::PASS),
+        Err(e) => {
+            eprintln!("periskop: rpc transport failed: {e}");
+            ExitCode::from(exit::ERROR)
+        }
     }
 }
 
