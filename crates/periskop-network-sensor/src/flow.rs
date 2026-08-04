@@ -379,10 +379,11 @@ impl Flow {
     /// let two spellings of the same connection into the pipeline, and the
     /// duplicate would surface as two observations of one thing.
     pub fn from_observation(
-        observation: Observation,
+        mut observation: Observation,
         flow_scope: FlowScope,
         mechanism: Mechanism,
     ) -> Result<Self, FlowError> {
+        let dns_names = std::mem::take(&mut observation.dns_names);
         let flow_id = derive_flow_id(
             &observation.host_id,
             observation.boot_id.as_deref(),
@@ -415,7 +416,7 @@ impl Flow {
             interface: None,
             resolved_host: observation.resolved_host,
             resolved_host_source: observation.resolved_host_source,
-            sni: None,
+            sni: observation.sni,
             sni_source: observation.sni_source,
             dns_names: None,
             provider_ref: observation.provider_ref,
@@ -433,6 +434,9 @@ impl Flow {
             // reader should not have to know that.
             degraded_reasons: (!degraded_reasons.is_empty()).then_some(degraded_reasons),
         };
+        // Routed through the setter so the ordering and the empty list rule
+        // live in one place rather than being restated here.
+        let flow = flow.with_dns_names(dns_names);
         flow.validate()?;
         Ok(flow)
     }
@@ -443,12 +447,10 @@ impl Flow {
 
     /// Names the interface the connection was seen on.
     ///
-    /// A setter on the record rather than a field of `Observation`, because the
-    /// three fields below arrive from parts of the sensor that do not build the
-    /// observation: the interface comes from the capture attachment, and the
-    /// name and classification detail come from the packet parsing helper, which
-    /// by contract carries no process context and therefore cannot be the thing
-    /// that constructs a flow.
+    /// A setter on the record rather than a field of `Observation`, because it
+    /// arrives from the capture attachment rather than from anything a hook
+    /// reported. The classification detail below is a setter for the same kind
+    /// of reason: it is decided by rule matching, after the observation exists.
     pub fn on_interface(mut self, interface: impl Into<String>) -> Self {
         self.interface = Some(interface.into());
         self

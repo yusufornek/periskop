@@ -29,6 +29,11 @@ def event_schema():
     return load_json(os.path.join(SCHEMA_DIR, "egress-event.schema.json"))
 
 
+def hook_status_schema():
+    """Contract for the sidecar this hook writes beside every stream."""
+    return load_json(os.path.join(SCHEMA_DIR, "hook-status.schema.json"))
+
+
 class FakeClient(object):
     def __init__(self, base_url):
         self.base_url = base_url

@@ -75,18 +75,64 @@ pub fn summary(report: &ScanReport) -> String {
 
     out.push_str(&runtime_line(report));
     out.push_str(&network_line(report));
+    out.push_str(&reconciliation_line(report));
 
     if !report.diagnostics.is_empty() {
         out.push_str("\nDiagnostics\n");
         for diagnostic in &report.diagnostics {
-            out.push_str(&format!(
-                "  {:?} in {:?}\n",
-                diagnostic.code, diagnostic.component
-            ));
+            out.push_str(&diagnostic_line(diagnostic));
         }
     }
 
     out
+}
+
+/// What reconciliation had to work with, and what it could not attribute.
+///
+/// Both halves used to exist only in the JSON. `unlinked_events` is the counter
+/// K-10 introduced as the schema level form of honest coverage: a run that
+/// collected ten thousand observations and could tie nine and a half thousand of
+/// them to no line of code has seen a great deal it cannot explain, and a reader
+/// looking at the terminal saw a clean scan. The mode is printed beside it
+/// because the number means different things in each mode, and a static only run
+/// has no observations to leave unlinked in the first place.
+fn reconciliation_line(report: &ScanReport) -> String {
+    let coverage = &report.coverage;
+    let mut line = format!(
+        "  reconciled {}, {} ms observed",
+        coverage.reconciliation_mode.as_str(),
+        coverage.observation_window_ms
+    );
+    if coverage.unlinked_events > 0 {
+        line.push_str(&format!(
+            ", {} observed calls reached no known call site",
+            coverage.unlinked_events
+        ));
+    }
+    line.push('\n');
+    line
+}
+
+/// One diagnostic, with the reason it carries.
+///
+/// The detail is the load bearing part and it used to be dropped. Reconciliation
+/// writes its suppression notices through this field, so a run that produced no
+/// derived findings because no sensor was present said, on screen, only
+/// `SuppressionNotice in Reconciliation`, and the reader could not learn from the
+/// terminal which finding kinds were not derived or why.
+///
+/// The names are the contract spellings rather than `{:?}`, so a line on screen
+/// can be searched for in the JSON that produced it.
+fn diagnostic_line(diagnostic: &periskop_report::report::Diagnostic) -> String {
+    let head = format!(
+        "  {} in {}",
+        diagnostic.code.as_str(),
+        diagnostic.component.as_str()
+    );
+    match &diagnostic.detail {
+        Some(detail) => format!("{head}: {detail}\n"),
+        None => format!("{head}\n"),
+    }
 }
 
 /// The runtime line, read off the coverage block rather than asserted.
@@ -182,8 +228,13 @@ mod tests {
         Component, Confidence, Detector, EntityRef, Evidence, EvidenceType, Finding, Kind,
         Location, RefType, Span,
     };
-    use periskop_report::coverage::{CoverageLanguage, CoverageStatement, RuntimeCoverage};
-    use periskop_report::report::{Envelope, PolicyRef, ReportBuilder, RuleHit};
+    use periskop_report::coverage::{
+        CoverageLanguage, CoverageStatement, ReconciliationMode, RuntimeCoverage,
+    };
+    use periskop_report::report::{
+        Diagnostic, DiagnosticCode, DiagnosticComponent, Envelope, PolicyRef, ReportBuilder,
+        RuleHit,
+    };
 
     fn envelope() -> Envelope {
         Envelope {
@@ -310,6 +361,63 @@ mod tests {
         );
         assert!(text.contains("1 suspected"), "{text}");
         assert!(text.contains("services/summary.py:200"), "{text}");
+    }
+
+    #[test]
+    fn a_diagnostic_shows_its_reason_and_not_only_its_code() {
+        // The bug this pins: the summary printed the code and the component and
+        // dropped `detail`. Reconciliation puts its suppression reasons there, so
+        // a reader saw that something was suppressed and never learned what or
+        // why. Nothing looked at this path at all before: no fixture in this
+        // module carried a diagnostic.
+        let mut builder = ReportBuilder::new();
+        builder.add_diagnostic(Diagnostic {
+            code: DiagnosticCode::CoreUnavailable,
+            component: DiagnosticComponent::Reconciliation,
+            detail: Some(
+                "unmatched_wire_traffic not derived: no network sensor in this run".into(),
+            ),
+        });
+        let text = summary(&builder.build(
+            envelope(),
+            policy(Vec::new()),
+            CoverageStatement::static_only(),
+        ));
+
+        assert!(text.contains("no network sensor in this run"), "{text}");
+        // The contract spelling, not the Rust variant name.
+        assert!(
+            text.contains("CORE_UNAVAILABLE in reconciliation"),
+            "{text}"
+        );
+        assert!(!text.contains("CoreUnavailable"), "{text}");
+    }
+
+    #[test]
+    fn observations_that_reached_no_call_site_are_shown() {
+        // K-10 makes this a coverage counter rather than a finding, which is
+        // exactly why it has to be printed: a counter nobody prints is a gap
+        // nobody sees. A run whose observations mostly attribute to nothing looks
+        // identical on screen to a clean one otherwise.
+        let mut coverage = CoverageStatement::static_only();
+        coverage.unlinked_events = 9500;
+        coverage.observation_window_ms = 60_000;
+        coverage.reconciliation_mode = ReconciliationMode::StaticPlusRuntime;
+        let text = summary(&ReportBuilder::new().build(envelope(), policy(Vec::new()), coverage));
+
+        assert!(text.contains("9500"), "{text}");
+        assert!(text.contains("static_plus_runtime"), "{text}");
+        assert!(text.contains("60000 ms observed"), "{text}");
+    }
+
+    #[test]
+    fn a_run_with_nothing_unlinked_says_so_by_saying_nothing() {
+        // The counter earns a clause only when it is non zero. A line reading
+        // "0 observed calls reached no known call site" in every static scan is
+        // noise, and noise is what teaches a reader to skip the coverage block.
+        let text = summary(&empty_report());
+        assert!(text.contains("reconciled static_only"), "{text}");
+        assert!(!text.contains("reached no known call site"), "{text}");
     }
 
     #[test]

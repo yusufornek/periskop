@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 
 from periskop_hook import failopen
@@ -68,7 +69,7 @@ class StreamTest(unittest.TestCase):
         self.assertEqual(1, status["written_events_count"])
 
     def test_the_status_document_is_the_one_the_collector_reads(self):
-        # Property names, not just values. The node hook writes these five and
+        # Property names, not just values. The node hook writes these six and
         # periskop-runtime-collector looks for them; a counter spelled
         # differently in either hook is a counter that reaches nobody, which is
         # what this whole sidecar was until the collector learned to read it.
@@ -79,14 +80,62 @@ class StreamTest(unittest.TestCase):
         with open(self.path + ".status.json", encoding="utf-8") as stream:
             status = json.load(stream)
         self.assertEqual(
-            ["dropped_events_count", "failures", "hook_status", "reason",
-             "written_events_count"],
+            ["dropped_events_count", "failures", "hook_status",
+             "observation_window_ms", "reason", "written_events_count"],
             sorted(status.keys()),
         )
         # The sidecar sits beside the stream under the suffix the collector
         # selects on, and never under the stream's own extension: read back as
         # an event it would be a malformed record instead of an account of one.
         self.assertTrue(self.path.endswith(".jsonl"))
+
+    def test_the_status_carries_how_long_the_process_was_watched(self):
+        # The one number every claim about a call that did NOT happen rests on.
+        # A duration, and one this process actually measured: without it the
+        # collector reads the run as unmeasured and every dormant_egress_point
+        # finding is suppressed, which is what happened in every real run before
+        # the field existed.
+        writer = EventWriter(self.path, capacity=16)
+        writer.submit(_event(0))
+        time.sleep(0.01)
+        writer.close()
+
+        with open(self.path + ".status.json", encoding="utf-8") as stream:
+            status = json.load(stream)
+        self.assertIsInstance(status["observation_window_ms"], int)
+        self.assertGreaterEqual(status["observation_window_ms"], 10)
+        # A duration, never a stamp: an epoch millisecond value would be around
+        # 1.7e12 and would put a clock into a report that has to be diffable.
+        self.assertLess(status["observation_window_ms"], 60 * 60 * 1000)
+
+    def test_a_process_that_never_calls_anything_still_declares_its_window(self):
+        # The run a dormancy claim is most often made from: the hook was in
+        # place for an hour and no wrapped library was ever reached. Before the
+        # sidecar was written at install time this process left nothing on disk,
+        # and a directory with no file in it cannot say whether it was watched.
+        writer = EventWriter(self.path, capacity=16)
+        writer.declare()
+
+        with open(self.path + ".status.json", encoding="utf-8") as stream:
+            status = json.load(stream)
+        self.assertEqual("active", status["hook_status"])
+        self.assertEqual(0, status["written_events_count"])
+        self.assertIn("observation_window_ms", status)
+
+    def test_a_crash_before_close_still_leaves_the_window_it_reached(self):
+        # A container stop or an OOM kill never reaches close(). The sidecar is
+        # rewritten on every flush precisely so that such a process leaves the
+        # window it had reached, which understates the run and can only suppress
+        # a claim rather than invent one.
+        writer = EventWriter(self.path, capacity=16)
+        writer.submit(_event(0))
+        writer._drain_once()
+
+        with open(self.path + ".status.json", encoding="utf-8") as stream:
+            status = json.load(stream)
+        self.assertEqual(1, status["written_events_count"])
+        self.assertIn("observation_window_ms", status)
+        writer.close()
 
     def test_a_write_that_fails_counts_every_event_it_lost(self):
         # The failure this accounting exists for. A CI container fills its disk

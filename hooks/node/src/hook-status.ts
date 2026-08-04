@@ -18,6 +18,18 @@
 // number says the hook broke; a label says which stage broke, and only the
 // second is something an operator can act on. Each label is a fixed token, and
 // the reader drops any that is not, because a label is copied into a report.
+//
+// The same document carries how long this process was watched for, and it is
+// the one number a claim about a call that never happened rests on. It cannot
+// travel in the event stream: egress_event_id is derived from the call shape
+// and holds no clock, which is what makes one call recorded twice one identity.
+// It is a duration read from a monotonic clock, never a wall clock stamp, so a
+// system clock corrected mid run cannot produce a negative or inflated window.
+// Its absence means the hook never entered the call path, which is a different
+// fact from a window of zero and is spelled differently on purpose: the
+// property is omitted rather than written as 0.
+//
+// Contract: schemas/hook-status.schema.json.
 
 export type DisableReason =
   | "disabled_by_env"
@@ -36,16 +48,26 @@ export interface StatusSnapshot {
   readonly written_events_count: number;
   /** Stage labels for swallowed failures, sorted and free of duplicates. */
   readonly failures: readonly string[];
+  /**
+   * Milliseconds this process has been under observation.
+   *
+   * Omitted, never zero, when the hook never entered the call path: a reader
+   * has to be able to tell "watched for no time" from "cannot say how long".
+   */
+  readonly observation_window_ms?: number;
 }
 
 // A process that fails on every call must not turn its own failure log into the
 // payload. Bounded, and deduplicated, so the file stays a summary.
 const MAX_RECORDED_FAILURES = 64;
 
+const NS_PER_MS = 1_000_000n;
+
 let disabledReason: DisableReason | undefined;
 let failures = new Set<string>();
 let droppedEvents = 0;
 let writtenEvents = 0;
+let observationStartedAt: bigint | undefined;
 
 /**
  * Take the hook out of the request path and say so where an operator can see it.
@@ -83,8 +105,35 @@ export function countWritten(events = 1): void {
   writtenEvents += events;
 }
 
+/**
+ * Open the observation window.
+ *
+ * Called when the hook enters the call path, not when the first event arrives.
+ * A process that ran for an hour and made one call in the last minute was
+ * watched for an hour, and timing from the first event would throw the other
+ * fifty-nine minutes of evidence away.
+ *
+ * process.hrtime.bigint is monotonic. Date.now is not, and a report built on it
+ * would move when the machine's clock was corrected.
+ */
+export function startObservation(): void {
+  if (observationStartedAt !== undefined) return;
+  observationStartedAt = process.hrtime.bigint();
+}
+
+/** Milliseconds watched so far, or undefined when nothing has been watched. */
+function observationWindowMs(): number | undefined {
+  if (observationStartedAt === undefined) return undefined;
+  const elapsed = process.hrtime.bigint() - observationStartedAt;
+  // Truncated rather than rounded: a window is the floor of what was watched.
+  // The clamp costs nothing and keeps a platform whose monotonic clock ever
+  // stepped backwards from putting a negative duration into a report.
+  return elapsed > 0n ? Number(elapsed / NS_PER_MS) : 0;
+}
+
 export function snapshot(): StatusSnapshot {
-  return {
+  const window = observationWindowMs();
+  const document: StatusSnapshot = {
     hook_status: disabledReason === undefined ? "active" : "disabled",
     reason: disabledReason ?? "",
     dropped_events_count: droppedEvents,
@@ -92,6 +141,10 @@ export function snapshot(): StatusSnapshot {
     // Sorted so two runs that saw the same failures write the same bytes.
     failures: [...failures].sort(),
   };
+  // Built conditionally rather than assigned undefined: JSON.stringify would
+  // drop the key either way, but a property that exists holding undefined is a
+  // different type, and the contract distinguishes absent from present.
+  return window === undefined ? document : { ...document, observation_window_ms: window };
 }
 
 /** Test seam. Module state outlives a single test file otherwise. */
@@ -100,4 +153,5 @@ export function resetStatus(): void {
   failures = new Set<string>();
   droppedEvents = 0;
   writtenEvents = 0;
+  observationStartedAt = undefined;
 }

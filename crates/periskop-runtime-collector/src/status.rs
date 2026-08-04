@@ -26,8 +26,16 @@
 //! Nothing from the file reaches a note before it has been checked to be a fixed
 //! token. The hook is a different program, in a language this crate does not
 //! compile, and a note is written into a report somebody diffs.
+//!
+//! The same sidecar carries the one number every claim about something *not*
+//! happening rests on: how long this process was watched for. It is a duration
+//! and not a stamp, for the reason `crate::window` states, and it is read here
+//! rather than assumed, because assuming it is what left `dormant_egress_point`
+//! underivable in every real run.
 
 use serde::Deserialize;
+
+use crate::window::ObservedWindow;
 
 /// Suffix of the file a hook writes beside its event stream.
 ///
@@ -48,11 +56,20 @@ const MAX_LABEL_CHARS: usize = 64;
 /// filling a report's diagnostics with its own noise.
 const MAX_REPORTED_FAILURES: usize = 16;
 
+/// Label for a process that was watched and cannot say for how long.
+const WINDOW_NOT_MEASURED: &str = "hook_window_not_measured";
+
 /// The document both hooks write. Fields this crate does not use are ignored.
 ///
 /// `hook_status` and `dropped_events_count` carry no `serde` default on purpose:
 /// a file that omits the counter would otherwise read as "nothing was lost",
 /// which is the assumption this module exists to stop anyone from making.
+///
+/// `observation_window_ms` does carry one, and the difference is not
+/// inconsistency. A missing counter and a zero counter make the same claim about
+/// loss, so the missing one has to be refused; a missing window and a zero
+/// window make opposite claims, so the missing one has to be representable. It
+/// arrives as `None`, which is "watched, duration unknown", and never as zero.
 #[derive(Debug, Clone, Deserialize)]
 struct StatusDocument {
     hook_status: String,
@@ -61,6 +78,8 @@ struct StatusDocument {
     reason: String,
     #[serde(default)]
     failures: Vec<String>,
+    #[serde(default)]
+    observation_window_ms: Option<u64>,
 }
 
 /// What one status file adds to a collection.
@@ -73,6 +92,12 @@ pub struct StatusReport {
     /// The caller prefixes the file name, the way it does for a damaged line, so
     /// that every entry in a coverage statement can be traced to one process.
     pub reasons: Vec<String>,
+    /// How long this one process was under observation.
+    ///
+    /// Folded with every other process's by [`crate::collector`], never used
+    /// alone: one worker's hour says nothing about what the run as a whole was
+    /// entitled to conclude.
+    pub window: ObservedWindow,
 }
 
 /// Reads one status file's contents.
@@ -85,16 +110,34 @@ pub fn read(contents: &str) -> StatusReport {
         return StatusReport {
             dropped: 0,
             reasons: vec!["unreadable_status".to_owned()],
+            // Accounting nobody can read cannot vouch for a duration either.
+            window: ObservedWindow::Unmeasured,
         };
     };
 
     let mut reasons = Vec::new();
+    let mut window = ObservedWindow::Unmeasured;
 
     if document.hook_status != ACTIVE {
         // A process that ran un-hooked observed nothing, and "observed nothing"
         // must never arrive at the report looking like "there was nothing to
         // observe".
         reasons.push(labelled("hook_not_active", &document.reason));
+        // Measured, and measured at zero: this process was in nobody's call
+        // path for any length of time. Reading it as unknown would be kinder to
+        // the run than the run deserves, and reading it as a window would let a
+        // process that watched nothing vouch for code that never ran.
+        window = ObservedWindow::Measured(0);
+    } else {
+        match document.observation_window_ms {
+            Some(duration_ms) => window = ObservedWindow::Measured(duration_ms),
+            // Watched, and unable to say for how long: a hook that died before
+            // it flushed, or one older than this field. Named rather than
+            // silently taken as zero, because the two decide dormancy in
+            // opposite directions and a reader has to be able to tell which
+            // process left the run unable to conclude.
+            None => reasons.push(WINDOW_NOT_MEASURED.to_owned()),
+        }
     }
 
     if document.dropped_events_count > 0 {
@@ -114,6 +157,7 @@ pub fn read(contents: &str) -> StatusReport {
     StatusReport {
         dropped: document.dropped_events_count,
         reasons,
+        window,
     }
 }
 
@@ -148,7 +192,8 @@ mod tests {
     fn document(dropped: u64) -> String {
         format!(
             r#"{{"hook_status":"active","reason":"","dropped_events_count":{dropped},
-               "written_events_count":3,"failures":[]}}"#
+               "written_events_count":3,"failures":[],
+               "observation_window_ms":600000}}"#
         )
     }
 
@@ -157,7 +202,48 @@ mod tests {
         // The common case has to stay silent, or every scan would carry a
         // diagnostic and operators would learn to skip the block.
         let report = read(&document(0));
-        assert_eq!(report, StatusReport::default());
+        assert_eq!(report.dropped, 0);
+        assert!(report.reasons.is_empty(), "{:?}", report.reasons);
+    }
+
+    #[test]
+    fn the_window_the_hook_measured_is_read_rather_than_assumed() {
+        // The whole point of the field. Before it was read, every run declared
+        // no window, and every dormant_egress_point finding was suppressed for
+        // want of the one number it rests on.
+        assert_eq!(read(&document(0)).window, ObservedWindow::Measured(600_000));
+    }
+
+    #[test]
+    fn a_hook_that_wrote_no_window_is_unmeasured_rather_than_zero() {
+        // Zero says the hook watched for no time. Absent says it watched and
+        // cannot say for how long. A crashed hook writes the second, and reading
+        // it as the first would turn an unknown into a measurement.
+        let report = read(
+            r#"{"hook_status":"active","reason":"","dropped_events_count":0,
+                "written_events_count":3,"failures":[]}"#,
+        );
+        assert_eq!(report.window, ObservedWindow::Unmeasured);
+        // And the run is told which process left it unable to conclude.
+        assert_eq!(report.reasons, [WINDOW_NOT_MEASURED]);
+    }
+
+    #[test]
+    fn a_process_that_ran_un_hooked_measured_a_window_of_zero() {
+        // Not unknown: this one is known, and known to be nothing. It has to
+        // reach the fold as a number, or a directory holding one hooked and one
+        // un-hooked process would look uniformly instrumented.
+        let report = read(
+            r#"{"hook_status":"disabled","reason":"install_failed",
+                "dropped_events_count":0,"failures":[],
+                "observation_window_ms":900000}"#,
+        );
+        assert_eq!(report.window, ObservedWindow::Measured(0));
+    }
+
+    #[test]
+    fn accounting_nobody_can_read_vouches_for_no_duration() {
+        assert_eq!(read("{ not json").window, ObservedWindow::Unmeasured);
     }
 
     #[test]
@@ -199,6 +285,7 @@ mod tests {
     fn swallowed_failures_reach_the_report() {
         let report = read(
             r#"{"hook_status":"active","reason":"","dropped_events_count":0,
+                "observation_window_ms":600000,
                 "failures":["writer.drain:OSError","writer.flush"]}"#,
         );
         assert_eq!(
@@ -235,7 +322,8 @@ mod tests {
     fn one_noisy_process_cannot_fill_the_report() {
         let failures: Vec<String> = (0..100).map(|i| format!("\"stage{i}\"")).collect();
         let report = read(&format!(
-            r#"{{"hook_status":"active","dropped_events_count":0,"failures":[{}]}}"#,
+            r#"{{"hook_status":"active","dropped_events_count":0,
+                 "observation_window_ms":600000,"failures":[{}]}}"#,
             failures.join(",")
         ));
         assert_eq!(report.reasons.len(), MAX_REPORTED_FAILURES);

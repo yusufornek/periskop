@@ -30,6 +30,13 @@
       "rationale": "The hook records structure, never content. A raw_body field would turn an observation tool into a copy of the data it was deployed to protect, so the schema refuses the field outright rather than trusting every caller to leave it out."
     },
     {
+      "file": "hook-status.invalid.json",
+      "schema": "hook-status.schema.json",
+      "violates": "the observation window is a duration, never a wall clock stamp",
+      "expected_error_contains": "/observation_window_ms",
+      "rationale": "A stamp in this field would put a clock value into the one number every dormant_egress_point finding rests on, and two runs over the same observations would then reconcile differently. The field is also what tells a reader whether the hook was watching for ten minutes or ten milliseconds, so a string that merely looks temporal must be rejected rather than parsed leniently by whichever reader gets there first."
+    },
+    {
       "file": "flow.invalid.json",
       "schema": "flow.schema.json",
       "violates": "a flow may not carry payload bytes",

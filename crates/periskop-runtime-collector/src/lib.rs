@@ -17,6 +17,8 @@
 pub mod collector;
 pub mod event;
 pub mod status;
+pub mod window;
 
 pub use collector::{collect, CollectionResult};
 pub use event::{EgressEvent, EventError};
+pub use window::ObservedWindow;

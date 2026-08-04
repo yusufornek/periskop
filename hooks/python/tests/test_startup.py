@@ -263,6 +263,29 @@ class InstrumentedProcessTest(unittest.TestCase):
         self.assertEqual([], [path for path in _streams(self.event_dir)
                               if path.endswith(".status.json")])
 
+    def test_the_sidecar_a_real_process_leaves_satisfies_its_contract(self):
+        """What the hook writes is what schemas/hook-status.schema.json says.
+
+        Asserted on the bytes a real interpreter left on disk, because the
+        document is read by another component in another language: a field this
+        hook spells its own way is a field that reaches nobody.
+        """
+        self._run_worker({"PERISKOP_EVENT_DIR": self.event_dir})
+
+        sidecars = glob.glob(os.path.join(self.event_dir, "*.status.json"))
+        self.assertEqual(1, len(sidecars), sidecars)
+        with open(sidecars[0], encoding="utf-8") as stream:
+            document = json.load(stream)
+
+        schema = support.hook_status_schema()
+        self.assertEqual([], schema_check.validate(document, schema))
+        self.assertEqual("active", document["hook_status"])
+        # The window every claim about a call that did NOT happen rests on. A
+        # duration measured by this process, never a clock: an epoch value would
+        # be around 1.7e12 and would make the report undiffable.
+        self.assertIsInstance(document["observation_window_ms"], int)
+        self.assertLess(document["observation_window_ms"], 60 * 60 * 1000)
+
     def test_the_legacy_output_variable_still_names_one_file(self):
         # An existing deployment that sets the old variable keeps working; it
         # just does not get the per process naming the directory model gives.

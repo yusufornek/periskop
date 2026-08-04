@@ -19,6 +19,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use periskop_reconcile::settings::ReconcileSettings;
 use periskop_report::coverage::ReconciliationMode;
 use periskop_report::report::DiagnosticComponent;
 use periskop_report::to_canonical_json;
@@ -36,6 +37,125 @@ use periskop_cli::scan;
 const CLIENT_WITH_A_DECLARED_TARGET: &str = "from openai import OpenAI\n\nclient = OpenAI(base_url=\"https://api.openai.com/v1\")\n\n\ndef ask(record):\n    return client.chat.completions.create(model=\"gpt-4\", messages=[{\"content\": record}])\n";
 
 const GENERATED_AT: &str = "2026-08-04T09:00:00Z";
+
+/// Set in continuous integration so a machine with no python3 fails the end to
+/// end proof rather than skipping it, exactly as `proof.rs` uses it. One switch
+/// for both gates, because two would mean a green pipeline could still be
+/// hiding one of them.
+const REQUIRE_PROOF: &str = "PERISKOP_REQUIRE_PROOF";
+
+/// The sample the hook runs: two egress points, one of which is never called.
+///
+/// The two differ in both keys the join compares, the operation and the
+/// destination, which is what makes the untouched one genuinely unobserved
+/// rather than silenced by the call the other one made. A second call site
+/// sharing either key would be attributed through it, which is correct and
+/// would prove nothing here.
+const TWO_POINTS_ONE_CALL: &str = r#""""Two places this code can send data. One line runs, the other never does.
+
+Nothing here is unusual: a vendor client and a gateway client side by side is
+what a deployment with a staging route looks like. The point of the sample is
+that only one of the two is reached while the process is watched.
+"""
+
+import time
+
+from openai import OpenAI
+
+client = OpenAI(base_url="https://api.openai.com/v1")
+gateway = OpenAI(base_url="https://llm-gateway.internal/v1")
+
+
+def ask(record):
+    return client.chat.completions.create(
+        model="gpt-4", messages=[{"content": record}])
+
+
+def embed(record):
+    return gateway.embeddings.create(model="text-embedding-3", input=record)
+
+
+if __name__ == "__main__":
+    ask("ticket 4471: the invoice total does not match the order")
+    # The window is a duration the hook measures, so the sample has to occupy
+    # one. Fifty milliseconds is far above the threshold this test states and
+    # far below one anybody waits for.
+    time.sleep(0.05)
+"#;
+
+/// Stand in for the OpenAI SDK, cut down to the shape the hook patches.
+///
+/// The same trade `proof.rs` makes for `requests`, for the same two reasons:
+/// the test installs no third party package, so it measures the hook rather
+/// than the machine's site-packages, and it opens no socket, because a test
+/// that reached a provider would prove the machine had a network and would send
+/// a request on every `cargo test`.
+///
+/// What it does not soften is the thing under test. The resource classes are
+/// the exact attributes `periskop_hook.wrappers.openai_sdk` names, and the base
+/// url is read off the client the way the real SDK holds it, so at the point the
+/// hook observes this is indistinguishable from the library.
+const OPENAI_SDK_STUB: &str = r#""""Minimal stand in for the openai package, for the periskop pipeline test.
+
+Only the surface the hook patches is present: the resource classes it names, and
+a client object holding the base url the wrapper reads the destination from.
+"""
+
+import types
+
+
+class _Resource(object):
+    def __init__(self, client):
+        self._client = client
+
+
+class Completions(_Resource):
+    def create(self, **kwargs):
+        return "chat-response"
+
+
+class AsyncCompletions(_Resource):
+    def create(self, **kwargs):
+        return "chat-response"
+
+
+class Responses(_Resource):
+    def create(self, **kwargs):
+        return "response"
+
+
+class AsyncResponses(_Resource):
+    def create(self, **kwargs):
+        return "response"
+
+
+class Embeddings(_Resource):
+    def create(self, **kwargs):
+        return "embedding"
+
+
+class AsyncEmbeddings(_Resource):
+    def create(self, **kwargs):
+        return "embedding"
+
+
+resources = types.SimpleNamespace(
+    chat=types.SimpleNamespace(
+        completions=types.SimpleNamespace(
+            Completions=Completions, AsyncCompletions=AsyncCompletions)),
+    responses=types.SimpleNamespace(
+        Responses=Responses, AsyncResponses=AsyncResponses),
+    embeddings=types.SimpleNamespace(
+        Embeddings=Embeddings, AsyncEmbeddings=AsyncEmbeddings),
+)
+
+
+class OpenAI(object):
+    def __init__(self, base_url=None):
+        self.base_url = base_url
+        self.chat = types.SimpleNamespace(completions=Completions(self))
+        self.embeddings = Embeddings(self)
+"#;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -64,6 +184,24 @@ impl Fixture {
 
     fn write_source(&self, contents: &str) -> &Self {
         std::fs::write(self.root.join("project/app.py"), contents).unwrap();
+        self
+    }
+
+    /// Writes another file into the scanned tree.
+    fn write_project_file(&self, relative: &str, contents: &str) -> &Self {
+        std::fs::write(self.root.join("project").join(relative), contents).unwrap();
+        self
+    }
+
+    /// Writes one status sidecar, the accounting a hook leaves beside a stream.
+    fn write_status(&self, stream_name: &str, contents: &str) -> &Self {
+        std::fs::write(
+            self.root
+                .join("events")
+                .join(format!("{stream_name}.status.json")),
+            contents,
+        )
+        .unwrap();
         self
     }
 
@@ -96,6 +234,26 @@ impl Fixture {
 
     fn scan_without_events(&self) -> scan::ScanOutcome {
         run_with(&self.project(), None)
+    }
+
+    /// The same scan with the dormancy threshold the caller states.
+    ///
+    /// The default is ten minutes, which no test can wait for. What a test may
+    /// not do instead is fake the window: the duration under the threshold has
+    /// to be one a real hook really measured, or the proof is of nothing. So the
+    /// window stays real and the threshold moves, which is the one of the two
+    /// the contract lets a caller state.
+    fn scan_with_min_window(&self, minimum_ms: u64) -> scan::ScanOutcome {
+        scan::run_with_events_and_settings(
+            scan::ScanRequest {
+                project_root: &self.project(),
+                rules_root: &repo_root().join("rules"),
+                tool_version: "0.0.0-test",
+                generated_at: GENERATED_AT.to_owned(),
+            },
+            Some(&self.events()),
+            ReconcileSettings::default().with_min_dormant_window_ms(minimum_ms),
+        )
     }
 }
 
@@ -302,9 +460,15 @@ fn a_call_whose_destination_the_hook_could_not_read_produces_no_drift() {
     // it to the code point, so it is not counted as reaching nothing.
     assert_eq!(outcome.report.coverage.unlinked_events, 0);
     assert_eq!(outcome.report.coverage.dropped_events, 0);
-    // And the run reports no internal disagreement over it.
+    // And the run reports no internal disagreement over the record itself. The
+    // stream is named in a diagnostic only when something in it was lost, and
+    // a call whose destination the hook could not read is not a loss. The run
+    // does report that nobody stated a window, which is a fact about the
+    // directory rather than about this event.
     assert!(
-        details(&outcome, DiagnosticComponent::RuntimeHooks).is_empty(),
+        !details(&outcome, DiagnosticComponent::RuntimeHooks)
+            .iter()
+            .any(|detail| detail.contains("worker-1.jsonl")),
         "{:?}",
         outcome.report.diagnostics
     );
@@ -598,6 +762,351 @@ fn the_static_findings_survive_the_reconciled_run() {
     assert_eq!(declared(&with_events), declared(&without));
     assert_eq!(declared(&with_events), 1, "{:?}", with_events.report);
     assert!(with_events.report.findings.len() > without.report.findings.len());
+}
+
+/// The interpreter to run the sample with, or the reason there is none.
+///
+/// Same policy as `proof.rs`, and deliberately the same switch: a machine with
+/// no python3 says so loudly and states that this run did not close the gate,
+/// and continuous integration sets [`REQUIRE_PROOF`] so that a skip there is a
+/// failure. Two policies would mean a green pipeline could still be hiding one
+/// of the two gates.
+fn python_interpreter() -> Result<String, String> {
+    for candidate in ["python3", "python"] {
+        match Command::new(candidate).arg("--version").output() {
+            Ok(output) if output.status.success() => return Ok(candidate.to_owned()),
+            Ok(output) => {
+                return Err(format!(
+                    "{candidate} is on PATH but `{candidate} --version` exited with {}",
+                    output.status
+                ))
+            }
+            Err(_) => continue,
+        }
+    }
+    Err("no python3 or python interpreter on PATH".to_owned())
+}
+
+/// Runs the sample under the real hook, the documented fallback way.
+///
+/// `PYTHONPATH` points at `hooks/python`, whose `sitecustomize.py` installs the
+/// hook before the application's first line. The application is not modified,
+/// which is the property the whole runtime source rests on.
+fn run_hooked(interpreter: &str, project: &Path, event_dir: &Path) -> std::process::Output {
+    Command::new(interpreter)
+        .arg("app.py")
+        .current_dir(project)
+        .env("PYTHONPATH", repo_root().join("hooks/python"))
+        // Keeps the run from leaving __pycache__ directories in a source tree
+        // the test does not own.
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("PERISKOP_EVENT_DIR", event_dir)
+        .env("PERISKOP_HOOK_ENTRYPOINT", "pipeline-app")
+        // A developer who switched the hook off in their shell would otherwise
+        // get an empty event directory and a failure with no obvious cause.
+        .env_remove("PERISKOP_HOOK")
+        .env_remove("PERISKOP_HOOK_OUTPUT")
+        .output()
+        .expect("the interpreter answered --version, so it can run a script")
+}
+
+/// The window the hook itself wrote, read straight off the sidecar.
+///
+/// Read from the file rather than taken from the report, so that the assertion
+/// comparing the two is comparing two sources and not one value with itself.
+fn window_the_hook_wrote(event_dir: &Path) -> u64 {
+    let mut windows: Vec<u64> = Vec::new();
+    for entry in std::fs::read_dir(event_dir)
+        .expect("event directory")
+        .flatten()
+    {
+        let path = entry.path();
+        if !path.to_string_lossy().ends_with(".status.json") {
+            continue;
+        }
+        let document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("status file"))
+                .expect("the hook writes JSON");
+        windows.push(
+            document["observation_window_ms"]
+                .as_u64()
+                .expect("the hook states how long it was watching"),
+        );
+    }
+    assert_eq!(windows.len(), 1, "the sample runs exactly one process");
+    windows[0]
+}
+
+/// The code point a finding is about.
+fn egress_point_of(finding: &periskop_core::finding::Finding) -> &str {
+    finding
+        .refs
+        .iter()
+        .find(|reference| reference.ref_type == periskop_core::finding::RefType::EgressPoint)
+        .map(|reference| reference.ref_id.as_str())
+        .expect("every finding about a call site names it")
+}
+
+fn findings_of_kind(
+    outcome: &scan::ScanOutcome,
+    kind: periskop_core::finding::Kind,
+) -> Vec<&periskop_core::finding::Finding> {
+    outcome
+        .report
+        .findings
+        .iter()
+        .chain(outcome.report.suspect_findings.iter())
+        .filter(|finding| finding.kind == kind)
+        .collect()
+}
+
+/// **The gate for F2-N. A run in which this does not pass has not closed it.**
+///
+/// Everything before this test proved a piece: the hook measures a window, the
+/// collector folds one out of the sidecars, the scan converts it. None of that
+/// is worth anything on its own, because the defect being fixed was exactly a
+/// chain of correct pieces that no real run ever assembled: `dormant_egress_point`
+/// was derivable in a unit test, the pipeline passed `ObservationWindow::NONE`,
+/// and every scan of a real repository suppressed the finding.
+///
+/// So this runs the real hook in a real interpreter over a sample with two
+/// egress points, calls one of them, and asks the scan whether it reports the
+/// other. The window under the claim is the one that process actually measured;
+/// nothing in the test writes it.
+#[test]
+fn a_call_site_the_running_program_never_reached_is_reported_dormant() {
+    let interpreter = match python_interpreter() {
+        Ok(interpreter) => interpreter,
+        Err(reason) => {
+            assert!(
+                std::env::var_os(REQUIRE_PROOF).is_none(),
+                "{REQUIRE_PROOF} is set and the F2-N gate cannot run: {reason}"
+            );
+            eprintln!(
+                "\n  SKIPPED: the dormant_egress_point end to end proof did not run.\n  \
+                 Reason: {reason}\n  \
+                 This run does not close F2-N. Install a python3 interpreter, or set \
+                 {REQUIRE_PROOF}=1\n  to make the missing interpreter a failure instead \
+                 of a skip.\n"
+            );
+            return;
+        }
+    };
+
+    let fixture = Fixture::new("dormant-end-to-end");
+    fixture
+        .write_source(TWO_POINTS_ONE_CALL)
+        .write_project_file("openai.py", OPENAI_SDK_STUB);
+
+    // (a) The program runs, hooked. A non zero exit would be a fail-open
+    //     failure before it proved anything about findings.
+    let run = run_hooked(&interpreter, &fixture.project(), &fixture.events());
+    assert!(
+        run.status.success(),
+        "the hooked application did not exit cleanly.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    // (b) The window is one the hook measured, not one this test invented.
+    let measured = window_the_hook_wrote(&fixture.events());
+    assert!(
+        measured >= 50,
+        "the sample occupies fifty milliseconds, so the hook measured at least that: {measured}"
+    );
+
+    // (c) The scan. The threshold is stated rather than the default ten
+    //     minutes, which no test can wait for; the window it is compared
+    //     against is real.
+    let outcome = fixture.scan_with_min_window(1);
+
+    assert_eq!(
+        outcome.report.coverage.reconciliation_mode,
+        ReconciliationMode::StaticPlusRuntime
+    );
+    assert_eq!(
+        outcome.report.coverage.observation_window_ms, measured,
+        "the window in the report is the one the hook wrote: {:?}",
+        outcome.report.coverage
+    );
+
+    // (d) Two call sites were declared and one call was observed.
+    let declared = findings_of_kind(&outcome, periskop_core::finding::Kind::DeclaredEgressPoint);
+    assert_eq!(declared.len(), 2, "{declared:?}");
+    let point_for = |operation: &str| -> &str {
+        declared
+            .iter()
+            .find(|finding| finding.operation.as_deref() == Some(operation))
+            .map(|finding| egress_point_of(finding))
+            .unwrap_or_else(|| panic!("the scanner read no point for {operation}: {declared:?}"))
+    };
+
+    // (e) The finding. One, for the line the program never reached.
+    let dormant = findings_of_kind(&outcome, periskop_core::finding::Kind::DormantEgressPoint);
+    assert_eq!(
+        dormant.len(),
+        1,
+        "one line ran and one did not, so exactly one dormancy is derivable: {:?}",
+        outcome.report
+    );
+    assert_eq!(
+        egress_point_of(dormant[0]),
+        point_for("embeddings.create"),
+        "the dormant finding is about the line that never ran"
+    );
+    assert_ne!(
+        egress_point_of(dormant[0]),
+        point_for("chat.completions.create"),
+        "the line the program did run must not be reported as never executed"
+    );
+    assert_eq!(
+        dormant[0].detector.component,
+        periskop_core::finding::Component::Reconciliation
+    );
+    // The claim is stated no more firmly than the run can defend: a call to this
+    // vendor was observed, so any of its call sites could have made it.
+    assert_eq!(
+        dormant[0].confidence,
+        periskop_core::finding::Confidence::Suspect
+    );
+    // And the window it rests on travels with it, so the claim can be argued
+    // with rather than only read.
+    let evidence: Vec<&str> = dormant[0]
+        .evidence
+        .iter()
+        .map(|evidence| evidence.r#ref.as_str())
+        .collect();
+    assert!(
+        evidence
+            .iter()
+            .any(|text| text.contains(&format!("observation_window_ms={measured}"))),
+        "{evidence:?}"
+    );
+    // Nothing was lost on the way: this is a clean run, not one whose events
+    // the collector could not read.
+    assert_eq!(outcome.report.coverage.dropped_events, 0);
+    assert_eq!(outcome.report.coverage.unlinked_events, 0);
+}
+
+#[test]
+fn a_window_no_hook_measured_suppresses_the_claim_and_the_report_says_which() {
+    // The other half of the gate. A hook that died before it could flush leaves
+    // its stream and no accounting, and the run then knows a call happened and
+    // not how long it watched. Deriving a dormancy from that would state the one
+    // fact the finding rests on without having measured it.
+    let fixture = Fixture::new("window-unmeasured");
+    fixture.write_events("worker-1.jsonl", &[call_to("api.openai.com")]);
+
+    let outcome = fixture.scan_with_min_window(1);
+
+    assert!(
+        findings_of_kind(&outcome, periskop_core::finding::Kind::DormantEgressPoint).is_empty(),
+        "an unmeasured window cannot support a dormancy claim: {:?}",
+        outcome.report
+    );
+    // Suppressed is not the same as absent, so the report carries both halves:
+    // that the kind was not derived, and that the window was never measured.
+    // Without the second line a reader sees observation_window_ms: 0 and cannot
+    // tell a hook that watched nothing from one that never said.
+    let stated = details(&outcome, DiagnosticComponent::Reconciliation);
+    assert!(
+        stated
+            .iter()
+            .any(|detail| detail.contains("dormant_egress_point")
+                && detail.contains("observation_window_too_short")),
+        "{stated:?}"
+    );
+    let hooks = details(&outcome, DiagnosticComponent::RuntimeHooks);
+    assert!(
+        hooks
+            .iter()
+            .any(|detail| detail.contains("observation window not measured")),
+        "{hooks:?}"
+    );
+    assert_eq!(outcome.report.coverage.observation_window_ms, 0);
+}
+
+#[test]
+fn a_measured_window_and_an_unmeasured_one_do_not_produce_the_same_report() {
+    // The distinction the whole change rests on, held against the one field the
+    // coverage statement has for it. Both runs write 0 or a duration into
+    // observation_window_ms, and only the diagnostics say which of the two
+    // silences the reader is looking at.
+    let measured = Fixture::new("window-measured");
+    measured
+        .write_events("worker-1.jsonl", &[call_to("api.openai.com")])
+        .write_status(
+            "worker-1.jsonl",
+            r#"{"hook_status":"active","reason":"","dropped_events_count":0,
+                "written_events_count":1,"failures":[],
+                "observation_window_ms":900000}"#,
+        );
+
+    let outcome = measured.scan();
+
+    assert_eq!(outcome.report.coverage.observation_window_ms, 900_000);
+    assert!(
+        !details(&outcome, DiagnosticComponent::RuntimeHooks)
+            .iter()
+            .any(|detail| detail.contains("observation window not measured")),
+        "a run that measured its window must not report that it did not: {:?}",
+        outcome.report.diagnostics
+    );
+    // Nine hundred seconds is over the declared threshold, so the kind is not
+    // suppressed for want of a window either.
+    assert!(
+        !details(&outcome, DiagnosticComponent::Reconciliation)
+            .iter()
+            .any(|detail| detail.contains("dormant_egress_point")
+                && detail.contains("observation_window_too_short")),
+        "{:?}",
+        outcome.report.diagnostics
+    );
+}
+
+#[test]
+fn one_process_that_ran_un_hooked_takes_the_dormancy_claim_with_it() {
+    // A window of zero rather than an unknown one, and it decides the run: part
+    // of the program ran in nobody's call path, so no silence observed anywhere
+    // else can be read as code that never executes.
+    let fixture = Fixture::new("window-unhooked-process");
+    fixture
+        .write_events("worker-1.jsonl", &[call_to("api.openai.com")])
+        .write_status(
+            "worker-1.jsonl",
+            r#"{"hook_status":"active","reason":"","dropped_events_count":0,
+                "written_events_count":1,"failures":[],
+                "observation_window_ms":900000}"#,
+        )
+        .write_status(
+            "worker-2.jsonl",
+            r#"{"hook_status":"disabled","reason":"install_failed",
+                "dropped_events_count":0,"written_events_count":0,"failures":[]}"#,
+        );
+
+    let outcome = fixture.scan_with_min_window(1);
+
+    assert_eq!(outcome.report.coverage.observation_window_ms, 0);
+    assert!(
+        findings_of_kind(&outcome, periskop_core::finding::Kind::DormantEgressPoint).is_empty(),
+        "{:?}",
+        outcome.report
+    );
+    // The window was measured, so this is not the unmeasured case and must not
+    // be reported as one. Which process cost the run is named instead.
+    let hooks = details(&outcome, DiagnosticComponent::RuntimeHooks);
+    assert!(
+        !hooks
+            .iter()
+            .any(|detail| detail.contains("observation window not measured")),
+        "{hooks:?}"
+    );
+    assert!(
+        hooks
+            .iter()
+            .any(|detail| detail.contains("hook_not_active: install_failed")),
+        "{hooks:?}"
+    );
 }
 
 #[test]

@@ -26,6 +26,11 @@ def activate(config):
     # Resolved once: the call path must not pay for a getcwd on every call.
     _project_root = os.getcwd()
     _writer = EventWriter(config.output_path, config.buffer_capacity)
+    # The observation window starts here, so the accounting has to exist here
+    # too: a hooked process that never calls a wrapped library would otherwise
+    # leave nothing on disk, and a run cannot tell an hour of watching from a
+    # process that never started by looking at a directory with no file in it.
+    _writer.declare()
     return _writer
 
 

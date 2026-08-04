@@ -20,6 +20,7 @@ use std::path::Path;
 
 use crate::event::EgressEvent;
 use crate::status::{self, STATUS_FILE_SUFFIX};
+use crate::window::{ObservedWindow, WindowFold};
 
 /// Extension of a hook event file.
 ///
@@ -58,6 +59,13 @@ pub struct CollectionResult {
     /// never quotes the record, because the records this list describes are
     /// exactly the ones suspected of carrying content they should not.
     pub malformed: Vec<String>,
+    /// How long the hooks were watching, folded across every process here.
+    ///
+    /// The one number a claim about something *not* happening rests on, and the
+    /// reason this crate reads the sidecars for more than their loss counters.
+    /// Unmeasured is the honest answer for a directory whose processes never
+    /// said, and it is not zero: see [`crate::window`].
+    pub window: ObservedWindow,
 }
 
 impl CollectionResult {
@@ -99,14 +107,23 @@ impl CollectionResult {
 pub fn collect(dir: &Path) -> CollectionResult {
     let mut result = CollectionResult::default();
     let listing = hook_files(dir, &mut result);
+    let mut window = WindowFold::default();
 
     for file_name in &listing.events {
         read_event_file(&dir.join(file_name), file_name, &mut result);
+        if !listing.has_status_for(file_name) {
+            // A process that wrote events and never accounted for itself: it
+            // crashed before its first flush, or it is still running. Either way
+            // nothing says how long it was watched, and the run may not assume
+            // it was watched for as long as its neighbours were.
+            window.add(ObservedWindow::Unmeasured);
+        }
     }
     for file_name in &listing.statuses {
-        read_status_file(&dir.join(file_name), file_name, &mut result);
+        read_status_file(&dir.join(file_name), file_name, &mut result, &mut window);
     }
 
+    result.window = window.resolve();
     result.normalize();
     result
 }
@@ -120,6 +137,18 @@ pub fn collect(dir: &Path) -> CollectionResult {
 struct HookFiles {
     events: Vec<String>,
     statuses: Vec<String>,
+}
+
+impl HookFiles {
+    /// Whether the process that wrote `file_name` also left its accounting.
+    ///
+    /// Binary search rather than a scan, because both lists grow with the number
+    /// of workers and this runs once per stream. Sound only because
+    /// [`hook_files`] sorts before returning.
+    fn has_status_for(&self, file_name: &str) -> bool {
+        let sidecar = format!("{file_name}{STATUS_FILE_SUFFIX}");
+        self.statuses.binary_search(&sidecar).is_ok()
+    }
 }
 
 /// Lists what the hooks wrote, in an order that does not depend on the filesystem.
@@ -176,16 +205,24 @@ fn hook_files(dir: &Path, result: &mut CollectionResult) -> HookFiles {
 /// on the way out of a full ring, or after a write that failed. This sidecar is
 /// the only record they existed, so a collector that reads only `.jsonl` files
 /// reports the loss as a clean result.
-fn read_status_file(path: &Path, file_name: &str, result: &mut CollectionResult) {
+fn read_status_file(
+    path: &Path,
+    file_name: &str,
+    result: &mut CollectionResult,
+    window: &mut WindowFold,
+) {
     let Ok(contents) = std::fs::read_to_string(path) else {
         // Named without a count, for the reason given on `dropped`: how much a
-        // process lost is unknowable once its accounting is unreadable.
+        // process lost is unknowable once its accounting is unreadable. So is
+        // how long it was watching.
         result.malformed.push(format!("{file_name}: unreadable"));
+        window.add(ObservedWindow::Unmeasured);
         return;
     };
 
     let report = status::read(&contents);
     result.dropped += report.dropped;
+    window.add(report.window);
     for reason in report.reasons {
         result.malformed.push(format!("{file_name}: {reason}"));
     }
@@ -256,7 +293,13 @@ mod tests {
 
     impl TempDir {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("periskop-collector-{name}"));
+            // The process id is part of the name because the first thing this
+            // does is delete the directory. Two test runs on one machine, which
+            // is what a workspace run and an editor's test runner are, would
+            // otherwise delete each other's fixtures mid assertion and fail in
+            // whichever test happened to be reading at the time.
+            let dir = std::env::temp_dir()
+                .join(format!("periskop-collector-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
             Self(dir)
@@ -519,7 +562,8 @@ mod tests {
         dir.write(
             "worker-1.jsonl.status.json",
             r#"{"hook_status":"active","reason":"","dropped_events_count":200000,
-                "written_events_count":1,"failures":[]}"#,
+                "written_events_count":1,"failures":[],
+                "observation_window_ms":600000}"#,
         );
 
         let result = collect(dir.path());
@@ -542,7 +586,8 @@ mod tests {
         dir.write(
             "worker-1.jsonl.status.json",
             r#"{"hook_status":"active","reason":"","dropped_events_count":0,
-                "written_events_count":1,"failures":[]}"#,
+                "written_events_count":1,"failures":[],
+                "observation_window_ms":600000}"#,
         );
 
         let result = collect(dir.path());
@@ -579,11 +624,13 @@ mod tests {
         let dir = TempDir::new("hook-drops-many");
         dir.write(
             "a.jsonl.status.json",
-            r#"{"hook_status":"active","dropped_events_count":12,"failures":[]}"#,
+            r#"{"hook_status":"active","dropped_events_count":12,"failures":[],
+                "observation_window_ms":600000}"#,
         );
         dir.write(
             "b.jsonl.status.json",
-            r#"{"hook_status":"active","dropped_events_count":30,"failures":[]}"#,
+            r#"{"hook_status":"active","dropped_events_count":30,"failures":[],
+                "observation_window_ms":600000}"#,
         );
 
         let result = collect(dir.path());
@@ -592,6 +639,89 @@ mod tests {
         // Each entry names its own file: a total nobody can trace to a process
         // is a number nobody can act on.
         assert_eq!(result.malformed.len(), 2);
+    }
+
+    /// One process's accounting, with the window it claims to have watched for.
+    fn status(window_ms: Option<u64>) -> String {
+        let window = match window_ms {
+            Some(ms) => format!(r#","observation_window_ms":{ms}"#),
+            None => String::new(),
+        };
+        format!(
+            r#"{{"hook_status":"active","reason":"","dropped_events_count":0,
+                 "written_events_count":1,"failures":[]{window}}}"#
+        )
+    }
+
+    #[test]
+    fn the_window_the_hooks_measured_reaches_the_result() {
+        // The number the whole dormancy claim rests on, carried from the hook's
+        // own accounting rather than assumed by the reader.
+        let dir = TempDir::new("window");
+        dir.write("worker-1.jsonl", &line("api.openai.com"));
+        dir.write("worker-1.jsonl.status.json", &status(Some(900_000)));
+
+        assert_eq!(
+            collect(dir.path()).window,
+            ObservedWindow::Measured(900_000)
+        );
+    }
+
+    #[test]
+    fn the_least_watched_process_decides_what_the_run_may_conclude() {
+        // Two workers, two windows. The hour long one may not speak for the one
+        // that lived fifty milliseconds: the code that never ran may be exactly
+        // the code only the short one could reach.
+        let dir = TempDir::new("window-shortest");
+        dir.write("a.jsonl", &line("api.openai.com"));
+        dir.write("a.jsonl.status.json", &status(Some(3_600_000)));
+        dir.write("b.jsonl", &line("api.anthropic.com"));
+        dir.write("b.jsonl.status.json", &status(Some(50)));
+
+        assert_eq!(collect(dir.path()).window, ObservedWindow::Measured(50));
+    }
+
+    #[test]
+    fn a_stream_whose_process_never_accounted_for_itself_leaves_the_run_unmeasured() {
+        // A hook that died before its first flush leaves a stream and no
+        // sidecar. Letting the other worker's window stand for it would state a
+        // duration for a process nobody timed.
+        let dir = TempDir::new("window-orphan-stream");
+        dir.write("a.jsonl", &line("api.openai.com"));
+        dir.write("a.jsonl.status.json", &status(Some(3_600_000)));
+        dir.write("b.jsonl", &line("api.anthropic.com"));
+
+        assert_eq!(collect(dir.path()).window, ObservedWindow::Unmeasured);
+    }
+
+    #[test]
+    fn an_un_hooked_process_measures_zero_and_takes_the_run_with_it() {
+        // Zero rather than unknown, and it wins the fold: part of this program
+        // ran in nobody's call path, so no absence observed anywhere else can be
+        // read as code that never ran.
+        let dir = TempDir::new("window-unhooked");
+        dir.write("a.jsonl", &line("api.openai.com"));
+        dir.write("a.jsonl.status.json", &status(Some(3_600_000)));
+        dir.write(
+            "b.jsonl.status.json",
+            r#"{"hook_status":"disabled","reason":"install_failed",
+                "dropped_events_count":0,"written_events_count":0,"failures":[]}"#,
+        );
+
+        assert_eq!(collect(dir.path()).window, ObservedWindow::Measured(0));
+    }
+
+    #[test]
+    fn a_directory_with_nothing_in_it_measured_no_window_rather_than_a_zero_one() {
+        // Both empty and missing. Neither is a run that watched for no time; both
+        // are runs that cannot say, and the distinction decides whether a
+        // dormancy claim is refused for want of evidence or made on none.
+        let dir = TempDir::new("window-empty");
+        assert_eq!(collect(dir.path()).window, ObservedWindow::Unmeasured);
+        assert_eq!(
+            collect(&dir.path().join("never-created")).window,
+            ObservedWindow::Unmeasured
+        );
     }
 
     #[test]

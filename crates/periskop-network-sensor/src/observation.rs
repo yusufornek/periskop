@@ -31,7 +31,17 @@ pub struct Observation {
     pub five_tuple: FiveTuple,
     pub resolved_host: Option<String>,
     pub resolved_host_source: Option<ResolvedHostSource>,
+    /// The server name the handshake presented, as read from the clear text
+    /// part of a ClientHello. Only ever set alongside
+    /// [`SniSource::ClientHello`]; the record validation rejects the pairing
+    /// that would contradict the field measuring the blind spot.
+    pub sni: Option<String>,
     pub sni_source: SniSource,
+    /// Everything the DNS map said this destination is called. Carried
+    /// separately from `resolved_host` because the two can disagree, and a
+    /// record declaring a disagreement while showing one side of it is a claim
+    /// nobody can check.
+    pub dns_names: Vec<String>,
     pub provider_ref: Option<String>,
     pub process_attribution: ProcessAttribution,
     pub process: Option<ProcessRecord>,
@@ -63,7 +73,9 @@ impl Observation {
             five_tuple,
             resolved_host: None,
             resolved_host_source: None,
+            sni: None,
             sni_source,
+            dns_names: Vec::new(),
             provider_ref: None,
             process_attribution: ProcessAttribution::Unattributed,
             process: None,
@@ -98,6 +110,21 @@ impl Observation {
     pub fn resolved(mut self, host: impl Into<String>, source: ResolvedHostSource) -> Self {
         self.resolved_host = Some(host.into());
         self.resolved_host_source = Some(source);
+        self
+    }
+
+    /// Records the server name the handshake presented.
+    ///
+    /// Infallible here and checked at the record: the pairing rule belongs to
+    /// the contract, and duplicating it would give two places to change it.
+    pub fn with_sni(mut self, sni: impl Into<String>) -> Self {
+        self.sni = Some(sni.into());
+        self
+    }
+
+    /// Records the names DNS mapped to this destination.
+    pub fn with_dns_names(mut self, dns_names: Vec<String>) -> Self {
+        self.dns_names = dns_names;
         self
     }
 

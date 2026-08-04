@@ -141,6 +141,22 @@ pub enum HookError {
     TargetRequired { language: Language },
     /// Something is already at the destination.
     AlreadyInstalled { occupied: Vec<PathBuf> },
+    /// A payload entry whose name this build cannot reproduce at the
+    /// destination.
+    ///
+    /// Skipping it is what this variant exists to prevent. A hook missing one
+    /// module still installs, still loads its `.pth`, and then fails its import
+    /// inside somebody else's interpreter, where the failure is swallowed by the
+    /// hook's own fail-open guard. The operator is told the installation
+    /// succeeded and the application runs with no instrumentation at all.
+    UnreadableName { path: PathBuf },
+    /// A path `NODE_OPTIONS` cannot carry.
+    ///
+    /// The variable is split on whitespace and understands quoting, but it has
+    /// no escape for a quote character inside a quoted argument. A path
+    /// containing one cannot be written down correctly, and writing it down
+    /// incorrectly produces a variable that looks right and loads nothing.
+    UnquotablePath { path: PathBuf },
     Io {
         path: PathBuf,
         error: std::io::Error,
@@ -175,6 +191,13 @@ impl HookError {
                 .to_owned(),
             },
             Self::AlreadyInstalled { .. } => "remove it, or pass --force to replace it".to_owned(),
+            Self::UnreadableName { .. } => {
+                "rename it to valid UTF-8 in the hook source tree, then install again".to_owned()
+            }
+            Self::UnquotablePath { .. } => {
+                "install the hook under a path without a quote character, or pass --target"
+                    .to_owned()
+            }
             Self::Io { .. } => "check that the path exists and is writable".to_owned(),
         }
     }
@@ -200,6 +223,16 @@ impl fmt::Display for HookError {
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
+            ),
+            Self::UnreadableName { path } => write!(
+                f,
+                "a hook file has a name that is not valid UTF-8: {}",
+                path.display()
+            ),
+            Self::UnquotablePath { path } => write!(
+                f,
+                "NODE_OPTIONS cannot carry a path containing a quote character: {}",
+                path.display()
             ),
             Self::Io { path, error } => write!(f, "{}: {error}", path.display()),
         }
@@ -321,7 +354,7 @@ pub fn install(request: &HookRequest<'_>) -> Result<Installed, HookError> {
     let occupied: Vec<PathBuf> = entries
         .iter()
         .map(|(_, to)| to.clone())
-        .filter(|to| to.exists())
+        .filter(|to| occupies(to))
         .collect();
     if !occupied.is_empty() && !request.force {
         return Err(HookError::AlreadyInstalled { occupied });
@@ -333,7 +366,7 @@ pub fn install(request: &HookRequest<'_>) -> Result<Installed, HookError> {
         // Removed rather than merged into. A file the previous version shipped
         // and this one does not would otherwise survive the upgrade and be
         // imported alongside the new package.
-        if to.exists() {
+        if occupies(to) {
             remove(to)?;
         }
         copy_entry(from, to)?;
@@ -379,7 +412,8 @@ pub fn env_vars(request: &HookRequest<'_>, ambient: &Ambient) -> Result<Vec<EnvV
             });
         }
         Language::Node => {
-            let require = format!("--require {}", root.join("preload.js").display());
+            let preload = root.join("preload.js");
+            let require = format!("--require {}", quote_for_node_options(&preload)?);
             vars.push(EnvVar {
                 name: "NODE_OPTIONS",
                 value: append_argument(ambient.node_options.as_deref(), &require),
@@ -420,6 +454,19 @@ fn source_dir(language: Language, source_root: &Path) -> PathBuf {
     source_root.join(language.as_str())
 }
 
+/// Whether anything at all sits at this path, including a link to nothing.
+///
+/// `Path::exists` follows symbolic links and answers `false` for one whose
+/// target is gone, which is the wrong answer to both questions this module asks.
+/// A broken link belonging to another tool passed the collision check, `--force`
+/// was never demanded, and the copy that followed wrote *through* the link to
+/// whatever path it named: a destination the operator never saw and this command
+/// never reported. The header of this module promises an installation is never
+/// silently replaced, and that promise was kept by a call that cannot see links.
+fn occupies(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
 fn require_present(language: Language, root: &Path) -> Result<(), HookError> {
     let probe = language.probe(root);
     if probe.exists() {
@@ -435,6 +482,33 @@ fn join_after(existing: Option<&str>, value: &str) -> String {
         Some(existing) => format!("{existing}{}{value}", path_separator()),
         None => value.to_owned(),
     }
+}
+
+/// A path written so that `NODE_OPTIONS` reads it as one argument.
+///
+/// The variable is split on whitespace before anything else looks at it, so an
+/// unquoted `/Users/ali/My Project/.../preload.js` arrives at node as
+/// `--require /Users/ali/My` followed by two stray arguments. Node then either
+/// refuses to start or starts without the hook, and the command that printed the
+/// line said it had succeeded. Paths with spaces in them are ordinary on macOS
+/// and Windows, so this is the common case rather than the exotic one.
+///
+/// Quoted unconditionally rather than only when a space is present: a value
+/// whose shape changes with its contents is one a script can get right for the
+/// paths it was tested on and wrong for the next one.
+///
+/// A quote character inside the path has no representation here, because the
+/// variable offers no escape inside a quoted argument. That is an error rather
+/// than a best effort, since best effort means printing a line that looks
+/// correct and loads nothing.
+fn quote_for_node_options(path: &Path) -> Result<String, HookError> {
+    let rendered = path.display().to_string();
+    if rendered.contains('"') {
+        return Err(HookError::UnquotablePath {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(format!("\"{rendered}\""))
 }
 
 /// Puts an argument at the end of a command line, keeping what was there.
@@ -504,15 +578,34 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), HookError> {
     children.sort();
 
     for child in children {
-        let Some(name) = child.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if is_development_residue(name) {
+        let name = entry_name(&child)?.to_owned();
+        if is_development_residue(&name) {
             continue;
         }
         copy_entry(&child, &to.join(name))?;
     }
     Ok(())
+}
+
+/// The name a payload entry will be written under.
+///
+/// A name this build cannot read is a name it cannot reproduce, and the entry is
+/// refused rather than passed over. Skipping it produced an installation
+/// reported as complete with a module missing from it; the import error that
+/// followed happened inside the application's own interpreter, where the hook's
+/// fail-open guard swallowed it by design. Refusing here is the last place the
+/// operator can still be told.
+///
+/// Its own function so the decision can be pinned without a filesystem that can
+/// hold such a name: APFS and NTFS both reject one outright, so a test that
+/// created the file would only ever run on Linux.
+fn entry_name(child: &Path) -> Result<&str, HookError> {
+    child
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| HookError::UnreadableName {
+            path: child.to_path_buf(),
+        })
 }
 
 /// Files that belong to the hook's own development rather than to a deployment.
@@ -544,8 +637,15 @@ fn create_dir_all(path: &Path) -> Result<(), HookError> {
     })
 }
 
+/// Takes one entry away, link included.
+///
+/// `symlink_metadata` for the same reason the collision check uses it, and for
+/// one more: a link pointing at a directory reports itself as a directory to
+/// `metadata`, and removing it as one would delete the contents of a directory
+/// this command was never pointed at. Seen as a link it is removed as the single
+/// entry it is.
 fn remove(path: &Path) -> Result<(), HookError> {
-    let metadata = std::fs::metadata(path).map_err(|error| HookError::Io {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| HookError::Io {
         path: path.to_path_buf(),
         error,
     })?;
@@ -558,4 +658,214 @@ fn remove(path: &Path) -> Result<(), HookError> {
         path: path.to_path_buf(),
         error,
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// A throwaway tree, built by hand.
+    ///
+    /// The same shape the integration suite uses, repeated here rather than
+    /// shared because these three cases are about how this module reads the
+    /// filesystem, and a unit test that lives beside the code it pins is the one
+    /// a reader finds from the code.
+    struct TempTree {
+        root: PathBuf,
+    }
+
+    impl TempTree {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("periskop-hook-unit-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        fn write(&self, relative: &str, contents: &str) -> PathBuf {
+            let path = self.root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, contents).unwrap();
+            path
+        }
+
+        fn path(&self, relative: &str) -> PathBuf {
+            self.root.join(relative)
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn node_source(tree: &TempTree) -> PathBuf {
+        tree.write("hooks/node/dist/preload.js", "// preload\n");
+        tree.path("hooks")
+    }
+
+    #[test]
+    fn a_node_require_path_survives_a_space_in_it() {
+        // The bug: the argument was printed unquoted. NODE_OPTIONS is split on
+        // whitespace, so a target under `My Project` produced
+        // `--require /Users/ali/My`, node loaded nothing, and the command
+        // reported success. Paths with spaces are ordinary on macOS.
+        let tree = TempTree::new("spaces");
+        let source = node_source(&tree);
+        let target = tree.path("My Project/node_modules");
+        std::fs::create_dir_all(target.join("periskop-hook")).unwrap();
+        std::fs::write(target.join("periskop-hook/preload.js"), "// preload\n").unwrap();
+
+        let request = HookRequest {
+            language: Language::Node,
+            source_root: &source,
+            target: Some(&target),
+            event_dir: Path::new(".periskop/events"),
+            force: false,
+        };
+        let vars = env_vars(&request, &Ambient::default()).unwrap();
+        let node_options = vars
+            .iter()
+            .find(|v| v.name == "NODE_OPTIONS")
+            .expect("NODE_OPTIONS is printed for node");
+
+        assert!(
+            node_options.value.contains("--require \""),
+            "{}",
+            node_options.value
+        );
+        assert!(
+            node_options.value.trim_end().ends_with("preload.js\""),
+            "{}",
+            node_options.value
+        );
+        // Split the way node splits the variable: on whitespace, but not inside
+        // a quoted run. Unquoted, this produced three arguments and the second
+        // was a path ending at the space.
+        let pieces = split_node_options(&node_options.value);
+        assert_eq!(pieces.len(), 2, "{pieces:?}");
+        assert_eq!(pieces[0], "--require");
+        assert!(Path::new(&pieces[1]).is_file(), "{pieces:?}");
+    }
+
+    /// Whitespace separated arguments, with double quotes grouping.
+    ///
+    /// The half of node's own parser this output has to survive. Written out
+    /// because asserting on the string alone would pass for a value that no
+    /// parser reads the way this test intends.
+    fn split_node_options(value: &str) -> Vec<String> {
+        let mut pieces = Vec::new();
+        let mut current = String::new();
+        let mut quoted = false;
+        let mut started = false;
+        for c in value.chars() {
+            match c {
+                '"' => {
+                    quoted = !quoted;
+                    started = true;
+                }
+                c if c.is_whitespace() && !quoted => {
+                    if started {
+                        pieces.push(std::mem::take(&mut current));
+                        started = false;
+                    }
+                }
+                c => {
+                    current.push(c);
+                    started = true;
+                }
+            }
+        }
+        if started {
+            pieces.push(current);
+        }
+        pieces
+    }
+
+    #[test]
+    fn a_path_node_options_cannot_carry_is_refused_rather_than_mangled() {
+        // No escape exists inside a quoted NODE_OPTIONS argument, so this path
+        // has no correct spelling. Printing an incorrect one would look right.
+        let quoted = Path::new("/tmp/we\"ird/preload.js");
+        let error = quote_for_node_options(quoted).unwrap_err();
+        assert!(matches!(error, HookError::UnquotablePath { .. }), "{error}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_payload_name_that_is_not_utf8_stops_the_install() {
+        // The bug: `let Some(name) = ... else { continue; }`. Skipping produced
+        // an installation reported as complete with a module missing from it,
+        // and the import error that followed was swallowed by the hook's own
+        // fail-open guard inside the application's interpreter.
+        //
+        // Pinned on the decision rather than on a file: APFS refuses to create
+        // a name like this at all, so a filesystem test would only run on Linux
+        // and would report as passing everywhere else.
+        use std::os::unix::ffi::OsStrExt;
+
+        let invalid = PathBuf::from(std::ffi::OsStr::from_bytes(
+            b"/tmp/periskop_hook/writer\xff.py",
+        ));
+        let error = entry_name(&invalid).unwrap_err();
+        assert!(
+            matches!(error, HookError::UnreadableName { .. }),
+            "silently skipped instead: {error}"
+        );
+
+        // The ordinary case still resolves, so the guard is not simply refusing
+        // everything.
+        assert_eq!(
+            entry_name(Path::new("/tmp/periskop_hook/writer.py")).unwrap(),
+            "writer.py"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_broken_symlink_at_the_destination_is_a_collision() {
+        // `Path::exists` follows links and answers false for a broken one, so
+        // the collision check passed, --force was never demanded, and the copy
+        // wrote through the link to a path the operator never saw. The link here
+        // belongs to another tool, which is the case the module header is about.
+        let tree = TempTree::new("brokenlink");
+        tree.write("hooks/python/periskop_hook/__init__.py", "# package\n");
+        tree.write("hooks/python/periskop-hook.pth", "import periskop_hook\n");
+        let target = tree.path("site-packages");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(
+            tree.path("gone/elsewhere.pth"),
+            target.join("periskop-hook.pth"),
+        )
+        .unwrap();
+
+        let source = tree.path("hooks");
+        let request = HookRequest {
+            language: Language::Python,
+            source_root: &source,
+            target: Some(&target),
+            event_dir: Path::new(".periskop/events"),
+            force: false,
+        };
+        let error = install(&request).unwrap_err();
+        assert!(
+            matches!(error, HookError::AlreadyInstalled { .. }),
+            "wrote through a link instead: {error}"
+        );
+
+        // With --force the link itself is removed, not followed: nothing appears
+        // at the path it pointed at.
+        let forced = HookRequest {
+            force: true,
+            ..request
+        };
+        install(&forced).unwrap();
+        assert!(!tree.path("gone/elsewhere.pth").exists());
+        assert!(std::fs::symlink_metadata(target.join("periskop-hook.pth"))
+            .unwrap()
+            .is_file());
+    }
 }

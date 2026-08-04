@@ -1,0 +1,8 @@
+{
+  "hook_status": "active",
+  "reason": "",
+  "dropped_events_count": 0,
+  "written_events_count": 2,
+  "failures": [],
+  "observation_window_ms": "2026-08-04T09:00:00Z"
+}

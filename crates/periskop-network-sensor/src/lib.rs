@@ -20,22 +20,34 @@
 //! - **A denied sensor cannot fail a scan.** [`sensor::observe`] returns an
 //!   outcome, never an error.
 //!
-//! The kernel side is behind [`source::FlowSource`]. This build ships the seam
-//! and a loader that reports it is not built yet.
+//! The kernel side is behind [`kernel::KernelEvents`], and the line is drawn as
+//! far towards the kernel as it will go. Which programs to attach, how a
+//! packet event joins onto a process event, what a DNS answer means, what a
+//! ClientHello means, which name wins when the two disagree and what the record
+//! then says are all on this side of it and all tested here. Opening the kernel
+//! objects is the only thing on the far side, because it is the only thing that
+//! cannot run in continuous integration (ADR-014).
 
+pub mod assemble;
 pub mod flow;
 pub mod identity;
+pub mod kernel;
 pub mod observation;
+pub mod parse;
 pub mod platform;
 pub mod privilege;
+pub mod resolve;
 pub mod scope;
 pub mod sensor;
 pub mod source;
 
+pub use assemble::FlowAssembler;
 pub use flow::{Flow, FlowError, Mechanism};
+pub use kernel::{FlowKey, KernelEvent, KernelEvents};
 pub use observation::Observation;
 pub use platform::SensorPlatformClass;
 pub use privilege::{Privileges, SensorUnavailable};
+pub use resolve::DnsObservation;
 pub use scope::{FlowScope, ScopePolicy, ScopeTally};
 pub use sensor::{observe, SensorOutcome, SensorState};
-pub use source::FlowSource;
+pub use source::{EbpfFlowSource, FlowSource, SourceCoverage};

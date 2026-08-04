@@ -140,6 +140,24 @@ pub enum DiagnosticCode {
     Internal,
 }
 
+impl DiagnosticCode {
+    /// The spelling the contract uses.
+    ///
+    /// Written out rather than left to `{:?}`, because the debug spelling is the
+    /// Rust variant name and the report says `RULE_LOAD_ERROR`. A reader who saw
+    /// `RuleLoadError` on the terminal and searched the JSON for it found
+    /// nothing, which turns one fact into two vocabularies for no gain.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedSchemaVersion => "UNSUPPORTED_SCHEMA_VERSION",
+            Self::CoreUnavailable => "CORE_UNAVAILABLE",
+            Self::RuleLoadError => "RULE_LOAD_ERROR",
+            Self::PolicyLoadError => "POLICY_LOAD_ERROR",
+            Self::Internal => "INTERNAL",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DiagnosticComponent {
@@ -148,6 +166,20 @@ pub enum DiagnosticComponent {
     NetworkSensor,
     Reconciliation,
     Reporting,
+}
+
+impl DiagnosticComponent {
+    /// The spelling the contract uses. Kebab case here, and that is not a typo:
+    /// it is the documented exception recorded as K-09.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StaticScanner => "static-scanner",
+            Self::RuntimeHooks => "runtime-hooks",
+            Self::NetworkSensor => "network-sensor",
+            Self::Reconciliation => "reconciliation",
+            Self::Reporting => "reporting",
+        }
+    }
 }
 
 /// An engine, rule or schema problem.
@@ -448,6 +480,44 @@ mod tests {
     use periskop_core::finding::{
         Component, Detector, EntityRef, Evidence, EvidenceType, Kind, RefType,
     };
+
+    /// The printed spelling and the serialized one are the same word.
+    ///
+    /// Pinned against `serde` rather than against a second literal list, because
+    /// a second list is exactly the thing that drifts. A terminal that names a
+    /// diagnostic `RuleLoadError` while the JSON beside it says
+    /// `RULE_LOAD_ERROR` gives the reader two vocabularies for one fact and no
+    /// way to search from one to the other.
+    #[test]
+    fn a_diagnostic_is_printed_in_the_words_the_contract_uses() {
+        for code in [
+            DiagnosticCode::UnsupportedSchemaVersion,
+            DiagnosticCode::CoreUnavailable,
+            DiagnosticCode::RuleLoadError,
+            DiagnosticCode::PolicyLoadError,
+            DiagnosticCode::Internal,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&code).unwrap(),
+                format!("\"{}\"", code.as_str()),
+                "{code:?}"
+            );
+        }
+
+        for component in [
+            DiagnosticComponent::StaticScanner,
+            DiagnosticComponent::RuntimeHooks,
+            DiagnosticComponent::NetworkSensor,
+            DiagnosticComponent::Reconciliation,
+            DiagnosticComponent::Reporting,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&component).unwrap(),
+                format!("\"{}\"", component.as_str()),
+                "{component:?}"
+            );
+        }
+    }
 
     fn finding(confidence: Confidence, rule: &str) -> Finding {
         Finding::new(

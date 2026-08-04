@@ -32,6 +32,11 @@ const SCHEMA = JSON.parse(
   readFileSync(join(__dirname, "..", "..", "..", "schemas", "egress-event.schema.json"), "utf8"),
 ) as Schema;
 
+/** Contract for the sidecar, read from the same place the other hook reads it. */
+const STATUS_SCHEMA = JSON.parse(
+  readFileSync(join(__dirname, "..", "..", "..", "schemas", "hook-status.schema.json"), "utf8"),
+) as Schema;
+
 /**
  * Event files as periskop-runtime-collector selects them.
  *
@@ -283,7 +288,23 @@ test("what a hooked process leaves on disk is what the collector reads", (t) => 
 
   // The status sidecar sits beside the stream and outside the selection, so a
   // run's own accounting is never read back as a malformed event.
-  assert.ok(readdirSync(eventDir).some((name) => name.endsWith(".status.json")));
+  const sidecars = readdirSync(eventDir).filter((name) => name.endsWith(".status.json"));
+  assert.equal(sidecars.length, 1);
+
+  // And it carries what the event stream cannot: how long this process was
+  // watched for. Measured by the hook in a real process, because that is the
+  // only place it can be measured, and every claim that a call site never ran
+  // is derived from this number.
+  const status = JSON.parse(
+    readFileSync(join(eventDir, sidecars[0] as string), "utf8")
+  ) as Record<string, unknown>;
+  // The document is read by another component in another language, so what it
+  // has to satisfy is the contract rather than this package's own expectations.
+  assert.deepEqual(validate(STATUS_SCHEMA, status), []);
+  assert.equal(status["hook_status"], "active");
+  assert.equal(typeof status["observation_window_ms"], "number");
+  // A duration, never a stamp: an epoch value would be around 1.7e12.
+  assert.ok((status["observation_window_ms"] as number) < 60 * 60 * 1000, JSON.stringify(status));
 });
 
 test("the previous variable name still points the hook at a directory", (t) => {

@@ -162,9 +162,12 @@ fn an_existing_environment_variable_is_kept_in_front() {
         node_options.starts_with("--require /opt/tracer.js "),
         "the existing value was dropped: {node_options}"
     );
+    // Quoted, because NODE_OPTIONS is split on whitespace and a path with a
+    // space in it is ordinary on macOS and Windows. This assertion used to pin
+    // the unquoted form, which is how the defect stayed in place (finding H-17).
     assert!(
         node_options.ends_with(&format!(
-            "--require {}",
+            "--require \"{}\"",
             source.join("node/dist/preload.js").display()
         )),
         "{node_options}"
@@ -323,7 +326,7 @@ fn installing_the_node_hook_points_the_environment_at_the_copy() {
     assert_eq!(
         value_of(&vars, "NODE_OPTIONS"),
         format!(
-            "--require {}",
+            "--require \"{}\"",
             target.join("periskop-hook/preload.js").display()
         )
     );

@@ -118,6 +118,13 @@ export class FileEventSink implements EventSink {
       noteFailure(STAGE_FLUSH);
     }
     this.#pending.length = 0;
+    // The accounting is rewritten with every batch and not only on the way out.
+    // A process killed by a container stop or an OOM handler never reaches
+    // close(), and without this it leaves a stream of events beside a window
+    // nobody measured, which suppresses every claim those events were collected
+    // to support. What the sidecar then holds is the window as of the last
+    // flush: a lower bound, which can only understate the run.
+    this.#writeStatus();
   }
 
   /**
@@ -141,10 +148,11 @@ export class FileEventSink implements EventSink {
    * The hook's own account of itself, kept out of the event stream.
    *
    * Spec section 5 wants a disabled hook to be visible rather than indistinct
-   * from a quiet one, and ADR-009 wants dropped events counted. Neither fits in
-   * the event schema, which is a closed set of properties, so both land here,
-   * where `periskop-runtime-collector` reads them back into the coverage
-   * statement.
+   * from a quiet one, ADR-009 wants dropped events counted, and a dormancy
+   * claim needs to know how long this process was watched. None of the three
+   * fits in the event schema, which is a closed set of properties and carries
+   * no clock, so all of them land here, where `periskop-runtime-collector`
+   * reads them back. Contract: schemas/hook-status.schema.json.
    *
    * Written rather than appended: a second line would make the file two JSON
    * documents, and the reader would take neither.

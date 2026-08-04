@@ -7,7 +7,7 @@
 
 import { createRecorder, type CallRecorder } from "./call-recorder";
 import { FileEventSink, type EventSink } from "./event-writer";
-import { markDisabled } from "./hook-status";
+import { markDisabled, startObservation } from "./hook-status";
 import { patchFetch } from "./patch-fetch";
 import { patchHttpModule } from "./patch-http";
 import { readConfig } from "./config";
@@ -85,6 +85,11 @@ export function install(options: InstallOptions = {}): InstallResult {
       runtime: runtimeName(process.version),
       config,
     });
+    // The window opens where the hook enters the call path, which is here and
+    // not at the first observed call. A process watched for an hour that calls
+    // a provider once at the end was watched for an hour, and timing from the
+    // first event would report a minute.
+    startObservation();
     undo = patchTransports(record);
   });
 

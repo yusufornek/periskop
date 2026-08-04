@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
 import { FileEventSink, streamName } from "./event-writer";
-import { resetStatus, snapshot } from "./hook-status";
+import { resetStatus, snapshot, startObservation } from "./hook-status";
 import type { EgressEvent } from "./egress-event";
 
 function event(id: string): EgressEvent {
@@ -102,11 +102,12 @@ test("a write that fails counts every event it lost", (t) => {
 });
 
 test("the status document is the one the collector reads", (t) => {
-  // Property names, not just values. The Python hook writes these five and
+  // Property names, not just values. The Python hook writes these six and
   // periskop-runtime-collector looks for them; a counter spelled differently
   // here is a counter that reaches nobody, which is what "dropped_events"
   // used to be.
   resetStatus();
+  startObservation();
   const { dir, cleanup } = sandbox();
   t.after(cleanup);
 
@@ -119,12 +120,73 @@ test("the status document is the one the collector reads", (t) => {
     "dropped_events_count",
     "failures",
     "hook_status",
+    "observation_window_ms",
     "reason",
     "written_events_count",
   ]);
   assert.equal(status["hook_status"], "active");
   assert.equal(status["written_events_count"], 1);
   assert.equal(status["dropped_events_count"], 0);
+});
+
+test("the status carries how long the process was watched, as a duration", (t) => {
+  // The one number every claim about a call that did NOT happen rests on.
+  // Without it the collector reads the run as unmeasured and every
+  // dormant_egress_point finding is suppressed, which is what happened in every
+  // real run before the field existed.
+  resetStatus();
+  startObservation();
+  const { dir, cleanup } = sandbox();
+  t.after(cleanup);
+
+  const sink = new FileEventSink(dir, 110, 16);
+  sink.record(event("ee_000000000000000a"));
+  sink.close();
+
+  const status = JSON.parse(readFileSync(sink.statusPath, "utf8")) as Record<string, unknown>;
+  const window = status["observation_window_ms"];
+  assert.equal(typeof window, "number");
+  assert.ok((window as number) >= 0);
+  // A duration, never a stamp. An epoch millisecond value would be around
+  // 1.7e12 and would put a clock into output that has to be diffable.
+  assert.ok((window as number) < 60 * 60 * 1000, `${String(window)} looks like a clock`);
+});
+
+test("a hook that never entered the call path states no window at all", (t) => {
+  // Absent, not zero. Zero says the hook was watching for no time; absent says
+  // it cannot say. The collector decides dormancy differently for each, so a
+  // hook that wrote 0 here would let a run conclude from an unmeasured silence.
+  resetStatus();
+  const { dir, cleanup } = sandbox();
+  t.after(cleanup);
+
+  const sink = new FileEventSink(dir, 111, 16);
+  sink.record(event("ee_000000000000000b"));
+  sink.close();
+
+  const status = JSON.parse(readFileSync(sink.statusPath, "utf8")) as Record<string, unknown>;
+  assert.ok(!("observation_window_ms" in status), JSON.stringify(status));
+});
+
+test("a process killed before close still leaves the window it reached", async (t) => {
+  // A container stop never reaches close(). The sidecar is rewritten on every
+  // flush so that such a process leaves a lower bound rather than nothing,
+  // because nothing suppresses every finding the events it did write support.
+  // The drain is left to its own timer here rather than forced, so what is
+  // proved is the path a killed process actually takes.
+  resetStatus();
+  startObservation();
+  const { dir, cleanup } = sandbox();
+  t.after(cleanup);
+
+  const sink = new FileEventSink(dir, 112, 16);
+  t.after(() => sink.close());
+  sink.record(event("ee_000000000000000c"));
+  await new Promise((resolve) => setTimeout(resolve, 400));
+
+  const status = JSON.parse(readFileSync(sink.statusPath, "utf8")) as Record<string, unknown>;
+  assert.equal(status["written_events_count"], 1);
+  assert.equal(typeof status["observation_window_ms"], "number");
 });
 
 test("the hook's own account of itself lands beside the events, not inside them", (t) => {

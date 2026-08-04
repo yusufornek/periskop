@@ -26,6 +26,7 @@ use std::path::Path;
 use periskop_core::coverage::UnparsedReason;
 use periskop_core::finding::{Finding, Kind};
 use periskop_reconcile::capability::Suppression;
+use periskop_reconcile::settings::ReconcileSettings;
 use periskop_reconcile::{
     reconcile, DeclaredPoint, DeclaredSource, ObservationWindow, ReconcileInputs, RuntimeSource,
     Sources, WireSource,
@@ -38,6 +39,7 @@ use periskop_report::report::{
     Diagnostic, DiagnosticCode, DiagnosticComponent, Envelope, PolicyRef, ReportBuilder, RuleHit,
     ScanInputs, ScanReport, Verdict,
 };
+use periskop_runtime_collector::ObservedWindow;
 use periskop_static_scanner::discovery::{discover, read_source, DiscoveryOptions};
 use periskop_static_scanner::engine::detect;
 use periskop_static_scanner::language::Language;
@@ -50,6 +52,19 @@ use periskop_static_scanner::rules::{load_directory, CompiledRules, RuleFile};
 /// Named here rather than inline because it is the join key between the verdict
 /// and the diagnostics that explain it.
 const RULE_SET_GATE: &str = "engine.rule-set-loaded";
+
+/// What the report says when no hook stated how long it was watching.
+///
+/// Written out because it is the difference between two facts the coverage
+/// statement cannot tell apart. `coverage.observation_window_ms` is an integer
+/// with no absent value, so a run that measured nothing and a run that measured
+/// zero both write `0` there; only this line says which happened, and the
+/// dormancy suppression that follows it means the opposite thing in each case.
+/// A field that can carry the difference is filed against the contract owner in
+/// `hub/memory/interfaces.md`.
+const WINDOW_NOT_MEASURED: &str =
+    "observation window not measured: no hook stated how long it was watching, \
+     so an unobserved call proves nothing";
 
 /// Everything the scan needs to know about where things live.
 pub struct ScanRequest<'a> {
@@ -87,6 +102,31 @@ pub fn run(request: ScanRequest<'_>) -> ScanOutcome {
 /// means nobody was watching. Reading the first as the second is how a tool ends
 /// up reporting a live codebase as dead.
 pub fn run_with_events(request: ScanRequest<'_>, event_dir: Option<&Path>) -> ScanOutcome {
+    run_with_events_and_settings(request, event_dir, ReconcileSettings::default())
+}
+
+/// The same run, with the reconciliation thresholds stated by the caller.
+///
+/// Only one threshold exists today and it decides whether this run may say a
+/// code point never executed: `min_dormant_window_ms`, ten minutes by default,
+/// because an absence observed over five minutes tells nobody anything. The
+/// default belongs to the product, but the number cannot only be a default. A
+/// short lived batch job is watched for seconds and a soak test for hours, and
+/// the same threshold cannot serve both; a caller that cannot state it is left
+/// choosing between a claim it cannot support and no claim at all.
+///
+/// Kept as a separate entry point rather than a field on [`ScanRequest`], for
+/// the reason [`run`] gives: the request is built by several callers and a new
+/// required field would make every one of them state a threshold it has no
+/// opinion about. The command line does not expose it yet, which is a gap filed
+/// against the CLI owner in `hub/memory/interfaces.md` rather than worked around
+/// with an environment variable: a knob that changes which findings exist and
+/// leaves no trace in the report is worse than no knob.
+pub fn run_with_events_and_settings(
+    request: ScanRequest<'_>,
+    event_dir: Option<&Path>,
+    settings: ReconcileSettings,
+) -> ScanOutcome {
     let (rules, load_errors) = load_directory(request.rules_root);
     let mut rule_errors: Vec<String> = load_errors.iter().map(|e| e.to_string()).collect();
 
@@ -194,7 +234,7 @@ pub fn run_with_events(request: ScanRequest<'_>, event_dir: Option<&Path>) -> Sc
     // against whichever events happened to have been read by then, and the
     // result would depend on the walk order.
     if let Some(event_dir) = event_dir {
-        let stage = reconcile_stage(event_dir, &static_findings);
+        let stage = reconcile_stage(event_dir, &static_findings, &settings);
         coverage.dropped_events = stage.dropped_events;
         coverage.unlinked_events = stage.unlinked_events;
         coverage.observation_window_ms = stage.observation_window_ms;
@@ -286,7 +326,11 @@ struct ReconciledStage {
 /// one layer down: damaged events are data. A scan that abandoned its report
 /// because an event file was truncated would hand any misbehaving hook the power
 /// to blind the whole run.
-fn reconcile_stage(event_dir: &Path, static_findings: &[Finding]) -> ReconciledStage {
+fn reconcile_stage(
+    event_dir: &Path,
+    static_findings: &[Finding],
+    settings: &ReconcileSettings,
+) -> ReconciledStage {
     let collected = periskop_runtime_collector::collect(event_dir);
 
     // Every line the collector could not read is named here. The count alone
@@ -317,13 +361,14 @@ fn reconcile_stage(event_dir: &Path, static_findings: &[Finding]) -> ReconciledS
         WireSource::Absent,
     );
 
-    // No window is claimed. `schemas/egress-event.schema.json` carries no clock
-    // value, by design, so nothing in the event stream says how long the hooks
-    // were watching, and the command line has no second source to read it from.
-    // Declaring a duration it did not measure would be inventing the one fact
-    // every `dormant_egress_point` finding rests on, so the run declares none
-    // and the suppression that follows says exactly that.
-    let outcome = reconcile(&ReconcileInputs::new(sources, ObservationWindow::NONE));
+    // The window comes from the hooks' own accounting, not from this process's
+    // clock. `schemas/egress-event.schema.json` carries no clock value by
+    // design, so the duration travels in the status sidecar beside each stream
+    // and the collector folds one number out of it. Measuring it here instead
+    // would time the scan rather than the observation, which is a different
+    // interval entirely and usually a far shorter one.
+    let window = observation_window(collected.window, &mut diagnostics);
+    let outcome = reconcile(&ReconcileInputs::new(sources, window).with_settings(settings.clone()));
 
     diagnostics.extend(outcome.suppressed.iter().map(suppression_diagnostic));
     // The engine disagreeing with itself. A diagnostic, never a coverage
@@ -351,6 +396,38 @@ fn reconcile_stage(event_dir: &Path, static_findings: &[Finding]) -> ReconciledS
         unlinked_events: outcome.unlinked_events,
         observation_window_ms: outcome.observation_window_ms,
         reconciliation_mode: outcome.reconciliation_mode,
+    }
+}
+
+/// What the hooks measured, in the vocabulary the reconciler takes.
+///
+/// The two answers are not two spellings of one thing. A measured window, zero
+/// included, is a fact about the run: the hooks were watching, for that long. An
+/// unmeasured one is the absence of that fact, and it arrives whenever a hook
+/// died before it could flush its accounting, or was never installed at all.
+///
+/// Both reach the reconciler as a duration it can compare against the threshold,
+/// because [`ObservationWindow`] has no third state, and an unmeasured window
+/// therefore arrives as `NONE` and suppresses the dormancy claim exactly as a
+/// zero one would. What must not also disappear is which of the two happened, so
+/// the unmeasured case is written into the report before the value is flattened.
+/// Without that line the reader sees `observation_window_ms: 0` and a dormancy
+/// suppression, and cannot tell whether the hooks watched nothing or simply
+/// never said. A third state on the reconciler's type is filed against its owner
+/// in `hub/memory/interfaces.md`.
+fn observation_window(
+    observed: ObservedWindow,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> ObservationWindow {
+    match observed.duration_ms() {
+        Some(duration_ms) => ObservationWindow::of_ms(duration_ms),
+        None => {
+            diagnostics.push(internal_diagnostic(
+                DiagnosticComponent::RuntimeHooks,
+                WINDOW_NOT_MEASURED.to_owned(),
+            ));
+            ObservationWindow::NONE
+        }
     }
 }
 

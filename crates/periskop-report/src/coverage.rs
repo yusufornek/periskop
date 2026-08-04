@@ -69,6 +69,20 @@ pub enum ReconciliationMode {
     StaticPlusWire,
 }
 
+impl ReconciliationMode {
+    /// The spelling the contract uses, for a surface that prints rather than
+    /// serializes. Without it a renderer reaches for `{:?}` and the terminal
+    /// starts naming the same value differently from the JSON beside it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::StaticOnly => "static_only",
+            Self::StaticPlusRuntime => "static_plus_runtime",
+            Self::StaticPlusWire => "static_plus_wire",
+        }
+    }
+}
+
 /// What the scan could not see, in numbers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoverageStatement {
@@ -152,8 +166,28 @@ impl CoverageStatement {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reconciliation_mode_is_printed_in_the_words_the_contract_uses() {
+        // Same reason as the diagnostic vocabulary in `report.rs`: a summary
+        // that prints `StaticPlusRuntime` and a JSON that says
+        // `static_plus_runtime` describe one run in two languages.
+        for mode in [
+            ReconciliationMode::Full,
+            ReconciliationMode::StaticOnly,
+            ReconciliationMode::StaticPlusRuntime,
+            ReconciliationMode::StaticPlusWire,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&mode).expect("mode serializes"),
+                format!("\"{}\"", mode.as_str()),
+                "{mode:?}"
+            );
+        }
+    }
 
     #[test]
     fn static_only_run_declares_no_observation() {

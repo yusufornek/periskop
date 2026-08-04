@@ -17,8 +17,9 @@
 use crate::flow::{DegradedReason, Flow};
 use crate::platform::{self, SensorPlatformClass};
 use crate::privilege::{self, Privileges, SensorUnavailable};
+use crate::resolve::DnsObservation;
 use crate::scope::{ScopePolicy, ScopeTally};
-use crate::source::FlowSource;
+use crate::source::{FlowSource, SourceCoverage};
 
 /// Whether the sensor observed anything at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +36,7 @@ pub struct SensorOutcome {
     flows: Vec<Flow>,
     tally: ScopeTally,
     rejected: Vec<&'static str>,
+    coverage: SourceCoverage,
 }
 
 impl SensorOutcome {
@@ -45,6 +47,7 @@ impl SensorOutcome {
             flows: Vec::new(),
             tally: ScopeTally::default(),
             rejected: Vec::new(),
+            coverage: SourceCoverage::default(),
         }
     }
 
@@ -97,6 +100,33 @@ impl SensorOutcome {
     /// up as a quiet shortfall in the flow count.
     pub fn rejected(&self) -> &[&'static str] {
         &self.rejected
+    }
+
+    /// Whether plaintext DNS could be watched, or `None` if nothing was
+    /// watched at all.
+    ///
+    /// Deliberately optional. The coverage contract closes this field at two
+    /// values, both of which are statements about a run that happened; a sensor
+    /// that never started has made neither, and defaulting to `available` would
+    /// put a measurement in a report where there was none.
+    pub fn dns_observation(&self) -> Option<DnsObservation> {
+        match self.state {
+            SensorState::Observed => Some(self.coverage.dns_observation),
+            SensorState::NotStarted(_) => None,
+        }
+    }
+
+    /// Events the capture transport lost under load.
+    ///
+    /// Zero on a sensor that never started, which is true rather than a
+    /// default: nothing was dropped because nothing was read.
+    pub fn dropped_events(&self) -> u64 {
+        self.coverage.dropped_events
+    }
+
+    /// Events that named a connection the pass never saw open.
+    pub fn unlinked_events(&self) -> u64 {
+        self.coverage.unlinked_events
     }
 }
 
@@ -173,6 +203,9 @@ pub(crate) fn observe_on<S: FlowSource>(
         flows,
         tally,
         rejected,
+        // Read after the drain, because a mechanism only knows what it lost
+        // once it has finished handing over what it kept.
+        coverage: source.coverage(),
     }
 }
 
@@ -187,7 +220,7 @@ mod tests {
     };
     use crate::observation::Observation;
     use crate::scope::FlowScope;
-    use crate::source::{EbpfFlowSource, StubFlowSource};
+    use crate::source::{EbpfFlowSource, SourceCoverage, StubFlowSource};
 
     fn capable() -> Privileges {
         Privileges {
@@ -290,10 +323,48 @@ mod tests {
     fn the_shipped_build_never_takes_the_scan_down_on_any_machine() {
         // Runs `observe` itself, so whatever this machine is, the contract
         // holds: an outcome, a stated reason, and no panic.
-        let outcome = observe(&mut EbpfFlowSource, &Privileges::probe(), &policy());
+        let mut source = EbpfFlowSource::new("h_9f2c4a17be0d5386");
+        let outcome = observe(&mut source, &Privileges::probe(), &policy());
         assert!(matches!(outcome.state(), SensorState::NotStarted(_)));
         assert!(outcome.unavailable_reason().is_some_and(|r| !r.is_empty()));
         assert_eq!(outcome.coverage_platform_class(), SensorPlatformClass::None);
+    }
+
+    #[test]
+    fn a_sensor_that_never_started_states_no_dns_observation_at_all() {
+        // The coverage contract closes the field at two values, and both are
+        // claims about a run that happened. A denied sensor made neither.
+        let outcome = observe_on(
+            SensorPlatformClass::LinuxEbpf,
+            &mut StubFlowSource::yielding(Vec::new()),
+            &Privileges::default(),
+            &policy(),
+        );
+        assert_eq!(outcome.dns_observation(), None);
+        assert_eq!(outcome.dropped_events(), 0);
+    }
+
+    #[test]
+    fn what_the_mechanism_lost_reaches_the_outcome() {
+        // Otherwise a run that dropped a thousand events and a quiet run look
+        // identical from the report's side.
+        let mut source = StubFlowSource::yielding(Vec::new()).losing(SourceCoverage {
+            dropped_events: 1_000,
+            unlinked_events: 3,
+            dns_observation: DnsObservation::UnavailableEncryptedDns,
+        });
+        let outcome = observe_on(
+            SensorPlatformClass::LinuxEbpf,
+            &mut source,
+            &capable(),
+            &policy(),
+        );
+        assert_eq!(outcome.dropped_events(), 1_000);
+        assert_eq!(outcome.unlinked_events(), 3);
+        assert_eq!(
+            outcome.dns_observation(),
+            Some(DnsObservation::UnavailableEncryptedDns)
+        );
     }
 
     #[test]

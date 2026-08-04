@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://periskop.dev/schemas/hook-status.schema.json",
+  "title": "HookStatus",
+  "type": "object",
+  "description": "One hooked process accounting for itself. Written beside the process's event stream as <stream>.jsonl.status.json. Where an egress event says a call happened, this document says how much the hook could see and for how long it was watching.",
+  "$comment": "Two rules run opposite to egress-event.schema.json and both are deliberate. Unknown properties are allowed here, because a document from a newer hook carrying an extra counter still delivers the counters this reader came for, and refusing it would throw them away; an event carrying an unknown field may be smuggling content through a channel nothing validates, so there the property list is closed. And every string in this document is a fixed token rather than free text, because a reader copies these values into a report: a hook with a bug could otherwise put a payload where a label belongs and move the leak one layer down.",
+  "required": [
+    "hook_status",
+    "reason",
+    "dropped_events_count",
+    "written_events_count",
+    "failures"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "hook_status": {
+      "enum": ["active", "disabled"],
+      "description": "Whether the hook was in the call path of this process. A process that ran with the hook disabled observed nothing, and nothing observed must never reach a report looking like nothing to observe."
+    },
+    "reason": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]*$",
+      "description": "Why the hook is disabled, as a fixed token from the hook's own vocabulary, for example no_output_configured or install_failed. Empty while active. Never free text: this value is copied into a report."
+    },
+    "dropped_events_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Events this process observed and never wrote: a ring that overflowed, a batch whose write failed, a record that could not be serialised. This document is the only record they existed at all, which is why the counter is required rather than defaulted. An absent counter must be read as unreadable accounting, never as a clean run."
+    },
+    "written_events_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Lines this process wrote to its stream. Carried so that a stream nobody could read is distinguishable from a process that wrote nothing."
+    },
+    "failures": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9_.:-]+$"
+      },
+      "description": "Stage labels for failures the hook swallowed on the application's behalf, sorted and free of duplicates. A label names which stage broke, which is something an operator can act on; a count is not."
+    },
+    "observation_window_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How long this process was under observation, in milliseconds. A DURATION, never a wall clock stamp, and read from a monotonic clock so that a system clock corrected mid run cannot produce a negative or inflated window. Measured from the moment the hook entered the call path to the moment the document was written, which makes it a lower bound while the process is still alive: the hook rewrites this file on every flush, so a process that crashed still leaves the window it had reached. Absent means NOT MEASURED, which is a different fact from zero: zero says the hook was watching for no time at all, absent says it was watching and cannot say for how long. A reader that treats the absence as zero turns an unknown into a measurement."
+    }
+  }
+}

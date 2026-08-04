@@ -18,6 +18,16 @@ has been emptied loses events that no counter would ever see: the guard around
 the drain records that *something* failed, never how much went with it. On a CI
 container with a full disk that difference is the whole report, so every path
 out of the ring below either ends in a written line or in the drop counter.
+
+The same file carries how long this process was watched for. Nothing in the
+event schema can: `egress_event_id` is derived from the call shape and carries
+no clock, which is what makes the same call recorded twice one identity, and a
+stamp in the body would break both that and the determinism of the report. The
+window is not a property of a call anyway. It is a property of the collection,
+and it is the only thing under a claim that some call site never ran, so it
+travels here as a DURATION read from a monotonic clock. Wall clock time is not
+used at any point: a system clock corrected mid run would otherwise produce a
+negative or an inflated window.
 """
 
 import atexit
@@ -25,6 +35,7 @@ import collections
 import json
 import os
 import threading
+import time
 
 from . import failopen
 
@@ -43,12 +54,57 @@ class EventWriter(object):
         self._stop = threading.Event()
         self._thread = None
         self._lock = threading.Lock()
+        self._close_registered = False
+        # The window opens when the hook enters the call path, which is when
+        # this object is built, and not when the first call arrives. A process
+        # that ran for an hour and called a provider once in the last minute was
+        # watched for an hour; timing from the first event would report a minute
+        # and turn fifty-nine minutes of evidence into nothing.
+        self._observation_started_at = time.monotonic()
         self.dropped_events_count = 0
         self.written_events_count = 0
 
     @property
     def output_path(self):
         return self._output_path
+
+    def observation_window_ms(self):
+        """Milliseconds this process has been under observation so far.
+
+        A duration, never a stamp. Truncated rather than rounded, because a
+        window is the floor of what was watched and rounding up would state a
+        few tenths of a millisecond nobody observed.
+        """
+        elapsed = time.monotonic() - self._observation_started_at
+        # A monotonic clock cannot go backwards, but a platform that ever let it
+        # would put a negative window into a report, and the max costs nothing.
+        return int(max(0.0, elapsed) * 1000)
+
+    def declare(self):
+        """Announce the run before any event exists. Safe to call twice.
+
+        Without this, a process that is hooked and never calls a wrapped library
+        leaves nothing on disk at all, and a directory holding no file for it
+        cannot say whether it was watched for an hour or never started. That is
+        exactly the run a dormancy claim is made from, so the accounting has to
+        exist from the moment the hook is in place rather than from the first
+        event.
+        """
+        failopen.run("writer.declare", self._declare)
+
+    def _declare(self):
+        directory = os.path.dirname(self._output_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        self._register_close()
+        self.write_status(ACTIVE, "")
+
+    def _register_close(self):
+        """Arrange for the final flush and status write, exactly once."""
+        if self._close_registered:
+            return
+        self._close_registered = True
+        atexit.register(self.close)
 
     def submit(self, event):
         """Hand an event to the ring. Never blocks, never raises."""
@@ -75,7 +131,7 @@ class EventWriter(object):
             thread.daemon = True
             self._thread = thread
             thread.start()
-            atexit.register(self.close)
+            self._register_close()
 
     def _drain_forever(self):
         while not self._stop.is_set():
@@ -123,6 +179,13 @@ class EventWriter(object):
             self.dropped_events_count += len(lines)
             raise
         self.written_events_count += len(lines)
+        # The accounting is rewritten with every batch, not only at exit. A
+        # process killed by an OOM handler or a container stop never reaches
+        # close(), and without this it would leave a stream of events beside a
+        # window nobody measured, which suppresses every claim those events were
+        # collected to support. What the sidecar then holds is the window as of
+        # the last flush: a lower bound, which can only understate the run.
+        failopen.run("writer.status", self.write_status, ACTIVE, "")
 
     def close(self):
         """Flush what is left and declare the run. Safe to call twice."""
@@ -136,13 +199,19 @@ class EventWriter(object):
         failopen.run("writer.status", self.write_status, ACTIVE, "")
 
     def write_status(self, status, reason):
-        """Sidecar declaring what this process observed, and what it lost."""
+        """Sidecar declaring what this process observed, and what it lost.
+
+        Contract: `schemas/hook-status.schema.json`. The property names are read
+        back by `periskop-runtime-collector`; a counter spelled differently here
+        is a counter that reaches nobody.
+        """
         document = {
             "hook_status": status,
             "reason": reason,
             "dropped_events_count": self.dropped_events_count,
             "written_events_count": self.written_events_count,
             "failures": list(failopen.failures()),
+            "observation_window_ms": self.observation_window_ms(),
         }
         path = self._output_path + _STATUS_SUFFIX
         with open(path, "w", encoding="utf-8") as stream:
