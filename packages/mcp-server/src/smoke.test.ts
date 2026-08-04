@@ -42,13 +42,19 @@ test("a scan crosses the boundary intact", { skip: !available }, async () => {
   try {
     const result = (await runScan(engine, { path: fixtures })) as {
       verdict: string;
-      summary: { confirmed: number; providers: string[] };
+      summary: { confirmed: number; suspected: number; providers: string[] };
       findings: unknown[];
       coverage: { files_read: number };
     };
 
-    assert.equal(result.verdict, "PASS");
-    assert.ok(result.summary.confirmed >= 5, `expected findings, got ${result.summary.confirmed}`);
+    // WARN rather than PASS, and that is the correct answer. The fixture set
+    // includes a call matched only by the text of its URL, which reports as
+    // suspected, and the default policy raises a warning when anything is merely
+    // suspected. Asserting PASS here would mean asserting that a weaker finding
+    // reaches the reader with no signal attached to it.
+    assert.equal(result.verdict, "WARN");
+    assert.ok(result.summary.confirmed >= 4, `expected findings, got ${result.summary.confirmed}`);
+    assert.ok(result.summary.suspected >= 1, "the suspected list should not be empty here");
     assert.ok(result.summary.providers.includes("openai"));
     assert.ok(result.coverage.files_read > 0);
   } finally {

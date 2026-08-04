@@ -307,23 +307,37 @@ fn report_path(path: &Path) -> String {
 /// Two things were wrong with the list this replaces, and both told the reader
 /// something untrue.
 ///
-/// The status was `not_instrumented`, which the contract defines as a mechanism
-/// that exists and was not switched on. This build has no hook mechanism for any
-/// language, so the honest value is `unsupported`: the contract keeps the two
-/// apart precisely because the first is the user's choice and the second is a
-/// gap in the product, and a reader who saw `not_instrumented` would go looking
-/// for the switch. When a hook does arrive, its language moves to
-/// `not_instrumented` and the distinction starts carrying real information.
+/// The two statuses carry different meanings and the contract keeps them apart on
+/// purpose: `not_instrumented` is a switch the user did not turn on, `unsupported`
+/// is a gap in the product. A reader who sees the first goes looking for the
+/// switch, and one who sees the second does not, so reporting the wrong one wastes
+/// their time or hides a real limit.
+///
+/// Which one applies is therefore a property of the language rather than of the
+/// run. Python and Node ship hooks, so a static only scan of them is a choice not
+/// yet made. Go and Java have no hook in this build, and saying otherwise would
+/// send a reader hunting for a switch that does not exist.
 ///
 /// The list was also fixed at three languages, so a repository of Go or Java
 /// source had no runtime line at all. It is built from the grammars the scan
 /// actually saw instead.
+fn runtime_status_for(language: Language) -> RuntimeStatus {
+    match language {
+        // A hook exists and this run did not use it.
+        Language::Python | Language::TypeScript | Language::Tsx | Language::JavaScript => {
+            RuntimeStatus::NotInstrumented
+        }
+        // No mechanism is defined for these yet.
+        Language::Go | Language::Java => RuntimeStatus::Unsupported,
+    }
+}
+
 fn runtime_coverage_for(languages: &BTreeSet<Language>) -> Vec<RuntimeCoverage> {
     let mut out: Vec<RuntimeCoverage> = languages
         .iter()
         .map(|language| RuntimeCoverage {
             language: language.coverage_language(),
-            status: RuntimeStatus::Unsupported,
+            status: runtime_status_for(*language),
             hook_mechanism: None,
         })
         .collect();

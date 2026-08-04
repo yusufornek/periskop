@@ -176,13 +176,15 @@ fn the_coverage_block_is_filled_in_not_just_present() {
         languages.contains(&"python"),
         "the fixtures are Python and no Python line was declared: {languages:?}"
     );
+    // Python ships a hook, so a static only scan of Python source is a switch the
+    // user did not turn on rather than a gap in the product. Reporting it as
+    // unsupported would send a reader looking for a mechanism that is right there.
     assert!(
         coverage
             .runtime_coverage
             .iter()
-            .all(|r| r.status == RuntimeStatus::Unsupported),
-        "this build defines no hook mechanism, so every language is unsupported \
-         rather than merely uninstrumented: {:?}",
+            .all(|r| r.status == RuntimeStatus::NotInstrumented),
+        "python has a hook, so its line is not_instrumented: {:?}",
         coverage.runtime_coverage
     );
 }
