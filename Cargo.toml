@@ -26,6 +26,7 @@ periskop-static-scanner = { path = "crates/periskop-static-scanner" }
 periskop-report = { path = "crates/periskop-report" }
 
 blake3 = "1.5"
+clap = { version = "4.5", features = ["derive"] }
 ignore = "0.4"
 tree-sitter = "0.25"
 tree-sitter-python = "0.25"

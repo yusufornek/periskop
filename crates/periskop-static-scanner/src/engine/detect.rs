@@ -215,24 +215,109 @@ fn capture_node<'t>(
 /// Reported rather than ignored. "We have no detector for this" is a different
 /// statement from "there is nothing here", and only the first one is honest.
 fn unclaimed_imports(table: &BindingTable, rules: &[RuleFile]) -> Vec<String> {
-    let known: Vec<&str> = rules
+    let mut known: Vec<&str> = rules
         .iter()
         .flat_map(|r| r.matches.iter())
         .filter_map(|m| m.binding.as_ref())
         .map(|b| b.resolves_to.module.as_str())
         .collect();
+    known.extend(
+        rules
+            .iter()
+            .flat_map(|r| r.covers_modules.iter().map(String::as_str)),
+    );
 
     let mut out: Vec<String> = table
         .imported_modules()
         .iter()
-        .filter(|module| {
-            !known
-                .iter()
-                .any(|k| module.as_str() == *k || module.starts_with(&format!("{k}.")))
-        })
+        .filter(|module| !is_standard_library(module))
+        .filter(|module| !known.iter().any(|k| covers(k, module)))
         .cloned()
         .collect();
     out.sort();
     out.dedup();
     out
+}
+
+/// Whether a rule claiming `known` accounts for an import of `module`.
+///
+/// Three relations count. An exact match, obviously. An import below a claimed
+/// module, since claiming a package claims what is inside it. And an import
+/// above one: `from google import genai` records the namespace package `google`
+/// while the rule names `google.genai`, and treating those as unrelated would
+/// report a package as undetected while its own rule sits right there.
+fn covers(known: &str, module: &str) -> bool {
+    module == known
+        || module.starts_with(&format!("{known}."))
+        || known.starts_with(&format!("{module}."))
+}
+
+/// Modules that ship with the language.
+///
+/// The coverage field is for third party packages nobody wrote a detector for.
+/// Listing the standard library there would bury the one or two entries that
+/// actually mean something under noise from every file that imports `os`.
+///
+/// The list is short on purpose. It covers what appears near egress code; a
+/// missing entry costs one noisy line, while a wrong entry would hide a real
+/// package, so the bias is toward leaving things out.
+fn is_standard_library(module: &str) -> bool {
+    const PYTHON: &[&str] = &[
+        "abc",
+        "argparse",
+        "asyncio",
+        "base64",
+        "collections",
+        "contextlib",
+        "csv",
+        "dataclasses",
+        "datetime",
+        "enum",
+        "functools",
+        "hashlib",
+        "http",
+        "io",
+        "itertools",
+        "json",
+        "logging",
+        "math",
+        "os",
+        "pathlib",
+        "random",
+        "re",
+        "socket",
+        "ssl",
+        "string",
+        "subprocess",
+        "sys",
+        "tempfile",
+        "threading",
+        "time",
+        "typing",
+        "urllib",
+        "uuid",
+        "warnings",
+    ];
+    const NODE: &[&str] = &[
+        "assert",
+        "buffer",
+        "child_process",
+        "crypto",
+        "events",
+        "fs",
+        "http",
+        "https",
+        "net",
+        "path",
+        "process",
+        "stream",
+        "tls",
+        "url",
+        "util",
+        "zlib",
+    ];
+
+    let root = module.split('.').next().unwrap_or(module);
+    let bare = root.strip_prefix("node:").unwrap_or(root);
+    PYTHON.contains(&bare) || NODE.contains(&bare)
 }

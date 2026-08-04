@@ -29,6 +29,15 @@ pub struct RuleFile {
     #[serde(rename = "match")]
     pub matches: Vec<MatchSpec>,
 
+    /// Modules this rule accounts for beyond what its bindings name.
+    ///
+    /// A rule that keys on a destination rather than on a client object has no
+    /// binding, so nothing else would mark the HTTP libraries it covers as
+    /// handled. Without this they would be reported as libraries with no
+    /// detector, which is the opposite of true.
+    #[serde(default)]
+    pub covers_modules: Vec<String>,
+
     #[serde(default)]
     pub extract: BTreeMap<String, ExtractSpec>,
 

@@ -48,6 +48,13 @@ jobs:
           rustc --version
           cargo --version
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Formatting
@@ -58,3 +65,30 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace
+
+      # periskop scans its own repository. If the tool cannot run on the codebase
+      # that produces it, that is worth finding out here rather than from a user.
+      - name: Scan this repository
+        run: cargo run --quiet -p periskop-cli -- scan . --rules rules
+
+      # The emitted report is validated against the shipped contract. A schema
+      # that only ever sees hand written examples drifts from what the tool
+      # actually writes.
+      - name: Report conforms to the contract
+        run: |
+          cargo run --quiet -p periskop-cli -- scan \
+            crates/periskop-static-scanner/fixtures/python \
+            --rules rules --json > /tmp/report.json
+          npx --no-install ajv validate --spec=draft2020 -c ajv-formats --strict=false \
+            -s schemas/report.schema.json \
+            -r schemas/finding.schema.json \
+            -r schemas/coverage-statement.schema.json \
+            -d /tmp/report.json
+
+      # Two builds of the same tree must agree byte for byte.
+      - name: Report is reproducible
+        run: |
+          FIX=crates/periskop-static-scanner/fixtures/python
+          cargo run --quiet -p periskop-cli -- scan "$FIX" --rules rules --json > /tmp/a.json
+          cargo run --quiet -p periskop-cli -- scan "$FIX" --rules rules --json > /tmp/b.json
+          python3 -c "import json,sys; a=json.load(open('/tmp/a.json')); b=json.load(open('/tmp/b.json')); a.pop('envelope'); b.pop('envelope'); sys.exit(0 if a==b else 'two scans of the same tree disagreed')"

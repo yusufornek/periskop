@@ -9,6 +9,11 @@ provider = "unknown"
 rule_id = "typescript.static.http-provider-endpoint"
 rule_version = "1.0.0"
 
+# Libraries this rule accounts for. It keys on the destination rather than on a
+# client object, so without this the HTTP clients it covers would be reported as
+# having no detector.
+covers_modules = ["axios", "undici", "node-fetch"]
+
 [[match]]
 kind = "http_request"
 query = '''
