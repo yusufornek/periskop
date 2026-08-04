@@ -29,3 +29,10 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+# Tests only, and only for one test: the proof that a derived finding can be
+# produced from a real scanner run rather than from a hand built point. A
+# hand built point is what let target_drift pass its unit tests for a whole
+# phase while the pipeline could not produce a single one, so the proof has to
+# start at source code and the real rule files. Nothing in the shipped crate
+# depends on the scanner, and the arrow still points the other way.
+periskop-static-scanner = { workspace = true }

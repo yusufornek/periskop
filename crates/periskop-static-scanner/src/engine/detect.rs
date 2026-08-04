@@ -24,8 +24,8 @@ use std::collections::BTreeMap;
 
 use periskop_core::coverage::{UnresolvedReason, UnresolvedTarget};
 use periskop_core::finding::{
-    Component, Confidence, Detector, EntityRef, Evidence, EvidenceType, Finding, Kind, Location,
-    RefType, Span,
+    Component, Confidence, DeclaredTarget, Detector, EntityRef, Evidence, EvidenceType, Finding,
+    Kind, Location, RefType, Span,
 };
 use periskop_core::ids::short_hash;
 use streaming_iterator::StreamingIterator;
@@ -33,7 +33,9 @@ use streaming_iterator::StreamingIterator;
 use crate::engine::{bindings, bindings_go, bindings_java, bindings_ts, BindingTable};
 use crate::language::Language;
 use crate::parser::ParsedFile;
-use crate::rules::model::{Confidence as RuleConfidence, ExtractSpec, MatchSpec, RuleFile};
+use crate::rules::model::{
+    Confidence as RuleConfidence, ExtractSpec, MatchKind, MatchSpec, RuleFile,
+};
 use crate::rules::CompiledRules;
 
 /// Everything one scan of one file produced.
@@ -83,6 +85,12 @@ struct CallSite<'a> {
     confidence: Confidence,
     /// Set when a downgrade fired, so the coverage statement can say why.
     unresolved: Option<UnresolvedReason>,
+    /// Where the code says this call goes, when a rule field named it and the
+    /// value could be read. One of the two keys reconciliation joins on.
+    declared_target: Option<DeclaredTarget>,
+    /// What the code says this call invokes, spelled the way a runtime hook
+    /// spells it. The other key reconciliation joins on.
+    operation: Option<String>,
     rule: &'a RuleFile,
 }
 
@@ -313,8 +321,121 @@ fn evaluate<'a>(
         shape: call_shape(source, spec, m, compiled),
         confidence,
         unresolved,
+        declared_target: declared_target(rule, m, compiled, source, constructors),
+        operation: declared_operation(spec, m, compiled, source),
         rule,
     })
+}
+
+/// Rule fields whose value is a destination rather than a request detail.
+///
+/// Recognised by name because the rule schema has no way to say what a field
+/// means: `[extract]` gives a key and a place to read it from, and nothing else.
+/// Every rule set in the repository already uses exactly these two names, so the
+/// convention is described here rather than invented. A rule that spells its
+/// destination field something else loses the destination and keeps the finding,
+/// which is the safe direction; the request for a declared role on `[extract]`
+/// is filed against the rule schema owner in `hub/memory/interfaces.md`.
+const DESTINATION_FIELDS: [&str; 2] = ["base_url", "target_url"];
+
+/// Where the code says this call goes.
+///
+/// Resolution runs a second time here rather than being threaded out of
+/// [`classify`], because the two ask different questions of the same node: the
+/// downgrade logic needs to know whether a value was knowable at all, and this
+/// needs the value. Sharing one pass would tie the destination to whichever
+/// fields a rule happens to downgrade on.
+///
+/// A value the engine cannot read yields no destination. That is the same
+/// absence as a rule that names no destination field, and both are honest: the
+/// join then has nothing to compare rather than something invented.
+fn declared_target(
+    rule: &RuleFile,
+    m: &tree_sitter::QueryMatch<'_, '_>,
+    compiled: &CompiledRules,
+    source: &str,
+    constructors: &ConstructorIndex<'_>,
+) -> Option<DeclaredTarget> {
+    for field in DESTINATION_FIELDS {
+        let Some(extract) = rule.extract.get(field) else {
+            continue;
+        };
+        if let FieldResolution::Resolved(Some(written)) =
+            resolve_field(extract, m, compiled, source, constructors)
+        {
+            return DeclaredTarget::parse(&written, None);
+        }
+    }
+    None
+}
+
+/// What the code says this call invokes, in the spelling a hook would record.
+///
+/// The two sides have to agree or the join silently misses. A Python hook
+/// wrapping the OpenAI SDK records `chat.completions.create`, which is the
+/// attribute path below the client object plus the method; a hook wrapping an
+/// HTTP client records `http.post`. Both are reproduced here from the syntax
+/// tree, so the code side and the runtime side spell one call one way.
+///
+/// An import names no operation and gets none. Inventing one would let an import
+/// match a call.
+fn declared_operation(
+    spec: &MatchSpec,
+    m: &tree_sitter::QueryMatch<'_, '_>,
+    compiled: &CompiledRules,
+    source: &str,
+) -> Option<String> {
+    let method = spec
+        .method
+        .as_ref()
+        .and_then(|method| capture_node(compiled, m, &method.capture))
+        .and_then(|node| source.get(node.byte_range()))?;
+
+    let operation = match spec.kind {
+        MatchKind::Import => return None,
+        // The hook's own normalisation, reproduced: `post` becomes `http.post`.
+        MatchKind::HttpRequest => format!("http.{method}"),
+        MatchKind::Call => match receiver_path(spec, m, compiled, source) {
+            Some(path) => format!("{path}.{method}"),
+            None => method.to_owned(),
+        },
+    };
+
+    let operation = operation.to_ascii_lowercase();
+    // The event contract fixes the spelling, and a value outside it can never
+    // match anything. A subscript or a call in the receiver chain produces one,
+    // and reporting it would put a string that looks like an operation into a
+    // field nothing can join on.
+    is_operation_spelling(&operation).then_some(operation)
+}
+
+/// The attribute path between the bound receiver and the method.
+///
+/// `client.chat.completions.create(...)` binds on `client` and captures
+/// `client.chat.completions` as the receiver, so what is left is
+/// `chat.completions`. The binding root is stripped rather than the first
+/// segment, because `self.client.chat` resolves to the root `self.client` and
+/// removing one segment would leave the object name in the operation.
+fn receiver_path(
+    spec: &MatchSpec,
+    m: &tree_sitter::QueryMatch<'_, '_>,
+    compiled: &CompiledRules,
+    source: &str,
+) -> Option<String> {
+    let binding = spec.binding.as_ref()?;
+    let node = capture_node(compiled, m, &binding.capture)?;
+    let written = source.get(node.byte_range())?;
+    let root = bindings::root_identifier(node, source)?;
+    let path = written.strip_prefix(&root)?.trim_start_matches('.');
+    (!path.is_empty()).then(|| path.to_owned())
+}
+
+/// Whether a value matches the operation pattern the event contract fixes.
+fn is_operation_spelling(value: &str) -> bool {
+    value.starts_with(|c: char| c.is_ascii_lowercase())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'.')
 }
 
 /// Applies the rule's declared downgrades to one match.
@@ -351,7 +472,7 @@ fn classify(
         };
 
         match resolve_field(extract, m, compiled, source, constructors) {
-            FieldResolution::Resolved => {}
+            FieldResolution::Resolved(_) => {}
             FieldResolution::Unresolved(reason) => {
                 // A downgrade may only weaken. Written out rather than as an
                 // ordering over the enum, because "weaker" is a property of this
@@ -375,10 +496,20 @@ fn classify(
 }
 
 /// What the engine could say about one extracted field.
+///
+/// `Resolved` carries the text when there is text to carry. Two callers ask
+/// different questions of the same answer: the downgrade logic only needs to
+/// know whether the value was knowable, while the destination a finding reports
+/// needs the value itself. Returning only the verdict is what used to make the
+/// scanner read a base url and then throw it away.
 #[derive(Debug, PartialEq, Eq)]
 enum FieldResolution {
     /// A value the engine can see, or a keyword the caller left at its default.
-    Resolved,
+    ///
+    /// `None` is the default case: the caller passed nothing and the library
+    /// decides the value. That is a determinate destination but not one this
+    /// engine can name, and naming it anyway would put a guess in the report.
+    Resolved(Option<String>),
     /// The engine looked and the value is not knowable from the syntax alone.
     Unresolved(UnresolvedReason),
     /// The engine has no way to look for this field in this grammar. Distinct
@@ -432,7 +563,7 @@ fn keyword_resolution(
 ) -> FieldResolution {
     match keyword_value(arguments, keyword, source) {
         Some(value) => literal_resolution(value, source),
-        None => FieldResolution::Resolved,
+        None => FieldResolution::Resolved(None),
     }
 }
 
@@ -471,14 +602,35 @@ fn keyword_value<'t>(
 
 /// Whether a value node is something the scanner can read off the page.
 fn literal_resolution(node: tree_sitter::Node<'_>, source: &str) -> FieldResolution {
+    let text = || literal_text(node, source);
     match node.kind() {
         "string" | "integer" | "float" | "number" | "true" | "false" | "concatenated_string" => {
-            FieldResolution::Resolved
+            FieldResolution::Resolved(text())
         }
         // A template with no substitution is still a literal.
-        "template_string" if !source[node.byte_range()].contains("${") => FieldResolution::Resolved,
+        "template_string" if !source[node.byte_range()].contains("${") => {
+            FieldResolution::Resolved(text())
+        }
         _ => FieldResolution::Unresolved(unresolved_reason_for(node, source)),
     }
+}
+
+/// The value of a literal node, without the quoting the grammar kept.
+///
+/// A concatenated string is deliberately not joined back together. Its pieces
+/// are separate nodes with quotes between them, and pasting the raw text would
+/// produce a destination containing quote characters, which is worse than
+/// reporting no destination at all.
+fn literal_text(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    if node.kind() == "concatenated_string" {
+        return None;
+    }
+    let raw = source.get(node.byte_range())?.trim();
+    // Python raw and byte prefixes sit outside the quotes.
+    let raw = raw.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+    let quote = raw.chars().next().filter(|c| "\"'`".contains(*c))?;
+    let unquoted = raw.trim_matches(quote);
+    (!unquoted.is_empty()).then(|| unquoted.to_owned())
 }
 
 /// Names the shape of a value the scanner could not read.
@@ -584,7 +736,7 @@ fn build_finding(
         },
     )?;
 
-    let finding = finding
+    let mut finding = finding
         .with_egress_kind(site.rule.classify.egress_kind.clone())
         .with_location(Location {
             component: Component::StaticScanner,
@@ -592,6 +744,16 @@ fn build_finding(
             span: Some(site.span),
             symbol: None,
         });
+
+    // The two keys reconciliation joins on. Set only when the syntax tree said
+    // so: an absent field means nothing was established, and the join then falls
+    // to a weaker key instead of comparing against a value nobody wrote.
+    if let Some(target) = site.declared_target {
+        finding = finding.with_declared_target(target);
+    }
+    if let Some(operation) = site.operation {
+        finding = finding.with_operation(operation);
+    }
 
     // A finding the scanner could not pin a destination for says so in the
     // finding as well as in the coverage statement, so a reader working from one
@@ -885,6 +1047,26 @@ mod tests {
         assert!(is_standard_library("net/http", Language::Go));
         assert!(!is_standard_library("github.com/x/net", Language::Go));
         assert!(is_standard_library("java.net.http", Language::Java));
+    }
+
+    #[test]
+    fn an_operation_outside_the_event_spelling_is_refused_rather_than_reported() {
+        // The join compares this field against what a hook wrote, and a hook
+        // writes lower case dotted names by contract. A value that cannot match
+        // anything would still look like an operation in the report, so it is
+        // refused at the source instead.
+        assert!(is_operation_spelling("chat.completions.create"));
+        assert!(is_operation_spelling("http.post"));
+        assert!(is_operation_spelling("generate_content"));
+        for wrong in [
+            "Chat.Completions.Create",
+            "clients[\"a\"].chat.create",
+            "",
+            ".create",
+            "3.create",
+        ] {
+            assert!(!is_operation_spelling(wrong), "{wrong:?}");
+        }
     }
 
     #[test]

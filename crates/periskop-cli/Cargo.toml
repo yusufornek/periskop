@@ -26,3 +26,8 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 periskop-static-scanner = { workspace = true }
+# Test only, and deliberately not a dependency of the binary. The F2 gate test
+# reads the hook's event stream back through the component that owns that half
+# of the contract; letting the test parse the JSON Lines itself would prove the
+# test could read them, not that periskop can.
+periskop-runtime-collector = { workspace = true }

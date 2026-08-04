@@ -311,8 +311,8 @@ pub(crate) mod tests {
 
     #[test]
     fn a_point_with_no_operation_still_reaches_its_calls_through_the_destination() {
-        // The shape the scanner produces today: the finding contract carries no
-        // operation, so the destination is the only key left.
+        // A rule that names a destination but no method, and a hook that names
+        // both: the destination is the only key the two have in common.
         let result = join(
             &[point_without_operation(EP, "api.openai.com")],
             &[event(

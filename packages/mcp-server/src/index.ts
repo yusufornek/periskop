@@ -9,6 +9,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
 import { EngineBridge } from "./bridge.js";
+import { traceInput, traceReconciliation } from "./reconciliation.js";
 import {
   coverageInput,
   detailInput,
@@ -87,6 +88,31 @@ async function main(): Promise<void> {
         {
           type: "text",
           text: JSON.stringify(await getCoverage(bridge, coverageInput.parse(args)), null, 2),
+        },
+      ],
+    }),
+  );
+
+  server.registerTool(
+    "trace_reconciliation",
+    {
+      title: "Where a derived finding came from",
+      description:
+        "Returns the join steps, the contributing sources and the difference behind a finding " +
+        "whose source is reconciled. Use when a finding says the code and the run disagree and " +
+        "you need to see what tied the two together. Declared and observed findings have no " +
+        "reconciliation trace; get_finding_detail is what covers those.",
+      inputSchema: traceInput.shape,
+    },
+    async (args) => ({
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            await traceReconciliation(bridge, traceInput.parse(args)),
+            null,
+            2,
+          ),
         },
       ],
     }),

@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "flow_id": "fl_0000000000000000",
   "host_id": "h_9f2c4a17be0d5386",
   "boot_id": "b_3f0a91c7d4e28b56",
@@ -11,10 +11,16 @@
     "dst_port": 443,
     "proto": "tcp"
   },
+  "interface": "utun4",
   "resolved_host": "api.openai.com",
   "resolved_host_source": "dns_and_sni",
+  "sni": "api.openai.com",
   "sni_source": "client_hello",
+  "dns_names": ["api.openai.com"],
   "provider_ref": "openai",
+  "classification": "classified",
+  "provider_confidence": "confirmed",
+  "ruleset_version": "1.4.0",
   "process_attribution": "kernel_attributed",
   "process": {
     "pid": 4821,

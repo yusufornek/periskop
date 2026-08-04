@@ -1,0 +1,22 @@
+{
+  "schema_version": "1.1",
+  "finding_id": "fnd_7c1e4a90b3d25f61",
+  "kind": "declared_egress_point",
+  "source": "declared",
+  "confidence": "confirmed",
+  "provider_ref": "openai",
+  "declared_target": { "host": "api.openai.com" },
+  "operation": "Chat.Completions.Create",
+  "refs": [
+    { "ref_type": "egress_point", "ref_id": "ep_3f0a91c7d4e28b56" }
+  ],
+  "evidence": [
+    { "evidence_type": "ast_node", "ref": "call@services/customer.py" }
+  ],
+  "detector": {
+    "component": "static-scanner",
+    "rule_id": "python.static.openai-client-call",
+    "rule_version": "1.0.0",
+    "rule_hash": "3b7d1e5f8a06c249de3f1b04a7c95d6e2f8013b4ca67d95e08f31a2b7c4d6e50"
+  }
+}

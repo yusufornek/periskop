@@ -9,6 +9,13 @@
       "rationale": "kind is declared_egress_point, which forces source to be declared. This exercises the conditional block, not just field presence."
     },
     {
+      "file": "finding.operation-case.invalid.json",
+      "schema": "finding.schema.json",
+      "violates": "operation spelling is fixed by the event contract",
+      "expected_error_contains": "/operation",
+      "rationale": "The reconciliation join compares this field against the operation a runtime hook recorded, and the hook writes lower case by contract. A finding spelled Chat.Completions.Create would validate as a string, join against nothing, and report a code point that did run as dormant. The pattern is what turns that silent mismatch into a rejection."
+    },
+    {
       "file": "report.no-coverage.invalid.json",
       "schema": "report.schema.json",
       "violates": "coverage statement is mandatory",
@@ -28,6 +35,13 @@
       "violates": "a flow may not carry payload bytes",
       "expected_error_contains": "payload_bytes",
       "rationale": "The sensor observes destinations, not contents. A field for payload bytes would turn the component deployed to find leaks into one, so the schema refuses it rather than relying on every implementation to leave it out."
+    },
+    {
+      "file": "flow.sni-without-handshake.invalid.json",
+      "schema": "flow.schema.json",
+      "violates": "a server name may only exist where the handshake showed one",
+      "expected_error_contains": "sni_source",
+      "rationale": "encrypted_client_hello measures a blind spot: the name was genuinely unavailable. A record that carries a name anyway contradicts the field measuring the loss, and the contradiction would be read as data rather than as a broken producer. This is the honest coverage principle enforced by the validator instead of by review."
     }
   ]
 }

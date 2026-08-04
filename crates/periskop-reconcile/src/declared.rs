@@ -1,19 +1,22 @@
 //! The code side of the join.
 //!
 //! A declared egress point is what the static scanner found: a place in the
-//! source that can reach a provider. The scanner reports it as a `Finding`, and a
-//! `Finding` deliberately carries only what the finding contract fixes, which is
-//! less than the join needs. Two fields the join compares on, the destination the
-//! code names and the operation it invokes, have no home in that contract; the
-//! scanner reads both while matching a rule and neither survives into its output.
+//! source that can reach a provider. The scanner reports it as a `Finding`, and
+//! everything this type needs now comes out of that finding.
 //!
-//! So this type is built from a finding and then completed by the caller, and the
-//! two halves are visible in the API on purpose. Everything [`DeclaredPoint::from_finding`]
-//! fills in is contract backed. Everything added afterwards is the caller stating
-//! something it read elsewhere, and a point that never receives a target simply
-//! has nothing for the join to compare, which is the honest result rather than a
-//! guessed one. The gap is recorded in `hub/memory/interfaces.md` for the owner of
-//! the finding contract.
+//! It did not always. The two fields the join compares on, the destination the
+//! code names and the operation it invokes, had no home in the finding contract:
+//! the scanner read both while matching a rule and neither survived into its
+//! output, so a caller had to state them from somewhere else or leave them
+//! empty. In a real run nobody could, which meant `target_drift` was derivable
+//! in a unit test and unproducible in the pipeline. Contract version 1.1 gives
+//! both a home (`declared_target`, `operation`) and
+//! [`DeclaredPoint::from_finding`] reads them.
+//!
+//! The two builders below survive because a caller may know something the
+//! finding does not, for instance a destination read from a lockfile or a
+//! deployment manifest. They state, they never guess: a point that receives no
+//! target has nothing for the join to compare, which is the honest result.
 
 use periskop_core::finding::{Confidence, Finding, Kind, RefType};
 use periskop_core::ids::EgressPointId;
@@ -70,14 +73,30 @@ impl DeclaredPoint {
             None => None,
         };
 
+        // A destination the contract accepted but this side cannot read is an
+        // error rather than an absence. The schema requires a non empty host, so
+        // the only way to arrive here is a malformed finding, and quietly
+        // treating it as "no destination" would turn a broken producer into a
+        // code point that simply never drifts.
+        let target = match &finding.declared_target {
+            Some(declared) => Some(
+                TargetId::parse(&declared.host, declared.port)
+                    .ok_or(ReconcileError::UnreadableTarget)?,
+            ),
+            None => None,
+        };
+
         Ok(Self {
             egress_point_id: egress_point_id.to_string(),
             provider_ref: finding.provider_ref.clone(),
             confidence: finding.confidence,
             egress_kind: finding.egress_kind.clone(),
             path,
-            target: None,
-            operation: None,
+            target,
+            operation: finding
+                .operation
+                .as_ref()
+                .map(|operation| operation.to_ascii_lowercase()),
         })
     }
 
@@ -148,7 +167,7 @@ fn is_absolute_path(path: &str) -> bool {
 pub(crate) mod tests {
     use super::*;
     use periskop_core::finding::{
-        Component, Detector, EntityRef, Evidence, EvidenceType, Location,
+        Component, DeclaredTarget, Detector, EntityRef, Evidence, EvidenceType, Location,
     };
 
     /// A scanner finding shaped exactly as `detect.rs` builds one.
@@ -211,9 +230,40 @@ pub(crate) mod tests {
         assert_eq!(point.provider_ref(), "openai");
         assert_eq!(point.egress_kind(), Some("llm_chat"));
         assert_eq!(point.path(), Some("services/customer.py"));
-        // Neither field exists in the finding contract, so neither is invented.
+        // The scanner could not read a destination for this one, so the finding
+        // states none and none is invented here.
         assert!(point.target().is_none());
         assert!(point.operation().is_none());
+    }
+
+    #[test]
+    fn both_join_keys_are_read_out_of_the_finding_rather_than_supplied_by_the_caller() {
+        // The bloker this closes. Both values used to be dropped on the way out
+        // of the scanner, so the only way a point ever had them was a caller
+        // stating them, and in a real run no caller could.
+        let finding = declared_finding("ep_3f0a91c7d4e28b56", "openai")
+            .with_declared_target(DeclaredTarget::parse("https://api.openai.com/v1", None).unwrap())
+            .with_operation("chat.completions.create");
+        let point = DeclaredPoint::from_finding(&finding).unwrap();
+
+        assert_eq!(point.target().map(TargetId::host), Some("api.openai.com"));
+        assert_eq!(point.operation(), Some("chat.completions.create"));
+    }
+
+    #[test]
+    fn a_declared_target_the_contract_should_have_refused_is_an_error_not_an_absence() {
+        // Reading a malformed host as "no destination" would turn a broken
+        // producer into a code point that simply never drifts, which is the
+        // quietest possible way to lose the finding.
+        let mut finding = declared_finding("ep_3f0a91c7d4e28b56", "openai");
+        finding.declared_target = Some(DeclaredTarget {
+            host: String::new(),
+            port: None,
+        });
+        assert!(matches!(
+            DeclaredPoint::from_finding(&finding),
+            Err(ReconcileError::UnreadableTarget)
+        ));
     }
 
     #[test]

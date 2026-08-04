@@ -7,9 +7,10 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use periskop_cli::clock::now_rfc3339;
+use periskop_cli::hook::{self, Ambient, HookError, HookRequest, Language};
 use periskop_cli::{render, rpc, scan};
 
 /// Exit codes, fixed by the command line contract.
@@ -65,6 +66,49 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         rules: Option<PathBuf>,
     },
+
+    /// Install the runtime hook that records what the code actually did.
+    ///
+    /// Optional. A scan reads code and reports the same thing with or without a
+    /// hook; what a hook adds is the second source reconciliation compares the
+    /// first against.
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookCommand {
+    /// Place the hook where the interpreter will find it.
+    Install(HookInstallArgs),
+}
+
+#[derive(Args)]
+struct HookInstallArgs {
+    /// Runtime to install the hook for.
+    #[arg(long, value_name = "python|node")]
+    language: Language,
+
+    /// Print the environment variables and change nothing on disk.
+    #[arg(long)]
+    print_env: bool,
+
+    /// Directory the hook is copied into. Required unless --print-env.
+    #[arg(long, value_name = "DIR")]
+    target: Option<PathBuf>,
+
+    /// Directory holding the hook sources.
+    #[arg(long, value_name = "DIR")]
+    source: Option<PathBuf>,
+
+    /// Directory the hook writes its event stream into.
+    #[arg(long, value_name = "DIR")]
+    event_dir: Option<PathBuf>,
+
+    /// Replace an existing installation instead of stopping.
+    #[arg(long)]
+    force: bool,
 }
 
 fn main() -> ExitCode {
@@ -77,7 +121,67 @@ fn main() -> ExitCode {
             max_unparsed_ratio,
         } => run_scan(path, json, rules, max_unparsed_ratio),
         Command::ServeRpc { rules } => run_serve_rpc(rules),
+        Command::Hook {
+            command: HookCommand::Install(args),
+        } => run_hook_install(&args),
     }
+}
+
+/// Installs a runtime hook, or says what installing one by hand would need.
+///
+/// Both paths end by printing the environment variables to stdout, because an
+/// installation the application is not pointed at records nothing, and a command
+/// that stops one step short of working is a command that gets reported as
+/// broken.
+fn run_hook_install(args: &HookInstallArgs) -> ExitCode {
+    let source_root = args
+        .source
+        .clone()
+        .unwrap_or_else(hook::default_source_root);
+    let event_dir = args
+        .event_dir
+        .clone()
+        .unwrap_or_else(hook::default_event_dir);
+
+    let request = HookRequest {
+        language: args.language,
+        source_root: &source_root,
+        target: args.target.as_deref(),
+        event_dir: &event_dir,
+        force: args.force,
+    };
+
+    if !args.print_env {
+        match hook::install(&request) {
+            Ok(installed) => {
+                let verb = if installed.replaced {
+                    "replaced"
+                } else {
+                    "installed"
+                };
+                for path in &installed.written {
+                    eprintln!("periskop: {verb} {}", path.display());
+                }
+            }
+            Err(e) => return report_hook_error(&e),
+        }
+    }
+
+    match hook::env_vars(&request, &Ambient::from_env()) {
+        Ok(vars) => {
+            for var in vars {
+                println!("{var}");
+            }
+            eprintln!("{}", hook::env_notes(args.language));
+            ExitCode::from(exit::PASS)
+        }
+        Err(e) => report_hook_error(&e),
+    }
+}
+
+fn report_hook_error(error: &HookError) -> ExitCode {
+    eprintln!("error: {error}\n  → {}", error.suggestion());
+    ExitCode::from(exit::ERROR)
 }
 
 fn run_serve_rpc(rules: Option<PathBuf>) -> ExitCode {

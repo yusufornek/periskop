@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.1",
+  "flow_id": "fl_0000000000000000",
+  "host_id": "h_9f2c4a17be0d5386",
+  "t_start_bucket": 1785834000,
+  "five_tuple": {
+    "src_port": 54321,
+    "dst_ip": "104.18.7.1",
+    "dst_port": 443,
+    "proto": "tcp"
+  },
+  "resolved_host": "api.openai.com",
+  "resolved_host_source": "sni",
+  "sni": "api.openai.com",
+  "sni_source": "encrypted_client_hello",
+  "provider_ref": "unknown",
+  "classification": "unclassified",
+  "process_attribution": "unattributed",
+  "flow_scope": "undetermined",
+  "mechanism": "ebpf"
+}

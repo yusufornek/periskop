@@ -29,31 +29,67 @@
       "minimum": 0,
       "description": "Observation start, rounded to a fixed bucket. A raw microsecond stamp would put wall clock into an identity that has to compare equal across runs."
     },
-    "duration_ms": { "type": "integer", "minimum": 0 },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How long the connection was observed. There is no t_end_bucket: the end is t_start_bucket plus this, and two independently written fields for one fact can disagree with nothing to say which is right. Absent means the end was not observed, which is a fact rather than a zero."
+    },
 
     "five_tuple": {
       "type": "object",
+      "description": "The connection key. There is no src_ip: it names the machine rather than the connection, and it moves under DHCP, NAT and container restarts, so the same connection would hash to two flow ids across two runs. host_id and netns carry what it was standing in for.",
       "required": ["src_port", "dst_ip", "dst_port", "proto"],
       "additionalProperties": false,
       "properties": {
         "src_port": { "type": "integer", "minimum": 0, "maximum": 65535 },
-        "dst_ip": { "type": "string" },
+        "dst_ip": { "type": "string", "minLength": 1 },
         "dst_port": { "type": "integer", "minimum": 0, "maximum": 65535 },
-        "proto": { "enum": ["tcp", "udp"] }
+        "proto": {
+          "enum": ["tcp", "udp"],
+          "description": "The IP protocol, which is the only thing the tuple can name. QUIC is carried over UDP; a tuple that read quic for one observation of a connection and udp for another would give that connection two identities."
+        }
       }
+    },
+    "interface": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Interface the connection was seen on. Optional because a record seeded from a socket table snapshot has no interface to report, and a required field the sensor cannot fill makes it drop the record or invent a value. A utun name is the reason this is worth carrying: it says the traffic went through a tunnel."
     },
 
     "resolved_host": { "type": "string", "description": "Destination name, when one could be established." },
     "resolved_host_source": {
       "enum": ["dns", "sni", "dns_and_sni", "none"],
-      "description": "How the name was established. Reported because the two sources can disagree and a reader needs to know which one produced this."
+      "description": "How the name was established. Reported because the two sources can disagree and a reader needs to know which one produced this. dns_and_sni is corroboration, and its opposite is the dns_sni_mismatch degradation."
+    },
+    "sni": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Server name as the handshake presented it. Present only when sni_source is client_hello: under an encrypted or absent ClientHello there is no name to record, and a value here would contradict the field that says so."
     },
     "sni_source": {
       "enum": ["client_hello", "encrypted_client_hello", "absent"],
       "description": "Required. encrypted_client_hello means the name is genuinely unavailable rather than merely missing, and the two must not read alike."
     },
+    "dns_names": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Names the observed DNS answers mapped to this destination, lexicographically ascending. Carried because degraded_reasons can say dns_sni_mismatch, and without this the record states a disagreement while showing only one side of it."
+    },
 
     "provider_ref": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "classification": {
+      "enum": ["classified", "unclassified", "opaque"],
+      "description": "Whether the destination could be resolved and named. This is the distinction provider_ref cannot carry: unclassified and opaque both write provider_ref unknown, and only this field separates we looked at a name and no signature matched from there was never a name to look at. The second is a measured blind spot and the report's most important line."
+    },
+    "provider_confidence": {
+      "enum": ["confirmed", "suspect"],
+      "description": "How the provider was established. A signature matched on a host name is a structural fact; a match on an address range is a guess, and the project forbids a guess from reaching the confirmed list. Present only when classification is classified: a confidence about a classification that does not exist is a claim about nothing."
+    },
+    "ruleset_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "Version of the signature set that produced the classification, for the same reason a finding names detector.rule_version: a classification nobody can trace back to a rule set cannot be explained or reproduced. Present only when classification is classified."
+    },
 
     "process_attribution": {
       "enum": ["kernel_attributed", "inferred", "unattributed"],
@@ -99,5 +135,31 @@
       },
       "description": "pre_existing_connection means bytes_out and duration_ms are lower bounds and t_start_bucket is when observation began, not when the connection did. A threshold rule must not discard such a record for falling under a limit."
     }
-  }
+  },
+
+  "allOf": [
+    {
+      "$comment": "A server name can only exist where the handshake showed one. Recording a name alongside encrypted_client_hello or absent would contradict the field that measures the blind spot, and the contradiction would read as data.",
+      "if": { "required": ["sni"] },
+      "then": {
+        "required": ["sni_source"],
+        "properties": { "sni_source": { "const": "client_hello" } }
+      }
+    },
+    {
+      "$comment": "Provider confidence and rule set version describe a classification. Carrying them on a record that classified nothing would attach a confidence to a claim nobody made. The reverse is deliberately not required: a build whose classifier has not run yet still reports its flows, and a required field it cannot fill would make it drop them instead.",
+      "if": {
+        "required": ["classification"],
+        "properties": { "classification": { "not": { "const": "classified" } } }
+      },
+      "then": {
+        "not": {
+          "anyOf": [
+            { "required": ["provider_confidence"] },
+            { "required": ["ruleset_version"] }
+          ]
+        }
+      }
+    }
+  ]
 }

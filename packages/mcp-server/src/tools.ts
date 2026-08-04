@@ -20,12 +20,31 @@ import type { EngineBridge } from "./bridge.js";
 export const DEFAULT_PAGE_SIZE = 20;
 export const MAX_PAGE_SIZE = 100;
 
+export interface EntityRef {
+  ref_type: string;
+  ref_id: string;
+}
+
+export interface Evidence {
+  evidence_type: string;
+  ref: string;
+}
+
 export interface Finding {
   finding_id: string;
   provider_ref: string;
   confidence: string;
   detector: { rule_id: string };
   location?: { path?: string; span?: { start_line: number } };
+  // Read by the reconciliation trace rather than by the scan projection, and
+  // optional here for one reason: an engine older than the field would omit it,
+  // and a required field would turn that into a type error at the boundary
+  // instead of a coverage note in the answer.
+  kind?: string;
+  source?: string;
+  refs?: EntityRef[];
+  evidence?: Evidence[];
+  data_sources?: Array<{ source: string; detector_id?: string | null }>;
 }
 
 export interface Coverage {

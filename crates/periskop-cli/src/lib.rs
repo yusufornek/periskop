@@ -11,6 +11,7 @@
 //! call it, and the clock the envelope needs.
 
 pub mod clock;
+pub mod hook;
 pub mod render;
 pub mod rpc;
 pub mod scan;

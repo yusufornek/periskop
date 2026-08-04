@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "finding_id": "fnd_7c1e4a90b3d25f61",
   "kind": "declared_egress_point",
   "source": "declared",
@@ -7,6 +7,8 @@
   "provider_ref": "openai",
   "egress_kind": "llm_chat",
   "detector_severity": "medium",
+  "declared_target": { "host": "api.openai.com" },
+  "operation": "chat.completions.create",
   "refs": [
     { "ref_type": "egress_point", "ref_id": "ep_3f0a91c7d4e28b56" }
   ],

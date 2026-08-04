@@ -348,6 +348,194 @@ mod tests {
         );
     }
 
+    /// The pipeline, end to end, with nothing hand built on the code side.
+    ///
+    /// Every other test in this module starts from a `DeclaredPoint` a test
+    /// helper filled in. That is exactly how this component passed its tests for
+    /// a whole phase while being unable to produce a single finding in a real
+    /// run: the two fields the join compares were read by the scanner and
+    /// dropped before its output, so a caller had to supply them and in a real
+    /// run no caller could.
+    ///
+    /// So this one starts at Python source and the rule files as shipped, runs
+    /// the real detector, and hands the resulting `Finding` to
+    /// `DeclaredPoint::from_finding` and nothing else. If either field stops
+    /// reaching the contract, this test fails and no other one does.
+    mod pipeline {
+        use super::*;
+        use periskop_core::finding::Kind;
+        use periskop_static_scanner::engine::detect;
+        use periskop_static_scanner::language::Language;
+        use periskop_static_scanner::parser::parse_as;
+        use periskop_static_scanner::rules::{compile, load_directory};
+
+        /// A client pointed at the vendor, and a call through it. The base url
+        /// is written out because that is the case where the code states a
+        /// destination at all; with the library default the scanner has nothing
+        /// to state and drift cannot be claimed.
+        const SOURCE: &str = r#"
+from openai import OpenAI
+
+client = OpenAI(base_url="https://api.openai.com/v1")
+
+
+def summarize(record):
+    return client.chat.completions.create(
+        model="gpt-4",
+        messages=[{"role": "user", "content": record}],
+    )
+"#;
+
+        /// A raw HTTP call to a provider endpoint, no SDK involved. Kept
+        /// separate because it exercises the other operation spelling: a hook
+        /// sitting at the transport records `http.post`, and the code side has
+        /// to reproduce that or the two never meet.
+        const RAW_HTTP_SOURCE: &str = r#"
+import requests
+
+
+def summarize(record, token):
+    return requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": token},
+        json={"model": "gpt-4", "messages": [{"role": "user", "content": record}]},
+    )
+"#;
+
+        fn scanned_points() -> Vec<DeclaredPoint> {
+            points_from(SOURCE)
+        }
+
+        fn points_from(source: &str) -> Vec<DeclaredPoint> {
+            let rules_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules");
+            let (rules, errors) = load_directory(&rules_dir);
+            assert!(errors.is_empty(), "rule load failed: {errors:?}");
+            let python: Vec<_> = rules
+                .into_iter()
+                .filter(|r| r.language == "python")
+                .collect();
+            let compiled = match compile(Language::Python, &python) {
+                Ok(compiled) => compiled,
+                Err(error) => unreachable!("shipped rules did not compile: {error}"),
+            };
+            let parsed = match parse_as("services/customer.py", source, Language::Python) {
+                Ok(parsed) => parsed,
+                Err(error) => unreachable!("fixture did not parse: {error}"),
+            };
+
+            let scanned = detect(&parsed, &compiled, &python);
+            assert!(
+                scanned.engine_faults.is_empty(),
+                "engine faults: {:?}",
+                scanned.engine_faults
+            );
+            scanned
+                .findings
+                .iter()
+                .filter(|finding| finding.kind == Kind::DeclaredEgressPoint)
+                .map(|finding| DeclaredPoint::from_finding(finding).unwrap())
+                .collect()
+        }
+
+        #[test]
+        fn the_scanner_alone_supplies_both_keys_the_join_compares() {
+            let points = scanned_points();
+            let point = points
+                .iter()
+                .find(|point| point.provider_ref() == "openai")
+                .unwrap();
+
+            assert_eq!(point.target().map(TargetId::host), Some("api.openai.com"));
+            assert_eq!(point.operation(), Some("chat.completions.create"));
+        }
+
+        #[test]
+        fn a_call_the_scanner_found_and_a_gateway_it_reached_produce_a_target_drift() {
+            // The event is spelled as the Python hook spells it, because the
+            // whole join rests on the two sides agreeing on one operation name.
+            let points = scanned_points();
+            let events = [event(
+                "openai",
+                "chat.completions.create",
+                "llm-gateway.internal",
+                "unknown",
+            )];
+
+            let result = join(&points, &events);
+            let derived = derive(&points, &result, &ReconcileSettings::default());
+
+            let drifts: Vec<&Finding> = derived
+                .findings
+                .iter()
+                .filter(|finding| finding.kind == Kind::TargetDrift)
+                .collect();
+            assert_eq!(drifts.len(), 1, "{:?}", derived.faults);
+            assert_eq!(drifts[0].confidence, Confidence::Confirmed);
+
+            let evidence: String = drifts[0]
+                .evidence
+                .iter()
+                .map(|piece| piece.r#ref.clone())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            assert!(evidence.contains("declared=api.openai.com"), "{evidence}");
+            assert!(
+                evidence.contains("observed=llm-gateway.internal"),
+                "{evidence}"
+            );
+            assert!(evidence.contains("drift=host"), "{evidence}");
+        }
+
+        #[test]
+        fn a_raw_http_call_is_spelled_the_way_the_transport_hook_spells_it() {
+            // The literal endpoint gives the destination and the verb gives the
+            // operation. If the code side said `post` while the hook said
+            // `http.post`, the two would only ever meet through the provider,
+            // and this rule reports provider unknown.
+            let points = points_from(RAW_HTTP_SOURCE);
+            let point = points.first().unwrap();
+
+            assert_eq!(point.target().map(TargetId::host), Some("api.openai.com"));
+            assert_eq!(point.operation(), Some("http.post"));
+
+            let events = [event(
+                "requests",
+                "http.post",
+                "llm-gateway.internal",
+                "unknown",
+            )];
+            let result = join(&points, &events);
+            let derived = derive(&points, &result, &ReconcileSettings::default());
+
+            let drifts: Vec<&Finding> = derived
+                .findings
+                .iter()
+                .filter(|finding| finding.kind == Kind::TargetDrift)
+                .collect();
+            assert_eq!(drifts.len(), 1, "{:?}", derived.faults);
+        }
+
+        #[test]
+        fn a_call_that_reached_what_the_code_named_produces_no_drift() {
+            // The negative half. Without it the test above would still pass if
+            // the deriver reported a drift for every matched call.
+            let points = scanned_points();
+            let events = [event(
+                "openai",
+                "chat.completions.create",
+                "api.openai.com",
+                "openai",
+            )];
+
+            let result = join(&points, &events);
+            let derived = derive(&points, &result, &ReconcileSettings::default());
+            assert!(derived
+                .findings
+                .iter()
+                .all(|finding| finding.kind != Kind::TargetDrift));
+        }
+    }
+
     #[test]
     fn the_finding_does_not_depend_on_the_order_the_calls_arrived_in() {
         let points = [point_without_operation(EP, "api.openai.com")];
