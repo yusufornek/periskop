@@ -76,12 +76,25 @@ pub enum RecordType {
 }
 
 impl RecordType {
-    /// The byte that goes into the AAD. Explicit rather than a cast of the
-    /// discriminant, because reordering the variants would then silently change
-    /// what every stored record authenticates against.
-    fn tag(self) -> u8 {
+    /// The byte that goes into the AAD, and into a vault file's frame header.
+    /// Explicit rather than a cast of the discriminant, because reordering the
+    /// variants would then silently change what every stored record
+    /// authenticates against.
+    pub(super) fn tag(self) -> u8 {
         match self {
             Self::Alias => 1,
+        }
+    }
+
+    /// Reads the byte back, refusing one this build does not know.
+    ///
+    /// `None` rather than a default: a frame carrying an unknown record type came
+    /// from a newer layout or from somebody guessing, and treating it as an alias
+    /// record would open it under the wrong AAD.
+    pub(super) fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::Alias),
+            _ => None,
         }
     }
 }
@@ -100,7 +113,7 @@ impl AliasSeed {
         Self(bytes)
     }
 
-    fn as_bytes(&self) -> &[u8; ALIAS_SEED_BYTES] {
+    pub(super) fn as_bytes(&self) -> &[u8; ALIAS_SEED_BYTES] {
         &self.0
     }
 }
@@ -145,6 +158,25 @@ pub struct SealedRecord {
 impl SealedRecord {
     pub fn nonce(&self) -> &[u8; NONCE_BYTES] {
         &self.nonce
+    }
+
+    /// The ciphertext with its Poly1305 tag, for the file backend that writes it
+    /// down and reads it back.
+    ///
+    /// Crate private, and it hands out sealed bytes rather than a value: there is
+    /// no accessor anywhere that produces a plaintext without going through
+    /// [`unseal`].
+    pub(super) fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// Rebuilds a record from what a vault file stored.
+    ///
+    /// This constructor makes no claim about the bytes. They are opened under the
+    /// identity the caller believes they belong to, and if that belief is wrong
+    /// the AEAD refuses; nothing here can turn tampered bytes into a value.
+    pub(super) fn from_parts(nonce: [u8; NONCE_BYTES], body: Vec<u8>) -> Self {
+        Self { nonce, body }
     }
 }
 

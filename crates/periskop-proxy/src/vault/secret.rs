@@ -73,7 +73,7 @@ impl DerivedPurpose for SessionScope {
 /// The key vault records are sealed under, `K_vault` in ADR-007.
 ///
 /// Expanded rather than used raw so that it is a sibling of the chain key the
-/// file backend will need ("K_chain ... kayıt anahtarından ayrı"), instead of the
+/// file backend needs ("K_chain ... kayıt anahtarından ayrı"), instead of the
 /// chain key being a child of the record key.
 #[derive(Debug)]
 pub struct RecordScope;
@@ -84,6 +84,26 @@ impl KeyPurpose for RecordScope {
 
 impl DerivedPurpose for RecordScope {
     const INFO: &'static [u8] = b"periskop/vault/record/v1";
+}
+
+/// The key the `vault.psk` integrity chain is computed under, `K_chain` in
+/// ADR-007 section "3. Dosya bütünlüğü".
+///
+/// Separate from [`RecordScope`] because the two answer different questions. The
+/// record key says "this record was sealed for this slot"; the chain key says
+/// "this is the whole set of records, in this order, under this header". A single
+/// key doing both would mean that a leak of the one used on every request also
+/// hands over the ability to forge a file the vault would open.
+#[derive(Debug)]
+pub struct ChainScope;
+
+impl KeyPurpose for ChainScope {
+    const LABEL: &'static str = "chain";
+}
+
+impl DerivedPurpose for ChainScope {
+    /// Fixed by ADR-007 by name; it is not ours to choose.
+    const INFO: &'static [u8] = b"periskop/vault/chain/v1";
 }
 
 /// A 256 bit key that knows what it is for, clears itself, and prints nothing.
@@ -128,6 +148,8 @@ pub type MasterKey = Key<Master>;
 pub type SessionKey = Key<SessionScope>;
 /// The key records are sealed under.
 pub type RecordKey = Key<RecordScope>;
+/// The key the vault file's integrity chain is computed under.
+pub type ChainKey = Key<ChainScope>;
 
 /// What the operator typed, on its way to Argon2id and nowhere else.
 pub struct Passphrase(Zeroizing<Vec<u8>>);
@@ -234,10 +256,22 @@ mod tests {
     }
 
     #[test]
-    fn the_two_expanded_purposes_use_different_info_strings() {
-        // The whole point of expanding rather than reusing the master key. If
-        // these ever collide, two keys become one key.
-        assert_ne!(SessionScope::INFO, RecordScope::INFO);
+    fn every_expanded_purpose_uses_a_different_info_string() {
+        // The whole point of expanding rather than reusing the master key. If any
+        // two of these collide, two keys become one key, and for the chain key
+        // that would mean the key an attacker needs to forge a vault file is the
+        // key every request already uses.
+        let labels = [SessionScope::INFO, RecordScope::INFO, ChainScope::INFO];
+        let distinct: std::collections::BTreeSet<&[u8]> = labels.into_iter().collect();
+        assert_eq!(distinct.len(), labels.len());
+    }
+
+    #[test]
+    fn the_chain_key_carries_the_info_string_the_adr_fixes() {
+        // ADR-007 section "3. Dosya bütünlüğü" writes this string out. Changing it
+        // silently invalidates every vault file a previous version wrote, so it
+        // has to be a decision rather than an edit.
+        assert_eq!(ChainScope::INFO, b"periskop/vault/chain/v1");
     }
 
     #[test]
@@ -256,6 +290,7 @@ mod tests {
         clears_itself::<MasterKey>();
         clears_itself::<SessionKey>();
         clears_itself::<RecordKey>();
+        clears_itself::<ChainKey>();
         clears_itself::<Passphrase>();
         clears_itself::<SecretValue>();
     }

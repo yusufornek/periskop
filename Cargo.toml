@@ -73,6 +73,11 @@ getrandom = "0.3"
 # purpose label, so a key that leaks leaks one purpose. Written by hand it would
 # be hand written crypto, which CLAUDE.md forbids.
 hkdf = "0.12"
+# The vault file's integrity chain (ADR-007 "3. Dosya bütünlüğü", ADR-016 section
+# 2). Already in this tree as `hkdf`'s own dependency; named here because the
+# chain calls it directly and a crate this workspace uses on purpose has to be a
+# line somebody decided to write.
+hmac = "0.12"
 ignore = "0.4"
 tree-sitter = "0.25"
 tree-sitter-python = "0.25"

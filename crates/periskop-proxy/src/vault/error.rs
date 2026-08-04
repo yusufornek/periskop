@@ -11,6 +11,8 @@
 //! a response body; personal data reaches neither (spec section 9, "Günlük
 //! disiplini").
 
+use std::fmt;
+
 use thiserror::Error;
 
 /// Everything the vault can refuse, and why.
@@ -77,6 +79,124 @@ pub enum VaultError {
     /// nobody can act on (spec section 10: 429 plus which limit was crossed).
     #[error("this session already holds its ceiling of {ceiling} aliases")]
     AliasCeilingReached { ceiling: usize },
+
+    /// The vault file did not survive its integrity check.
+    ///
+    /// One error for the three shapes of the same attack, because they end the
+    /// same way: `proxy/spec.md` section 10 answers all three with 503, the vault
+    /// stays sealed and **no recovery is attempted**. The distinction is carried
+    /// in [`Integrity`] rather than in three error variants so that the value
+    /// `GET /admin/vault/status` reports and the value the refusal carries cannot
+    /// drift apart.
+    #[error("the vault file failed its integrity check ({integrity}); the vault stays sealed and is not repaired")]
+    IntegrityFailed { integrity: Integrity },
+
+    /// The bytes on disk are not a `vault.psk` this build can read at all.
+    ///
+    /// Separate from [`VaultError::IntegrityFailed`] on purpose: a truncated or
+    /// corrupt header is not one of the three integrity violations the contract
+    /// enumerates, and reporting it as one would put a value in
+    /// `/admin/vault/status` that did not happen. Both refuse with 503.
+    #[error(
+        "the vault file is not readable: the {field} field is malformed; the vault stays sealed"
+    )]
+    VaultFileMalformed { field: VaultField },
+
+    /// The file is well formed but declares something this build does not
+    /// implement.
+    #[error(
+        "the vault file declares an unsupported {field} ({found}); the vault stays sealed rather than guessing"
+    )]
+    VaultFileUnsupported { field: VaultField, found: u32 },
+
+    /// The operating system refused a read, a write or a rename.
+    ///
+    /// Carries what was being attempted and the operating system's own category,
+    /// and never the path: a path is not secret but it is noise in a log line, and
+    /// the caller knows which vault it asked for.
+    #[error("the vault file could not be {operation}: {cause}; the vault stays sealed")]
+    VaultFileUnavailable {
+        operation: &'static str,
+        cause: String,
+    },
+}
+
+/// Which of the three violations ADR-007 section 3 and 4 name.
+///
+/// The values are the ones `proxy-api.md` fixes for `GET /admin/vault/status`, and
+/// this enum is their only definition in this crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Integrity {
+    /// Nothing is wrong, which is the only value a `memory` vault ever reports.
+    Ok,
+    /// The chain over the records does not end where the header says it does: a
+    /// record was removed, edited, reordered, truncated away or appended.
+    ChainMismatch,
+    /// The file's record counter is below one this process has already seen, which
+    /// is what restoring an older copy of the vault looks like.
+    CounterRollback,
+    /// The header did not authenticate under the key its own parameters derive,
+    /// which is what weakening the Argon2id parameters looks like.
+    HeaderMacFailed,
+}
+
+impl Integrity {
+    /// The wire value (`proxy-api.md`, `GET /admin/vault/status`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::ChainMismatch => "chain_mismatch",
+            Self::CounterRollback => "counter_rollback",
+            Self::HeaderMacFailed => "header_mac_failed",
+        }
+    }
+}
+
+impl fmt::Display for Integrity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Which field of the file format was wrong.
+///
+/// Named rather than numbered because the message reaches an operator looking at
+/// a vault that will not open, and "byte 10" is not something they can act on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VaultField {
+    Magic,
+    LayoutVersion,
+    KdfAlgorithm,
+    Aead,
+    HeaderLength,
+    HeaderReserved,
+    FrameVersion,
+    FrameLength,
+    FrameReserved,
+    RecordType,
+    AliasLength,
+    Alias,
+    BodyLength,
+}
+
+impl fmt::Display for VaultField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Magic => "magic",
+            Self::LayoutVersion => "layout version",
+            Self::KdfAlgorithm => "key derivation algorithm",
+            Self::Aead => "aead",
+            Self::HeaderLength => "header length",
+            Self::HeaderReserved => "header reserved",
+            Self::FrameVersion => "frame version",
+            Self::FrameLength => "frame length",
+            Self::FrameReserved => "frame reserved",
+            Self::RecordType => "record type",
+            Self::AliasLength => "alias length",
+            Self::Alias => "alias",
+            Self::BodyLength => "sealed body length",
+        })
+    }
 }
 
 impl VaultError {
@@ -99,7 +219,24 @@ impl VaultError {
             | Self::KeyDerivationFailed
             | Self::EntropyUnavailable
             | Self::RecordTamper
-            | Self::AliasCollision => 503,
+            | Self::AliasCollision
+            | Self::IntegrityFailed { .. }
+            | Self::VaultFileMalformed { .. }
+            | Self::VaultFileUnsupported { .. }
+            | Self::VaultFileUnavailable { .. } => 503,
+        }
+    }
+
+    /// The value `GET /admin/vault/status` reports after this refusal.
+    ///
+    /// `None` for every failure that is not one of the three the contract
+    /// enumerates. A truncated header is a real failure and it is still not a
+    /// `chain_mismatch`; answering with one would put a fact in the operator's
+    /// dashboard that did not happen.
+    pub fn integrity(&self) -> Option<Integrity> {
+        match self {
+            Self::IntegrityFailed { integrity } => Some(*integrity),
+            _ => None,
         }
     }
 }
@@ -137,5 +274,64 @@ mod tests {
     fn the_alias_ceiling_refusal_says_which_limit_was_crossed() {
         let rendered = VaultError::AliasCeilingReached { ceiling: 10_000 }.to_string();
         assert!(rendered.contains("10000"), "{rendered}");
+    }
+
+    /// Spec section 10's integrity row: all three violations are 503.
+    #[test]
+    fn all_three_integrity_violations_answer_503_and_name_themselves() {
+        for integrity in [
+            Integrity::ChainMismatch,
+            Integrity::CounterRollback,
+            Integrity::HeaderMacFailed,
+        ] {
+            let refusal = VaultError::IntegrityFailed { integrity };
+            assert_eq!(refusal.http_status(), 503, "{integrity:?}");
+            assert_eq!(refusal.integrity(), Some(integrity));
+            let rendered = refusal.to_string();
+            assert!(rendered.contains(integrity.as_str()), "{rendered}");
+            // The refusal has to say that nothing was repaired, because a vault
+            // that opened halfway is more dangerous than one that did not open.
+            assert!(rendered.contains("not repaired"), "{rendered}");
+        }
+    }
+
+    /// The four values `proxy-api.md` fixes for the status endpoint, spelled the
+    /// way the contract spells them.
+    #[test]
+    fn the_integrity_vocabulary_is_the_contract_vocabulary() {
+        assert_eq!(Integrity::Ok.as_str(), "ok");
+        assert_eq!(Integrity::ChainMismatch.as_str(), "chain_mismatch");
+        assert_eq!(Integrity::CounterRollback.as_str(), "counter_rollback");
+        assert_eq!(Integrity::HeaderMacFailed.as_str(), "header_mac_failed");
+    }
+
+    /// A file problem that is not one of the three has no integrity value.
+    #[test]
+    fn a_malformed_file_is_503_but_is_not_one_of_the_three_violations() {
+        let refusal = VaultError::VaultFileMalformed {
+            field: VaultField::Magic,
+        };
+        assert_eq!(refusal.http_status(), 503);
+        assert_eq!(refusal.integrity(), None);
+        assert!(refusal.to_string().contains("magic"));
+
+        let unsupported = VaultError::VaultFileUnsupported {
+            field: VaultField::LayoutVersion,
+            found: 2000,
+        };
+        assert_eq!(unsupported.http_status(), 503);
+        assert_eq!(unsupported.integrity(), None);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_says_what_was_being_attempted() {
+        let refusal = VaultError::VaultFileUnavailable {
+            operation: "opened",
+            cause: "permission denied".to_owned(),
+        };
+        assert_eq!(refusal.http_status(), 503);
+        let rendered = refusal.to_string();
+        assert!(rendered.contains("opened"), "{rendered}");
+        assert!(rendered.contains("permission denied"), "{rendered}");
     }
 }

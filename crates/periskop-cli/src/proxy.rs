@@ -27,7 +27,7 @@
 
 use std::io::Read;
 
-use periskop_proxy::vault::{OpenRequest, Passphrase, ProfileName, Vault};
+use periskop_proxy::vault::{Backing, OpenRequest, Passphrase, ProfileName, Vault};
 use zeroize::Zeroizing;
 
 /// What one `periskop proxy` invocation was asked for.
@@ -81,6 +81,13 @@ pub fn run(request: &ProxyRequest<'_>, passphrase_source: &mut impl Read) -> Pro
     match Vault::open(&OpenRequest {
         passphrase: &passphrase,
         profile,
+        // The default, and the only backing this command offers. The `file`
+        // backend exists (`vault.psk`, ADR-007) but reaching it needs a flag, a
+        // path and a way to carry the record counter across restarts, and all
+        // three belong to the command surface `cli/spec.md` defines rather than to
+        // this wave. Until they are decided, a run of `periskop proxy` writes
+        // nothing to a disk, which is what CLAUDE.md's first prohibition asks for.
+        backing: Backing::Memory,
     }) {
         Ok(vault) => ProxyOutcome::VaultOpened {
             notes: vault.notes().iter().map(ToString::to_string).collect(),
@@ -164,7 +171,15 @@ mod tests {
         match outcome {
             ProxyOutcome::VaultOpened { notes } => {
                 assert_eq!(notes.len(), 1);
-                assert!(notes[0].contains("ci"), "{notes:?}");
+                // The note names the two memory parameters rather than the profile
+                // it was asked for. That changed when the `file` backend arrived:
+                // a vault file carries its own Argon2id parameters, so the note has
+                // to describe the strength the vault is *actually* protected at,
+                // and a note that named `ci` would be false for a file whose header
+                // says something the shipped profiles never say.
+                assert!(notes[0].contains("64 MiB"), "{notes:?}");
+                assert!(notes[0].contains("256 MiB"), "{notes:?}");
+                assert!(notes[0].contains("cheaper"), "{notes:?}");
             }
             other => panic!("{other:?}"),
         }

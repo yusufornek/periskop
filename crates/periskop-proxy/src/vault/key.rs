@@ -33,7 +33,8 @@ use zeroize::Zeroizing;
 
 use super::error::VaultError;
 use super::secret::{
-    random_bytes, DerivedPurpose, Key, MasterKey, Passphrase, RecordKey, SessionKey, KEY_BYTES,
+    random_bytes, ChainKey, DerivedPurpose, Key, MasterKey, Passphrase, RecordKey, SessionKey,
+    KEY_BYTES,
 };
 use super::session::SessionId;
 
@@ -81,7 +82,7 @@ impl Salt {
         Self(bytes)
     }
 
-    fn as_bytes(&self) -> &[u8] {
+    pub(super) fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 }
@@ -128,14 +129,26 @@ impl ProfileName {
 
     /// What the operator has to be told about this choice, if anything.
     pub fn note(self) -> Option<VaultNote> {
-        match self {
-            Self::Standard => None,
-            Self::Ci => Some(VaultNote::ReducedKdfProfile {
-                memory_kib: KdfProfile::named(Self::Ci).memory_kib,
-                standard_memory_kib: KdfProfile::named(Self::Standard).memory_kib,
-            }),
-        }
+        note_for(&KdfProfile::named(self))
     }
+}
+
+/// What the operator has to be told about the strength a vault is actually
+/// protected at.
+///
+/// Keyed off the parameters rather than off the profile *name*, because a vault
+/// file carries its own parameters: an operator who asks for the shipped profile
+/// and opens a file created under the reduced one is running at the reduced one,
+/// and a note that followed the name would say the opposite.
+pub fn note_for(profile: &KdfProfile) -> Option<VaultNote> {
+    let standard = KdfProfile::named(ProfileName::Standard).memory_kib;
+    if profile.memory_kib >= standard {
+        return None;
+    }
+    Some(VaultNote::ReducedKdfProfile {
+        memory_kib: profile.memory_kib,
+        standard_memory_kib: standard,
+    })
 }
 
 /// Something the operator has to see, because it changes what the vault is worth.
@@ -146,7 +159,7 @@ impl ProfileName {
 /// reduced one" may not be invisible.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VaultNote {
-    /// The vault key was derived under the reduced profile.
+    /// The vault key was derived below the shipped strength.
     ReducedKdfProfile {
         memory_kib: u32,
         standard_memory_kib: u32,
@@ -156,12 +169,17 @@ pub enum VaultNote {
 impl fmt::Display for VaultNote {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            // The numbers rather than a profile name. A vault file carries its own
+            // Argon2id parameters, so this note is also produced for a file whose
+            // header says something the shipped profiles never say, and naming the
+            // `ci` profile there would be a false statement in a note whose whole
+            // job is to be true.
             Self::ReducedKdfProfile {
                 memory_kib,
                 standard_memory_kib,
             } => write!(
                 f,
-                "vault key derivation ran under the `ci` profile: Argon2id memory {} MiB instead of {} MiB. \
+                "vault key derivation ran at Argon2id memory {} MiB instead of the shipped {} MiB. \
                  Guessing the passphrase offline is correspondingly cheaper.",
                 memory_kib / 1024,
                 standard_memory_kib / 1024
@@ -249,6 +267,19 @@ impl KdfProfile {
             parallelism: claimed.parallelism,
         })
     }
+
+    /// The same numbers, on their way into a vault file header.
+    ///
+    /// Written back out as a claim rather than as a profile, because that is what
+    /// they become the moment they leave this process: the next reader has to
+    /// bound them again before deriving anything from them.
+    pub(super) fn claimed(&self) -> ClaimedKdfParameters {
+        ClaimedKdfParameters {
+            memory_kib: self.memory_kib,
+            iterations: self.iterations,
+            parallelism: self.parallelism,
+        }
+    }
 }
 
 fn check(
@@ -318,6 +349,16 @@ pub fn derive_session_key(
 
 /// Expands the key records are sealed under, `K_vault` in ADR-007.
 pub(super) fn derive_record_key(master: &MasterKey) -> Result<RecordKey, VaultError> {
+    expand(master, None)
+}
+
+/// Expands the key the vault file's integrity chain runs under, `K_chain` in
+/// ADR-007 section "3. Dosya bütünlüğü".
+///
+/// A sibling of the record key rather than a child of it, which is what the ADR
+/// means by "kayıt anahtarından ayrı": both come from the master key under their
+/// own info string, so neither can be computed from the other.
+pub(super) fn derive_chain_key(master: &MasterKey) -> Result<ChainKey, VaultError> {
     expand(master, None)
 }
 
@@ -454,10 +495,30 @@ mod tests {
         let note = ProfileName::Ci.note().unwrap();
         let rendered = note.to_string();
         // The operator has to be able to read what changed and what it costs.
-        assert!(rendered.contains("ci"), "{rendered}");
         assert!(rendered.contains("64 MiB"), "{rendered}");
         assert!(rendered.contains("256 MiB"), "{rendered}");
         assert!(rendered.contains("Guessing"), "{rendered}");
+    }
+
+    /// The note follows the parameters, not the name somebody typed.
+    ///
+    /// A vault file carries its own Argon2id parameters, so a run that asked for
+    /// the shipped profile can still end up deriving at a reduced strength. The
+    /// note has to say so, or the difference between "protected at the shipped
+    /// strength" and "protected at a reduced one" becomes invisible exactly when
+    /// it matters (README principle 4).
+    #[test]
+    fn a_reduced_parameter_set_from_a_file_produces_the_note_too() {
+        let from_file = KdfProfile::validate(&claim(100 * 1024, 3, 4)).unwrap();
+        let note = note_for(&from_file).unwrap();
+        assert!(note.to_string().contains("100 MiB"), "{note}");
+
+        // And a file at or above the shipped strength produces none.
+        assert_eq!(note_for(&KdfProfile::named(ProfileName::Standard)), None);
+        assert_eq!(
+            note_for(&KdfProfile::validate(&claim(MEMORY_CEILING_KIB, 3, 4)).unwrap()),
+            None
+        );
     }
 
     #[test]
@@ -558,6 +619,40 @@ mod tests {
         assert_eq!(
             record.as_bytes(),
             derive_record_key(&master).unwrap().as_bytes()
+        );
+    }
+
+    /// ADR-007 puts the chain key beside the record key rather than under it.
+    ///
+    /// If these two were ever the same bytes, the key that seals every record
+    /// would also be the key that authenticates the file, so a leak of the busy
+    /// one would let an attacker write a vault file this process opens.
+    #[test]
+    fn the_chain_key_is_separate_from_the_record_key_and_stable() {
+        let master = derive_master_key(&ci(), &passphrase(), &salt()).unwrap();
+        let chain = derive_chain_key(&master).unwrap();
+
+        assert_ne!(chain.as_bytes(), master.as_bytes());
+        assert_ne!(
+            chain.as_bytes(),
+            derive_record_key(&master).unwrap().as_bytes()
+        );
+        assert_eq!(
+            chain.as_bytes(),
+            derive_chain_key(&master).unwrap().as_bytes()
+        );
+
+        // And it follows the master key: a different passphrase cannot verify a
+        // header this one wrote.
+        let elsewhere = derive_master_key(
+            &ci(),
+            &Passphrase::new(b"a different operator".to_vec()),
+            &salt(),
+        )
+        .unwrap();
+        assert_ne!(
+            chain.as_bytes(),
+            derive_chain_key(&elsewhere).unwrap().as_bytes()
         );
     }
 

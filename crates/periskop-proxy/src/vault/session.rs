@@ -167,14 +167,14 @@ impl Session {
         alias: &str,
         sealed: SealedRecord,
         ceiling: usize,
-    ) -> Result<(), VaultError> {
+    ) -> Result<Inserted, VaultError> {
         if let Some(existing) = self.aliases.get(&seed) {
             // The same value masked again inside one conversation. Same seed,
             // same record, and it may not consume a second slot: a long
             // conversation about one customer would otherwise walk into the
             // ceiling for no reason.
             if existing.alias == alias {
-                return Ok(());
+                return Ok(Inserted::AlreadyHeld);
             }
             // Same value, two different aliases. Only a broken generator produces
             // that, and keeping either one would make the earlier turns of the
@@ -205,7 +205,18 @@ impl Session {
                 sealed,
             },
         );
-        Ok(())
+        Ok(Inserted::Stored)
+    }
+
+    /// Undoes an [`Inserted::Stored`].
+    ///
+    /// The one caller is the file backend's failure path: a record that could not
+    /// be written to the disk may not stay in memory, because the next restart
+    /// would silently lose it and every turn in between would have been answered
+    /// from a vault the file does not describe.
+    pub(super) fn forget(&mut self, seed: &AliasSeed, alias: &str) {
+        self.aliases.remove(seed);
+        self.reverse.remove(alias);
     }
 
     /// Finds what an alias in a model's answer refers to.
@@ -213,6 +224,32 @@ impl Session {
         let seed = self.reverse.get(alias)?;
         let record = self.aliases.get(seed)?;
         Some((*seed, &record.sealed))
+    }
+
+    /// Every record this session holds, in a stable order.
+    ///
+    /// Read by compaction, which writes the live sessions out as a new file. The
+    /// order is the map's, so two compactions of the same state produce the same
+    /// bytes.
+    pub(super) fn records(&self) -> impl Iterator<Item = (AliasSeed, &str, &SealedRecord)> {
+        self.aliases
+            .iter()
+            .map(|(seed, record)| (*seed, record.alias.as_str(), &record.sealed))
+    }
+
+    pub(super) fn last_used_at_ms(&self) -> u64 {
+        self.last_used_at_ms
+    }
+
+    /// Moves the deadline to a stamp read out of a vault file.
+    ///
+    /// Separate from [`Self::touch`] because it runs while the vault is being
+    /// loaded rather than while a request is being served, and because it must not
+    /// be reachable from the request path: a caller who could set a session's last
+    /// use to an arbitrary instant could keep an expired conversation alive.
+    pub(super) fn restore_last_use(&mut self, stamp_ms: u64) {
+        self.last_used_at_ms = self.last_used_at_ms.max(stamp_ms);
+        self.created_at_ms = self.created_at_ms.min(stamp_ms);
     }
 
     /// Exchanges two records' sealed bodies in place.
@@ -239,6 +276,17 @@ impl Session {
         replace(second, a);
         true
     }
+}
+
+/// Whether filing a record consumed a slot.
+///
+/// The file backend needs the difference: a repeat of a value the session already
+/// holds must not append a second frame, or a long conversation about one customer
+/// would grow the vault file without bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Inserted {
+    Stored,
+    AlreadyHeld,
 }
 
 /// What a lookup found.
@@ -283,6 +331,17 @@ impl SessionStore {
         self.sessions.len()
     }
 
+    /// Records held across every live session.
+    ///
+    /// The `entries_count` of `GET /admin/vault/status`: a number, and the only
+    /// thing about the mapping that endpoint is allowed to know.
+    pub(super) fn record_count(&self) -> usize {
+        self.sessions
+            .values()
+            .map(|session| session.aliases.len())
+            .sum()
+    }
+
     /// Returns the named session, creating it if this is its first request.
     ///
     /// The key is built by the caller's closure and only when a session is
@@ -308,10 +367,45 @@ impl SessionStore {
         }
     }
 
-    /// One session, for the fault injection the swap test needs. Test only.
-    #[cfg(test)]
+    /// One session by identifier, without ageing it.
+    ///
+    /// Used by the store path to take back a record the disk refused, and by the
+    /// swap test's fault injection. Deliberately not a lookup: undoing a write must
+    /// not be able to expire the conversation it is undoing.
     pub(super) fn session_mut(&mut self, id: &SessionId) -> Option<&mut Session> {
         self.sessions.get_mut(id)
+    }
+
+    /// Every live session, in identifier order.
+    ///
+    /// Read by compaction. Deterministic order, so the same vault state compacts
+    /// to the same bytes twice.
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&SessionId, &Session)> {
+        self.sessions.iter()
+    }
+
+    /// Files a record read out of a vault file.
+    ///
+    /// Not [`Self::ensure`] followed by an insert, because loading must not run
+    /// the expiry sweep: the sweep compares against a clock, and a vault is loaded
+    /// before the first request supplies one. Sessions whose time is up are dropped
+    /// by the caller once it does.
+    pub(super) fn load(
+        &mut self,
+        id: &SessionId,
+        stored_at_ms: u64,
+        seed: AliasSeed,
+        alias: &str,
+        sealed: SealedRecord,
+        key: impl FnOnce() -> Result<SessionKey, VaultError>,
+    ) -> Result<(), VaultError> {
+        let ceiling = self.limits.alias_ceiling;
+        let session = match self.sessions.entry(*id) {
+            Entry::Occupied(live) => live.into_mut(),
+            Entry::Vacant(slot) => slot.insert(Session::new(key()?, stored_at_ms)),
+        };
+        session.restore_last_use(stored_at_ms);
+        session.insert(seed, alias, sealed, ceiling).map(|_| ())
     }
 
     /// Finds a live session, forgetting it if its time is up.

@@ -20,25 +20,40 @@
 //!    reason: a boundary written down before anything crosses it is a boundary,
 //!    and one written afterwards is a description.
 //!
-//! **When the `file` backend arrives** (`vault.psk`, its own task), this test
-//! will fail, and that is the intended behaviour rather than an obstacle. Its
-//! author has to add the one module that may touch a disk to `MAY_TOUCH_FILES`
-//! below, which makes persistence a decision with a name on it. What must never
-//! happen is the allowance being widened to the whole vault.
+//! **The `file` backend has arrived** (`vault.psk`, milestone 71 and 72) and this
+//! test did fail, which was the intended behaviour rather than an obstacle. Two
+//! modules were added to `MAY_TOUCH_FILES` below, by name and with a reason, so
+//! that persistence is a decision somebody signed rather than an edit. What must
+//! never happen is the allowance being widened to the whole vault: the facade, the
+//! keys, the records, the sessions, the byte layout and the chain are all still
+//! scanned, and none of them may open a file.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use periskop_proxy::vault::record::ALIAS_SEED_BYTES;
 use periskop_proxy::vault::{
-    AliasSeed, OpenRequest, Passphrase, ProfileName, Restored, SessionId, Storage, Vault,
+    AliasSeed, Backing, OpenRequest, Passphrase, ProfileName, Restored, SessionId, Storage, Vault,
 };
 
 /// Vault modules allowed to name a filesystem API.
 ///
-/// Empty, and every entry added here is a place where the alias to person map can
-/// reach a disk.
-const MAY_TOUCH_FILES: &[&str] = &[];
+/// Every entry here is a place where the alias to person map can reach a disk, so
+/// every entry carries the reason it is allowed to:
+///
+/// - **`file.rs`** owns `vault.psk`: it creates the file, reads it back, verifies
+///   the chain over it and appends to it. It is the `file` backend
+///   (`proxy/spec.md` section 9), which is opt in and is not the default.
+/// - **`compaction.rs`** owns the swap: it writes the rebuilt file beside the old
+///   one and renames it over. ADR-007 requires the rename to be atomic, and a
+///   rename is a filesystem call.
+///
+/// Nothing else may appear here. In particular `mod.rs` may not: the facade
+/// decides *whether* records are persisted, and if it could also write them the
+/// two modules above would stop being the whole of the disk surface. The
+/// `file`-backed tests of the facade live in `tests/vault_file_backend.rs` for
+/// exactly that reason.
+const MAY_TOUCH_FILES: &[&str] = &["file.rs", "compaction.rs"];
 
 /// What a filesystem call looks like in this codebase.
 ///
@@ -72,6 +87,10 @@ fn a_whole_vault_lifetime_leaves_the_filesystem_as_it_found_it() {
         // The reduced profile, because this test is about the filesystem and not
         // about how long Argon2id takes.
         profile: ProfileName::Ci,
+        // The default backing, written out rather than left implicit: the claim
+        // being tested is about what the default configuration does, and a default
+        // that has to be named is a default a reader can check.
+        backing: Backing::Memory,
     })
     .unwrap();
     assert_eq!(vault.storage(), Storage::Memory);
@@ -127,13 +146,17 @@ fn no_vault_module_names_a_filesystem_api() {
     );
 
     let mut offences = Vec::new();
+    let mut allowance_used: BTreeSet<&str> = BTreeSet::new();
     for source in &sources {
         let name = source
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default()
             .to_owned();
-        if MAY_TOUCH_FILES.contains(&name.as_str()) {
+        if let Some(allowed) = MAY_TOUCH_FILES.iter().find(|entry| **entry == name) {
+            if names_a_filesystem_api(source) {
+                allowance_used.insert(allowed);
+            }
             continue;
         }
 
@@ -154,6 +177,29 @@ fn no_vault_module_names_a_filesystem_api() {
     }
 
     assert!(offences.is_empty(), "{offences:#?}");
+
+    // An exception nobody needs is an exception that quietly widens the boundary
+    // the next time somebody adds a file. Every name on the list has to be a
+    // module that actually writes, or it comes off the list.
+    let unused: Vec<&&str> = MAY_TOUCH_FILES
+        .iter()
+        .filter(|entry| !allowance_used.contains(**entry))
+        .collect();
+    assert!(
+        unused.is_empty(),
+        "these modules are allowed to touch files and do not: {unused:?}"
+    );
+}
+
+/// Whether one source names a filesystem API, by the same screen the scan uses.
+fn names_a_filesystem_api(source: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(source) else {
+        return false;
+    };
+    text.lines()
+        .map(str::trim_start)
+        .filter(|code| !code.starts_with("//"))
+        .any(|code| FILESYSTEM_APIS.iter().any(|api| code.contains(api)))
 }
 
 /// Every path under the watched roots, with the size that would change if a file

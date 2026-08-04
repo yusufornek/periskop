@@ -20,6 +20,10 @@ chacha20poly1305 = { workspace = true }
 # and from nowhere else. There is no counter and no seed of our own to roll back.
 getrandom = { workspace = true }
 hkdf = { workspace = true }
+# The vault file's chaining MAC (ADR-007 "3. Dosya bütünlüğü"). The AEAD protects
+# one record; this protects the set of them, which is what makes deleting,
+# reordering and restoring an older file detectable.
+hmac = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 # Key material and decrypted values live in buffers that clear themselves. This
