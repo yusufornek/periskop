@@ -305,6 +305,7 @@ dependencies = [
  "blake3",
  "clap",
  "periskop-core",
+ "periskop-network-sensor",
  "periskop-reconcile",
  "periskop-report",
  "periskop-runtime-collector",
@@ -324,10 +325,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "periskop-ebpf-loader"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "periskop-network-sensor"
 version = "0.1.0"
 dependencies = [
  "periskop-core",
+ "periskop-ebpf-loader",
  "serde",
  "serde_json",
  "thiserror",
@@ -339,6 +348,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "periskop-core",
+ "periskop-network-sensor",
  "periskop-report",
  "periskop-runtime-collector",
  "periskop-static-scanner",

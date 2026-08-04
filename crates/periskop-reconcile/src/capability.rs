@@ -67,12 +67,12 @@ pub enum SuppressionReason {
     WireSourceAbsent,
     /// The window was too short for an absence to mean anything.
     ObservationWindowTooShort,
-    /// The sources were there and this build has no deriver for the kind.
+    /// No policy declared the band an observed volume is compared against.
     ///
-    /// Stated rather than left as silence: a report that omits a kind because
-    /// the phase implementing it has not shipped reads exactly like one that
-    /// looked and found nothing.
-    NoDeriverInThisBuild,
+    /// The one threshold this crate refuses to invent. Any constant would be
+    /// wrong for most workloads while looking authoritative in every report, so
+    /// a run without a declared band derives nothing and says why.
+    VolumeBandNotDeclared,
 }
 
 /// One derived kind that will not appear in this report, and why.
@@ -134,14 +134,15 @@ impl Capabilities {
             );
         }
 
-        // The wire derivers belong to the phase that adds the sensor. Until then
-        // the entry is not a formality: a run handed a sensor would otherwise
-        // produce no unmatched traffic finding and no explanation for it.
-        for kind in [
-            DerivedKind::UnmatchedWireTraffic,
-            DerivedKind::VolumeAnomaly,
-        ] {
-            suppress(kind, SuppressionReason::NoDeriverInThisBuild);
+        // The threshold this crate will not invent. Without a declared band
+        // there is nothing to compare an observed volume against, and a run that
+        // silently used a made up one would produce findings nobody could
+        // review beforehand.
+        if settings.volume_band().is_none() {
+            suppress(
+                DerivedKind::VolumeAnomaly,
+                SuppressionReason::VolumeBandNotDeclared,
+            );
         }
 
         suppressed.sort();
@@ -209,18 +210,45 @@ mod tests {
     }
 
     #[test]
-    fn a_sensor_this_build_cannot_read_is_reported_rather_than_ignored() {
+    fn a_sensor_that_fed_the_run_unlocks_the_kind_that_needs_it() {
+        // The other half of the same rule, and the milestone this phase closes.
+        // The suppression above is not a permanent property of the build: it is
+        // a statement about a run that had no wire source, and a run that has
+        // one is entitled to the claim.
         let capabilities = Capabilities::of(
-            &sources(true, true, WireSource::Present),
+            &sources(true, true, WireSource::Present(Vec::new())),
             ObservationWindow::of_ms(3_600_000),
             &ReconcileSettings::default(),
         );
 
-        assert!(!capabilities.allows(DerivedKind::UnmatchedWireTraffic));
-        assert_eq!(
-            reasons_for(&capabilities, DerivedKind::UnmatchedWireTraffic),
-            [SuppressionReason::NoDeriverInThisBuild]
+        assert!(capabilities.allows(DerivedKind::UnmatchedWireTraffic));
+        assert!(reasons_for(&capabilities, DerivedKind::UnmatchedWireTraffic).is_empty());
+    }
+
+    #[test]
+    fn a_volume_claim_needs_a_band_somebody_declared() {
+        // The threshold comes from policy or the finding does not exist. There
+        // is no default, because a default here would be a number this crate
+        // made up and every report would carry it as though it meant something.
+        let no_band = Capabilities::of(
+            &sources(true, true, WireSource::Present(Vec::new())),
+            ObservationWindow::of_ms(3_600_000),
+            &ReconcileSettings::default(),
         );
+        assert!(!no_band.allows(DerivedKind::VolumeAnomaly));
+        assert_eq!(
+            reasons_for(&no_band, DerivedKind::VolumeAnomaly),
+            [SuppressionReason::VolumeBandNotDeclared]
+        );
+
+        let declared = Capabilities::of(
+            &sources(true, true, WireSource::Present(Vec::new())),
+            ObservationWindow::of_ms(3_600_000),
+            &ReconcileSettings::default().with_volume_band(
+                crate::settings::VolumeBand::declared(5_000, 30_000).expect("a band"),
+            ),
+        );
+        assert!(declared.allows(DerivedKind::VolumeAnomaly));
     }
 
     #[test]
@@ -260,16 +288,19 @@ mod tests {
     }
 
     #[test]
-    fn a_run_with_every_source_may_still_only_derive_what_this_build_implements() {
+    fn a_run_with_every_source_and_every_threshold_may_derive_all_four() {
         let capabilities = Capabilities::of(
-            &sources(true, true, WireSource::Present),
+            &sources(true, true, WireSource::Present(Vec::new())),
             ObservationWindow::of_ms(3_600_000),
-            &ReconcileSettings::default(),
+            &ReconcileSettings::default().with_volume_band(
+                crate::settings::VolumeBand::declared(5_000, 30_000).expect("a band"),
+            ),
         );
 
-        assert!(capabilities.allows(DerivedKind::DormantEgressPoint));
-        assert!(capabilities.allows(DerivedKind::TargetDrift));
-        assert!(!capabilities.allows(DerivedKind::VolumeAnomaly));
+        for kind in DerivedKind::ALL {
+            assert!(capabilities.allows(kind), "{kind:?} was suppressed");
+        }
+        assert!(capabilities.suppressed().is_empty());
     }
 
     #[test]

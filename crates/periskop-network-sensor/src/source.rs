@@ -16,6 +16,13 @@
 //! and is behind its own decision (ADR-014). When that refuses, this source
 //! reports the refusal in the vocabulary a permission failure uses; it never
 //! hands back an empty observation list as if it had looked.
+//!
+//! Nothing here changes when the loader is compiled in. That was ADR-014's
+//! prediction and it is worth having held to: the feature moves the seam
+//! underneath [`crate::kernel::PlatformKernel`], and everything above it, the
+//! join, the ageing, the naming and the record, is the same code exercised by
+//! the same tests on every platform in the workspace. The one visible
+//! difference is which cause an attach reports.
 
 use crate::assemble::FlowAssembler;
 use crate::kernel::{self, KernelEvents, PlatformKernel};
@@ -75,7 +82,7 @@ pub struct EbpfFlowSource<K = PlatformKernel> {
 impl EbpfFlowSource<PlatformKernel> {
     /// The sensor as it ships, reading from this machine's kernel.
     pub fn new(host_id: impl Into<String>) -> Self {
-        Self::over(PlatformKernel, host_id)
+        Self::over(PlatformKernel::default(), host_id)
     }
 }
 
@@ -246,16 +253,31 @@ mod tests {
 
     #[test]
     fn the_shipped_source_reports_a_cause_rather_than_a_clean_empty_run() {
-        // Whatever machine this is, an attach that cannot happen says so. The
-        // alternative would be a source that attaches, observes nothing and
-        // lets the run report a network picture it never looked at.
+        // Whatever machine this is, and whether or not the loader feature is
+        // compiled in, an attach that cannot happen says so. The alternative
+        // would be a source that attaches, observes nothing and lets the run
+        // report a network picture it never looked at.
+        //
+        // The set of causes is left open here rather than pinned to one: with
+        // the loader compiled in, an unprivileged Linux machine answers
+        // `missing_capability` and a machine with no BTF answers
+        // `kernel_unsupported`, and both are correct. What must hold everywhere
+        // is that there is a cause and that nothing was handed back.
         let mut source = EbpfFlowSource::new("h_1");
         let refusal = source.attach(&grant()).unwrap_err();
-        assert!(matches!(
-            refusal,
-            SensorUnavailable::LoaderNotBuilt | SensorUnavailable::UnsupportedPlatform
-        ));
+        assert!(!refusal.as_str().is_empty());
         assert!(source.drain().is_empty());
+    }
+
+    #[test]
+    fn an_unattached_source_still_reports_the_losses_it_has_not_measured_as_none() {
+        // A refusal must not leave the coverage looking like a measurement. The
+        // sensor states the cause separately; what this asserts is that the
+        // numbers alongside it are the honest zeroes of a run that never
+        // started, not defaults standing in for a count.
+        let mut source = EbpfFlowSource::new("h_1");
+        assert!(source.attach(&grant()).is_err());
+        assert_eq!(source.coverage(), SourceCoverage::default());
     }
 
     #[test]

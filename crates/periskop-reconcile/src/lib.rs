@@ -20,9 +20,15 @@
 //! making a three source claim would discredit the product's central argument
 //! more thoroughly than missing the finding would.
 //!
-//! What this build derives is `dormant_egress_point` and `target_drift`. The two
-//! that need the wire, `unmatched_wire_traffic` and `volume_anomaly`, are listed
-//! as suppressed with a reason rather than left as silence.
+//! All four derived kinds live here now. `dormant_egress_point` and
+//! `target_drift` need the code and the hooks; `unmatched_wire_traffic` and
+//! `volume_anomaly` need the wire as well, and a run without it lists them as
+//! suppressed with a reason rather than leaving them as silence.
+//!
+//! `unmatched_wire_traffic` is the one none of the three sources could ever have
+//! stated alone, and it is bounded by two rules that are not negotiable: it
+//! comes only from the `in_scope` bucket, and the three buckets that produce
+//! nothing are still counted and still shown (K-15).
 
 pub mod capability;
 pub mod declared;
@@ -31,16 +37,22 @@ mod drift;
 mod emit;
 pub mod engine;
 pub mod error;
+pub mod j1;
 pub mod join;
 pub mod outcome;
 pub mod settings;
 pub mod sources;
 pub mod target;
+mod unmatched;
+mod volume;
 pub mod window;
+pub mod wire;
 
 pub use declared::DeclaredPoint;
 pub use engine::{reconcile, ReconcileInputs};
 pub use error::{ReconcileError, Result};
 pub use outcome::ReconcileOutcome;
+pub use settings::{ReconcileSettings, VolumeBand};
 pub use sources::{DeclaredSource, RuntimeSource, Sources, WireSource};
 pub use window::ObservationWindow;
+pub use wire::WireCoverage;

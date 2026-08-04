@@ -42,6 +42,13 @@ const FIELD_SEPARATOR: u8 = 0x1f;
 /// reference and the rule id, so the same finding keeps its identity when a
 /// threshold moves.
 pub(crate) fn detector(rule_id: &str, settings: &ReconcileSettings) -> Detector {
+    // Every threshold that can change what a rule emits, including the one that
+    // is usually absent: a run with no volume band and a run with a very wide
+    // one produce the same findings and are not the same configuration.
+    let band = settings.volume_band().map_or_else(
+        || "none".to_owned(),
+        |band| format!("{}..{}", band.min_basis_points(), band.max_basis_points()),
+    );
     Detector {
         component: Component::Reconciliation,
         rule_id: rule_id.to_owned(),
@@ -53,6 +60,8 @@ pub(crate) fn detector(rule_id: &str, settings: &ReconcileSettings) -> Detector 
                 RULE_VERSION,
                 settings.algorithm_version(),
                 &settings.min_dormant_window_ms().to_string(),
+                &settings.effective_join_tolerance_ms().to_string(),
+                &band,
             ],
         ),
     }
@@ -81,7 +90,7 @@ pub(crate) fn derived_finding(
     settings: &ReconcileSettings,
     rule_id: &str,
 ) -> periskop_core::Result<Finding> {
-    Finding::new(
+    derived_finding_anchored(
         kind,
         confidence,
         provider_ref,
@@ -90,8 +99,42 @@ pub(crate) fn derived_finding(
             ref_id: egress_point_id.to_owned(),
         },
         evidence,
+        settings,
+        rule_id,
+    )
+}
+
+/// Builds a derived finding anchored on whatever entity it is about.
+///
+/// The two wire kinds are about a connection rather than a line of code, and a
+/// code point is exactly what they do not have: `unmatched_wire_traffic` exists
+/// because no code explains the traffic. Anchoring them on the flow is what
+/// gives them a stable identity of their own instead of borrowing one.
+pub(crate) fn derived_finding_anchored(
+    kind: Kind,
+    confidence: Confidence,
+    provider_ref: &str,
+    primary_ref: EntityRef,
+    evidence: Evidence,
+    settings: &ReconcileSettings,
+    rule_id: &str,
+) -> periskop_core::Result<Finding> {
+    Finding::new(
+        kind,
+        confidence,
+        provider_ref,
+        primary_ref,
+        evidence,
         detector(rule_id, settings),
     )
+}
+
+/// The primary reference of a finding about observed traffic.
+pub(crate) fn flow_ref(flow_id: &str) -> EntityRef {
+    EntityRef {
+        ref_type: RefType::Flow,
+        ref_id: flow_id.to_owned(),
+    }
 }
 
 /// Records where in the source the point sits.
@@ -112,9 +155,24 @@ pub(crate) fn code_location(path: Option<&str>) -> Location {
 
 /// Adds the observations a finding rests on, keeping the reference order fixed.
 pub(crate) fn attach_event_refs(finding: &mut Finding, egress_event_ids: &[String]) {
-    for id in egress_event_ids {
+    attach_refs(finding, RefType::EgressEvent, egress_event_ids);
+}
+
+/// Adds the connections a finding rests on.
+pub(crate) fn attach_flow_refs(finding: &mut Finding, flow_ids: &[String]) {
+    attach_refs(finding, RefType::Flow, flow_ids);
+}
+
+/// The ordering rule both of the above share.
+///
+/// Written once because the property it keeps is not obvious: the contract
+/// derives the identity from the first reference, so a finding that grew a
+/// second one must not thereby become a different finding. Two copies of this
+/// loop would be two chances to sort one of them differently.
+fn attach_refs(finding: &mut Finding, ref_type: RefType, ids: &[String]) {
+    for id in ids {
         finding.refs.push(EntityRef {
-            ref_type: RefType::EgressEvent,
+            ref_type,
             ref_id: id.clone(),
         });
     }

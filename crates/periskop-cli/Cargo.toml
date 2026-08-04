@@ -19,6 +19,11 @@ path = "src/main.rs"
 periskop-core = { workspace = true }
 blake3 = { workspace = true }
 clap = { workspace = true }
+# The reading half of the flow contract, for the same reason the collector is a
+# dependency: `--flows` hands the scan records the sensor wrote, and they are
+# read back through the component that owns that half of the contract rather
+# than through a second copy of the shape.
+periskop-network-sensor = { workspace = true }
 periskop-reconcile = { workspace = true }
 periskop-report = { workspace = true }
 # The reading half of the hook contract. A binary dependency since F2-L: the

@@ -11,8 +11,24 @@ authors.workspace = true
 [lints]
 workspace = true
 
+# The eBPF loader is off by default and stays off by default. ADR-014 grants the
+# `unsafe` exception to that crate alone, and this feature is the only edge
+# between the two: with it off, this crate compiles and tests with no `unsafe`
+# anywhere in its dependency graph, on every platform in ADR-002's target list.
+#
+# Not gated on `cfg(target_os = "linux")`, which is a deliberate departure from
+# ADR-014 §2 and is recorded in that ADR's revision note. The loader crate
+# compiles everywhere and refuses everywhere but Linux, so target gating would
+# buy nothing and would cost the only thing that keeps the exception crate from
+# rotting: the ability to compile and test this edge on the macOS machine the
+# repository is developed on. The target gate belongs one level down, on the
+# eBPF runtime dependency inside the loader crate, when there is one.
+[features]
+ebpf-loader = ["dep:periskop-ebpf-loader"]
+
 [dependencies]
 periskop-core = { workspace = true }
+periskop-ebpf-loader = { workspace = true, optional = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 

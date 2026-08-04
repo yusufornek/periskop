@@ -1,0 +1,46 @@
+[package]
+name = "periskop-ebpf-loader"
+description = "Opens the kernel objects the network sensor reads from, and decides nothing about what they mean."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# This crate is the `unsafe` exception ADR-002 reserved for the eBPF loader,
+# granted the way ADR-014 decided it has to be granted: at a crate boundary, in
+# this crate's own manifest, and never by loosening the workspace lint. The
+# workspace sets `unsafe_code = "forbid"`, and `forbid` is a level no crate can
+# lift from the inside; it can only be lifted where it is configured. So this
+# package deliberately does not inherit `[lints] workspace = true`, because
+# inheritance is all or nothing, and instead restates every workspace lint it is
+# not changing. Exactly one line differs from the workspace table, and it is the
+# line below.
+#
+# The grant is a boundary, not a licence for the file that happens to need it:
+# ADR-014 §5 requires every operation that uses it to sit in one named module,
+# and `tests/unsafe_boundary.rs` fails the build if any other file in this crate
+# opens one.
+[lints.rust]
+unsafe_code = "allow"
+# Inside a function that is itself marked as carrying the exception, each
+# operation still has to name itself. Without this, the whole body of such a
+# function would become one implicit blanket exception, which is the opposite of
+# the narrow grant this crate exists to hold.
+unsafe_op_in_unsafe_fn = "deny"
+
+# Restated from the workspace, not weakened. Silent failure is the defect class
+# this product exists to expose, and a loader that swallows a load error would
+# be the worst possible place to make an exception for it.
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[dependencies]
+# Already a workspace dependency, so this adds nothing to the dependency tree
+# that six other crates do not already carry. No eBPF runtime library appears
+# here: that decision is still deferred and the reasons are in ADR-014 §4 and in
+# this crate's own documentation.
+thiserror = { workspace = true }

@@ -41,4 +41,12 @@ pub enum ReconcileError {
 
     #[error("a declared target names no host")]
     UnreadableTarget,
+
+    /// A volume band whose upper edge sits below its lower one.
+    ///
+    /// It admits no volume at all, so every matched flow would be reported as an
+    /// anomaly. Reordering the two edges would produce a working band nobody
+    /// declared and hide the typo that produced it.
+    #[error("a volume band admits nothing: its upper edge is below its lower one")]
+    InvertedVolumeBand,
 }

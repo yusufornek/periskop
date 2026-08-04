@@ -19,8 +19,14 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use periskop_reconcile::settings::ReconcileSettings;
-use periskop_report::coverage::ReconciliationMode;
+use periskop_network_sensor::flow::{
+    FiveTuple, Mechanism as CaptureMechanism, ProcessRecord, Proto, ResolvedHostSource, SniSource,
+};
+use periskop_network_sensor::observation::Observation;
+use periskop_network_sensor::scope::FlowScope;
+use periskop_network_sensor::Flow;
+use periskop_reconcile::settings::{ReconcileSettings, VolumeBand};
+use periskop_report::coverage::{ReconciliationMode, SensorPlatformClass};
 use periskop_report::report::DiagnosticComponent;
 use periskop_report::to_canonical_json;
 use periskop_runtime_collector::event::{
@@ -177,6 +183,7 @@ impl Fixture {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("project")).unwrap();
         std::fs::create_dir_all(root.join("events")).unwrap();
+        std::fs::create_dir_all(root.join("flows")).unwrap();
         let fixture = Self { root };
         fixture.write_source(CLIENT_WITH_A_DECLARED_TARGET);
         fixture
@@ -220,6 +227,21 @@ impl Fixture {
         self
     }
 
+    /// Writes one flow record file, one record per line.
+    fn write_flows(&self, file_name: &str, flows: &[Flow]) -> &Self {
+        let body: String = flows
+            .iter()
+            .map(|flow| format!("{}\n", serde_json::to_string(flow).unwrap()))
+            .collect();
+        std::fs::write(self.root.join("flows").join(file_name), body).unwrap();
+        self
+    }
+
+    fn write_raw_flows(&self, file_name: &str, contents: &str) -> &Self {
+        std::fs::write(self.root.join("flows").join(file_name), contents).unwrap();
+        self
+    }
+
     fn project(&self) -> PathBuf {
         self.root.join("project")
     }
@@ -228,12 +250,56 @@ impl Fixture {
         self.root.join("events")
     }
 
+    fn flows(&self) -> PathBuf {
+        self.root.join("flows")
+    }
+
     fn scan(&self) -> scan::ScanOutcome {
         run_with(&self.project(), Some(&self.events()))
     }
 
     fn scan_without_events(&self) -> scan::ScanOutcome {
         run_with(&self.project(), None)
+    }
+
+    /// The scan with every source this fixture has: code, calls and connections.
+    fn scan_all_sources(&self) -> scan::ScanOutcome {
+        self.scan_with_sources(
+            scan::ScanSources {
+                event_dir: Some(&self.events()),
+                flow_dir: Some(&self.flows()),
+            },
+            ReconcileSettings::default(),
+        )
+    }
+
+    /// The scan with the wire source and no hooks: two sources, one of them the
+    /// one the product's headline finding needs.
+    fn scan_with_flows_only(&self) -> scan::ScanOutcome {
+        self.scan_with_sources(
+            scan::ScanSources {
+                event_dir: None,
+                flow_dir: Some(&self.flows()),
+            },
+            ReconcileSettings::default(),
+        )
+    }
+
+    fn scan_with_sources(
+        &self,
+        sources: scan::ScanSources<'_>,
+        settings: ReconcileSettings,
+    ) -> scan::ScanOutcome {
+        scan::run_with_sources(
+            scan::ScanRequest {
+                project_root: &self.project(),
+                rules_root: &repo_root().join("rules"),
+                tool_version: "0.0.0-test",
+                generated_at: GENERATED_AT.to_owned(),
+            },
+            sources,
+            settings,
+        )
     }
 
     /// The same scan with the dormancy threshold the caller states.
@@ -316,6 +382,45 @@ fn call_to(host: &str) -> EgressEvent {
 /// a sentinel and the reason travels beside it.
 fn call_to_somewhere_unreadable() -> EgressEvent {
     call_to("unknown").with_degraded_reasons(vec![DegradedReason::TargetNotResolved])
+}
+
+/// One connection the sensor watched, as it writes one to disk.
+///
+/// The process is the application under scan, which is what puts the record in
+/// the only bucket that can produce a finding.
+fn connection(host: &str, provider: &str, scope: FlowScope, src_port: u16) -> Flow {
+    Flow::from_observation(
+        Observation::new(
+            "h_9f2c4a17be0d5386",
+            1_785_834_000,
+            FiveTuple {
+                src_port,
+                dst_ip: "104.18.7.1".to_owned(),
+                dst_port: 443,
+                proto: Proto::Tcp,
+            },
+            SniSource::ClientHello,
+        )
+        .with_duration_ms(120)
+        .resolved(host, ResolvedHostSource::DnsAndSni)
+        .with_provider_ref(provider)
+        .kernel_attributed(ProcessRecord {
+            pid: 4821,
+            pid_start_time: Some(1_785_833_900),
+            comm: Some("python3".to_owned()),
+            exe: Some("/srv/app/venv/bin/python3".to_owned()),
+            cmdline_hash: None,
+        })
+        .with_volume(2_048, 8_192),
+        scope,
+        CaptureMechanism::Ebpf,
+    )
+    .unwrap()
+}
+
+/// Traffic to a destination this fixture's code never mentions.
+fn unexplained_traffic(scope: FlowScope, src_port: u16) -> Flow {
+    connection("telemetry.vendor.example", "unknown", scope, src_port)
 }
 
 fn derived(outcome: &scan::ScanOutcome) -> Vec<&periskop_core::finding::Finding> {
@@ -533,10 +638,10 @@ fn a_damaged_event_line_is_counted_and_does_not_cost_the_scan() {
 }
 
 #[test]
-fn the_full_mode_is_never_written_by_a_build_that_has_no_network_sensor() {
+fn the_full_mode_is_never_written_by_a_run_that_was_handed_no_flows() {
     // Two sources making a three source claim would discredit the product's
     // central argument more thoroughly than missing a finding would. `full` means
-    // the wire was watched, and nothing in this build can watch it.
+    // the wire was watched, and no flag on this run said it was.
     let fixture = Fixture::new("never-full");
     fixture.write_events(
         "worker-1.jsonl",
@@ -569,6 +674,350 @@ fn the_full_mode_is_never_written_by_a_build_that_has_no_network_sensor() {
                 && detail.contains("wire_source_absent")),
         "{suppressed:?}"
     );
+    // And no run without flows writes a flow counter.
+    let coverage = &fixture.scan().report.coverage;
+    assert_eq!(coverage.out_of_scope_flows, 0);
+    assert_eq!(coverage.sensor_platform_class, SensorPlatformClass::None);
+}
+
+#[test]
+fn traffic_no_code_and_no_call_explains_becomes_a_finding_in_a_real_report() {
+    // **Milestone 56, end to end.** The claim the whole product is built to
+    // make, produced by the command rather than by the component: a process
+    // belonging to the scanned codebase opened a connection to a destination the
+    // repository never mentions, the hooks recorded no call that went there, and
+    // the report says so. Neither of the other two sources could have.
+    let fixture = Fixture::new("unmatched-wire");
+    fixture
+        .write_events("worker-1.jsonl", &[call_to("api.openai.com")])
+        .write_flows(
+            "sensor-1.jsonl",
+            &[
+                unexplained_traffic(FlowScope::InScope, 54_321),
+                // The call the code declares, seen on the wire as well. It is
+                // explained, so it produces nothing, and its presence is what
+                // makes the finding above about one connection rather than about
+                // every connection.
+                connection("api.openai.com", "openai", FlowScope::InScope, 54_322),
+            ],
+        );
+
+    let outcome = fixture.scan_all_sources();
+    let unmatched = findings_of_kind(&outcome, periskop_core::finding::Kind::UnmatchedWireTraffic);
+
+    assert_eq!(
+        outcome.report.coverage.reconciliation_mode,
+        ReconciliationMode::Full,
+        "three sources fed this run"
+    );
+    assert_eq!(
+        unmatched.len(),
+        1,
+        "one connection nothing accounts for: {:?}",
+        outcome.report
+    );
+    let finding = unmatched[0];
+    assert_eq!(
+        finding.detector.component,
+        periskop_core::finding::Component::Reconciliation
+    );
+    assert_eq!(finding.source, periskop_core::finding::Source::Reconciled);
+    // The connection it is about is referenced, not merely summarised.
+    assert_eq!(
+        finding.refs[0].ref_type,
+        periskop_core::finding::RefType::Flow
+    );
+    let evidence: Vec<&str> = finding
+        .evidence
+        .iter()
+        .map(|piece| piece.r#ref.as_str())
+        .collect();
+    assert!(
+        evidence
+            .iter()
+            .any(|text| text.contains("target=telemetry.vendor.example")
+                && text.contains("flow_scope=in_scope")),
+        "{evidence:?}"
+    );
+    assert_eq!(
+        outcome.report.coverage.sensor_platform_class,
+        SensorPlatformClass::LinuxEbpf
+    );
+}
+
+#[test]
+fn the_same_traffic_produces_nothing_when_it_is_not_the_scanned_codebase() {
+    // **Milestone 56's non negotiable constraint, through the command.** The
+    // identical connection in the three quiet buckets, and the report gains no
+    // finding from any of them. This is the developer machine case K-15 is
+    // about: the editor assistant on the same laptop talking to the same
+    // provider is not this project's egress.
+    let fixture = Fixture::new("quiet-buckets");
+    fixture.write_flows(
+        "sensor-1.jsonl",
+        &[
+            unexplained_traffic(FlowScope::OutOfScopeProcess, 54_321),
+            unexplained_traffic(FlowScope::KnownBenign, 54_322),
+            unexplained_traffic(FlowScope::Undetermined, 54_323),
+        ],
+    );
+
+    let outcome = fixture.scan_with_flows_only();
+
+    assert!(
+        findings_of_kind(&outcome, periskop_core::finding::Kind::UnmatchedWireTraffic).is_empty(),
+        "{:?}",
+        outcome.report
+    );
+    // And not one of them disappeared. A bucket that keeps traffic out of the
+    // count and then vanishes from the report is a silent swallow, which is what
+    // K-15's attribution gate exists to prevent.
+    let coverage = &outcome.report.coverage;
+    assert_eq!(coverage.out_of_scope_flows, 1);
+    assert_eq!(coverage.known_benign_flows, 1);
+    assert_eq!(coverage.unattributed_flows, 1);
+    assert_eq!(coverage.unclassified_flows, 3);
+    assert_eq!(
+        coverage.reconciliation_mode,
+        ReconciliationMode::StaticPlusWire
+    );
+}
+
+#[test]
+fn a_sensor_that_watched_and_saw_nothing_is_not_a_sensor_that_never_ran() {
+    // The distinction the whole source model rests on, on the wire side. Both
+    // runs have no traffic in them and only one of them was watching, and the
+    // mode is where a reader sees which.
+    let fixture = Fixture::new("quiet-sensor");
+
+    let watched = fixture.scan_with_flows_only();
+    let unwatched = fixture.scan_without_events();
+
+    assert_eq!(
+        watched.report.coverage.reconciliation_mode,
+        ReconciliationMode::StaticPlusWire
+    );
+    assert_eq!(
+        unwatched.report.coverage.reconciliation_mode,
+        ReconciliationMode::StaticOnly
+    );
+    // A sensor with nothing to report is still a sensor, so the kind that needs
+    // it is not suppressed for want of a source.
+    let stated = details(&watched, DiagnosticComponent::Reconciliation);
+    assert!(
+        !stated
+            .iter()
+            .any(|detail| detail.contains("unmatched_wire_traffic")),
+        "{stated:?}"
+    );
+}
+
+#[test]
+fn a_volume_claim_is_not_derived_until_a_policy_declares_the_band() {
+    // **Milestone 57.** The threshold comes from policy, and the command line
+    // states none, so the report names the missing threshold instead of
+    // inventing one. The second half runs the same three sources with a band and
+    // shows the finding was reachable all along.
+    let fixture = Fixture::new("volume-band");
+    fixture
+        .write_events("worker-1.jsonl", &[call_to("api.openai.com")])
+        .write_flows(
+            "sensor-1.jsonl",
+            &[connection(
+                "api.openai.com",
+                "openai",
+                FlowScope::InScope,
+                54_321,
+            )],
+        );
+
+    let without = fixture.scan_all_sources();
+    assert!(
+        findings_of_kind(&without, periskop_core::finding::Kind::VolumeAnomaly).is_empty(),
+        "{:?}",
+        without.report
+    );
+    let stated = details(&without, DiagnosticComponent::Reconciliation);
+    assert!(
+        stated.iter().any(|detail| detail.contains("volume_anomaly")
+            && detail.contains("volume_band_not_declared")),
+        "{stated:?}"
+    );
+
+    // 2048 bytes on the wire against a declared payload of 512 is four times,
+    // outside a band that admits three.
+    let with = fixture.scan_with_sources(
+        scan::ScanSources {
+            event_dir: Some(&fixture.events()),
+            flow_dir: Some(&fixture.flows()),
+        },
+        ReconcileSettings::default().with_volume_band(VolumeBand::declared(5_000, 30_000).unwrap()),
+    );
+    assert_eq!(
+        findings_of_kind(&with, periskop_core::finding::Kind::VolumeAnomaly).len(),
+        1,
+        "{:?}",
+        with.report
+    );
+}
+
+#[test]
+fn two_runs_over_one_tree_and_one_flow_directory_write_the_same_bytes() {
+    let fixture = Fixture::new("wire-determinism");
+    fixture
+        .write_events("worker-1.jsonl", &[call_to("api.openai.com")])
+        .write_flows(
+            "sensor-1.jsonl",
+            &[
+                unexplained_traffic(FlowScope::InScope, 54_321),
+                unexplained_traffic(FlowScope::OutOfScopeProcess, 54_322),
+            ],
+        );
+
+    let first = to_canonical_json(&fixture.scan_all_sources().report).unwrap();
+    let second = to_canonical_json(&fixture.scan_all_sources().report).unwrap();
+
+    assert_eq!(first, second);
+}
+
+#[test]
+fn the_names_of_the_flow_files_do_not_reach_the_report() {
+    // Same traffic, split across files two different ways. A report that
+    // differed would differ because the sensor rotated its output, which is
+    // exactly the kind of change a diff must not light up on.
+    let one = Fixture::new("wire-layout-a");
+    one.write_flows(
+        "z-sensor.jsonl",
+        &[unexplained_traffic(FlowScope::InScope, 54_321)],
+    )
+    .write_flows(
+        "a-sensor.jsonl",
+        &[unexplained_traffic(FlowScope::OutOfScopeProcess, 54_322)],
+    );
+
+    let other = Fixture::new("wire-layout-b");
+    other.write_flows(
+        "m-sensor.jsonl",
+        &[
+            unexplained_traffic(FlowScope::OutOfScopeProcess, 54_322),
+            unexplained_traffic(FlowScope::InScope, 54_321),
+        ],
+    );
+
+    assert_eq!(
+        to_canonical_json(&one.scan_with_flows_only().report).unwrap(),
+        to_canonical_json(&other.scan_with_flows_only().report).unwrap()
+    );
+}
+
+#[test]
+fn a_damaged_flow_record_is_reported_and_does_not_cost_the_scan() {
+    // The normal state of a file a live sensor is still appending to. A scan
+    // that gave up here would hand any misbehaving sensor the power to blind the
+    // whole run.
+    let fixture = Fixture::new("damaged-flow");
+    let good = serde_json::to_string(&unexplained_traffic(FlowScope::InScope, 54_321)).unwrap();
+    fixture.write_raw_flows(
+        "sensor-1.jsonl",
+        &format!("{good}\n{{ half a record, no closing\n"),
+    );
+
+    let outcome = fixture.scan_with_flows_only();
+
+    // The intact record still did its work.
+    assert_eq!(
+        findings_of_kind(&outcome, periskop_core::finding::Kind::UnmatchedWireTraffic).len(),
+        1,
+        "{:?}",
+        outcome.report
+    );
+    // And the loss is located, not merely absorbed.
+    let losses = details(&outcome, DiagnosticComponent::NetworkSensor);
+    assert!(
+        losses
+            .iter()
+            .any(|detail| detail.contains("sensor-1.jsonl:2") && detail.contains("unparsable")),
+        "{losses:?}"
+    );
+}
+
+#[test]
+fn no_absolute_path_reaches_the_report_through_the_flow_side() {
+    // The flow directory is an absolute path on every machine that runs this.
+    // None of it may reach output two machines are supposed to be able to
+    // compare.
+    let fixture = Fixture::new("no-abs-path-wire");
+    fixture.write_raw_flows("sensor-1.jsonl", "{ not a record at all\n");
+
+    let outcome = fixture.scan_with_flows_only();
+    let json = to_canonical_json(&outcome.report).unwrap();
+
+    assert!(
+        !json.contains(&fixture.root.to_string_lossy().to_string()),
+        "the temporary directory leaked into the report"
+    );
+    // The loss is still reported, so the absence above is not the absence of a
+    // diagnostic.
+    assert!(
+        !details(&outcome, DiagnosticComponent::NetworkSensor).is_empty(),
+        "{:?}",
+        outcome.report.diagnostics
+    );
+}
+
+#[test]
+fn a_flow_directory_that_is_not_there_stops_the_command() {
+    // A mistyped path must not become a report claiming `full` with no traffic
+    // in it, which reads as a machine that sent nothing.
+    let fixture = Fixture::new("missing-flow-dir");
+    let absent = fixture.flows().join("never-created");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_periskop"))
+        .arg("scan")
+        .arg(fixture.project())
+        .arg("--rules")
+        .arg(repo_root().join("rules"))
+        .arg("--flows")
+        .arg(&absent)
+        .output()
+        .unwrap();
+
+    assert_eq!(status.status.code(), Some(2), "{status:?}");
+    assert!(
+        String::from_utf8_lossy(&status.stderr).contains("no flow directory"),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+}
+
+#[test]
+fn the_command_reaches_the_full_mode_when_it_is_given_all_three_sources() {
+    // The wiring, through the binary rather than the library: both flags, one
+    // report, and the mode the product's central claim is entitled to.
+    let fixture = Fixture::new("cli-full");
+    fixture
+        .write_events("worker-1.jsonl", &[call_to("api.openai.com")])
+        .write_flows(
+            "sensor-1.jsonl",
+            &[unexplained_traffic(FlowScope::InScope, 54_321)],
+        );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_periskop"))
+        .arg("scan")
+        .arg(fixture.project())
+        .arg("--rules")
+        .arg(repo_root().join("rules"))
+        .arg("--events")
+        .arg(fixture.events())
+        .arg("--flows")
+        .arg(fixture.flows())
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(report.contains("\"full\""), "{report}");
+    assert!(report.contains("unmatched_wire_traffic"), "{report}");
 }
 
 #[test]

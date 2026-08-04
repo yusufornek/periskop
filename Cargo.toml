@@ -8,6 +8,14 @@ members = [
     "crates/periskop-runtime-collector",
     "crates/periskop-reconcile",
     "crates/periskop-network-sensor",
+    # The eBPF loader is a workspace member even though nothing depends on it by
+    # default (ADR-014: it hangs off `periskop-network-sensor` behind an off by
+    # default feature). Membership is what makes `cargo build --workspace` and
+    # `cargo test --workspace` compile and exercise it on every platform,
+    # including the macOS machine this repository is developed on. ADR-014 listed
+    # a feature that nothing builds as a negative consequence, "the exception
+    # crate quietly rots"; this line is what prevents it.
+    "crates/periskop-ebpf-loader",
 ]
 
 # Crates designed but not yet implemented. They join the workspace in their own
@@ -29,6 +37,7 @@ periskop-report = { path = "crates/periskop-report" }
 periskop-runtime-collector = { path = "crates/periskop-runtime-collector" }
 periskop-reconcile = { path = "crates/periskop-reconcile" }
 periskop-network-sensor = { path = "crates/periskop-network-sensor" }
+periskop-ebpf-loader = { path = "crates/periskop-ebpf-loader" }
 
 blake3 = "1.5"
 clap = { version = "4.5", features = ["derive"] }

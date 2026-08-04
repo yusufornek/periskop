@@ -63,6 +63,16 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         events: Option<PathBuf>,
 
+        /// Directory holding the network sensor's flow records.
+        ///
+        /// The third source, and the only one that can see a connection no code
+        /// and no hooked call explains. Optional like the second: without it the
+        /// scan reports exactly what it reported before, and the report never
+        /// says `full`, because two sources may not make a three source claim.
+        /// Also read from PERISKOP_FLOW_DIR.
+        #[arg(long, value_name = "DIR")]
+        flows: Option<PathBuf>,
+
         /// Fail when the share of unreadable files exceeds this many basis points.
         #[arg(long, value_name = "BASIS_POINTS")]
         max_unparsed_ratio: Option<u64>,
@@ -130,12 +140,14 @@ fn main() -> ExitCode {
             json,
             rules,
             events,
+            flows,
             max_unparsed_ratio,
         } => run_scan(ScanArgs {
             path,
             json,
             rules,
             events,
+            flows,
             max_unparsed_ratio,
         }),
         Command::ServeRpc { rules } => run_serve_rpc(rules),
@@ -232,6 +244,7 @@ struct ScanArgs {
     json: bool,
     rules: Option<PathBuf>,
     events: Option<PathBuf>,
+    flows: Option<PathBuf>,
     max_unparsed_ratio: Option<u64>,
 }
 
@@ -241,6 +254,7 @@ fn run_scan(args: ScanArgs) -> ExitCode {
         json,
         rules,
         events,
+        flows,
         max_unparsed_ratio,
     } = args;
 
@@ -263,11 +277,25 @@ fn run_scan(args: ScanArgs) -> ExitCode {
     // command: a mistyped directory would otherwise produce a report claiming
     // static_plus_runtime with nothing observed, which reads as a hooked
     // application that made no calls.
-    let event_dir = match resolve_event_dir(events) {
+    let event_dir = match resolve_source_dir(events, EVENT_DIR_VAR) {
         Ok(dir) => dir,
         Err(given) => {
             eprintln!(
                 "periskop: no event directory at {}. Run `periskop hook install` first, or drop --events for a static scan.",
+                given.display()
+            );
+            return ExitCode::from(exit::ERROR);
+        }
+    };
+
+    // The same rule, and the stakes are higher: a mistyped flow directory would
+    // otherwise produce a report claiming `full` with no traffic in it, which
+    // reads as a machine that sent nothing.
+    let flow_dir = match resolve_source_dir(flows, FLOW_DIR_VAR) {
+        Ok(dir) => dir,
+        Err(given) => {
+            eprintln!(
+                "periskop: no flow directory at {}. Drop --flows for a scan without the network source.",
                 given.display()
             );
             return ExitCode::from(exit::ERROR);
@@ -286,14 +314,24 @@ fn run_scan(args: ScanArgs) -> ExitCode {
         }
     };
 
-    let outcome = scan::run_with_events(
+    let outcome = scan::run_with_sources(
         scan::ScanRequest {
             project_root: &path,
             rules_root: &rules_root,
             tool_version: env!("CARGO_PKG_VERSION"),
             generated_at,
         },
-        event_dir.as_deref(),
+        scan::ScanSources {
+            event_dir: event_dir.as_deref(),
+            flow_dir: flow_dir.as_deref(),
+        },
+        // The reconciliation thresholds are not on the command line yet, so this
+        // run uses the declared defaults and derives no volume anomaly: that
+        // kind needs a band a policy states, and the report names the missing
+        // threshold rather than inventing one. Exposing it belongs to the policy
+        // surface rather than to a flag, and the request is filed in
+        // `hub/memory/interfaces.md`.
+        periskop_reconcile::ReconcileSettings::default(),
     );
 
     for error in &outcome.rule_errors {
@@ -338,15 +376,22 @@ fn run_scan(args: ScanArgs) -> ExitCode {
 /// user carrying a path between them.
 const EVENT_DIR_VAR: &str = "PERISKOP_EVENT_DIR";
 
-/// Decides whether this run has a runtime source, and refuses a path that is not
-/// there.
+/// Environment variable naming the sensor's flow directory.
 ///
-/// `Ok(None)` is the static only run: no flag, no variable, and no directory is
+/// The sensor runs under a different privilege from the scan and usually writes
+/// its records somewhere the scan is pointed at afterwards, so the path is
+/// worth naming once in an environment rather than on every invocation.
+const FLOW_DIR_VAR: &str = "PERISKOP_FLOW_DIR";
+
+/// Decides whether this run has a given observation source, and refuses a path
+/// that is not there.
+///
+/// `Ok(None)` is the run without it: no flag, no variable, and no directory is
 /// looked for. An empty variable counts as unset, because an exported name with
 /// no value is how a shell says nothing rather than how it says "here".
-fn resolve_event_dir(flag: Option<PathBuf>) -> Result<Option<PathBuf>, PathBuf> {
+fn resolve_source_dir(flag: Option<PathBuf>, variable: &str) -> Result<Option<PathBuf>, PathBuf> {
     let requested = flag.or_else(|| {
-        std::env::var_os(EVENT_DIR_VAR)
+        std::env::var_os(variable)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
     });

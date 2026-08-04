@@ -11,8 +11,14 @@ use periskop_core::finding::{
     Component, Confidence, Detector, EntityRef, Evidence, EvidenceType, Finding, Kind, Location,
     RefType, Source,
 };
+use periskop_network_sensor::flow::{
+    FiveTuple, Mechanism as CaptureMechanism, ProcessRecord, Proto, ResolvedHostSource, SniSource,
+};
+use periskop_network_sensor::observation::Observation;
+use periskop_network_sensor::scope::FlowScope;
+use periskop_network_sensor::Flow;
 use periskop_reconcile::capability::{DerivedKind, SuppressionReason};
-use periskop_reconcile::settings::ReconcileSettings;
+use periskop_reconcile::settings::{ReconcileSettings, VolumeBand};
 use periskop_reconcile::{
     reconcile, DeclaredPoint, DeclaredSource, ObservationWindow, ReconcileInputs, ReconcileOutcome,
     RuntimeSource, Sources, WireSource,
@@ -120,6 +126,74 @@ fn run(
         ),
         window,
     ))
+}
+
+/// A three source run: code, calls and connections.
+fn run_full(
+    points: Vec<DeclaredPoint>,
+    events: Vec<EgressEvent>,
+    flows: Vec<Flow>,
+    settings: ReconcileSettings,
+) -> ReconcileOutcome {
+    reconcile(
+        &ReconcileInputs::new(
+            Sources::new(
+                DeclaredSource::Present(points),
+                RuntimeSource::Present(events),
+                WireSource::Present(flows),
+            ),
+            LONG_WINDOW,
+        )
+        .with_settings(settings),
+    )
+}
+
+/// One connection the sensor watched, in the bucket the caller states.
+fn connection(host: &str, provider: &str, scope: FlowScope, src_port: u16) -> Flow {
+    Flow::from_observation(
+        Observation::new(
+            "h_9f2c4a17be0d5386",
+            1_785_834_000,
+            FiveTuple {
+                src_port,
+                dst_ip: "104.18.7.1".to_owned(),
+                dst_port: 443,
+                proto: Proto::Tcp,
+            },
+            SniSource::ClientHello,
+        )
+        .with_duration_ms(120)
+        .resolved(host, ResolvedHostSource::DnsAndSni)
+        .with_provider_ref(provider)
+        .kernel_attributed(ProcessRecord {
+            pid: 4821,
+            pid_start_time: Some(1_785_833_900),
+            comm: Some("python3".to_owned()),
+            exe: Some("/srv/app/venv/bin/python3".to_owned()),
+            cmdline_hash: None,
+        })
+        .with_volume(2_048, 8_192),
+        scope,
+        CaptureMechanism::Ebpf,
+    )
+    .unwrap()
+}
+
+/// Traffic to a destination no rule in this test file declares.
+fn unexplained(scope: FlowScope, src_port: u16) -> Flow {
+    connection("telemetry.vendor.example", "unknown", scope, src_port)
+}
+
+/// The call the declared point makes, so a wire test is not also a dormancy
+/// test. Without it every three source run below would derive a dormant point
+/// as well, and the assertions would be about two rules at once.
+fn the_declared_call() -> Vec<EgressEvent> {
+    vec![call(
+        "openai",
+        "chat.completions.create",
+        "api.openai.com",
+        "openai",
+    )]
 }
 
 fn kinds_of(outcome: &ReconcileOutcome) -> Vec<Kind> {
@@ -389,59 +463,194 @@ fn no_wire_source_means_no_unmatched_traffic_finding() {
 }
 
 #[test]
-fn a_declared_sensor_this_build_cannot_read_does_not_become_a_claim() {
-    // The other half of the same guard: presence of a sensor must not be enough
-    // to make the finding appear, because this build has nothing that reads it.
-    let outcome = reconcile(&ReconcileInputs::new(
-        Sources::new(
-            DeclaredSource::Present(vec![point(
-                EP_ONE,
-                "api.openai.com",
-                "chat.completions.create",
-            )]),
-            RuntimeSource::Present(Vec::new()),
-            WireSource::Present,
-        ),
-        LONG_WINDOW,
-    ));
-
-    assert!(!kinds_of(&outcome).contains(&Kind::UnmatchedWireTraffic));
-    assert!(!kinds_of(&outcome).contains(&Kind::VolumeAnomaly));
-    assert_eq!(
-        reasons_for(&outcome, DerivedKind::UnmatchedWireTraffic),
-        [SuppressionReason::NoDeriverInThisBuild]
+fn three_sources_declare_the_full_mode_and_unlock_the_claim_that_needs_all_three() {
+    // Milestone 55. The mode is the report's statement of how much of the
+    // product's argument this run is entitled to make, and only a run with all
+    // three sources may write `full`.
+    let outcome = run_full(
+        vec![point(EP_ONE, "api.openai.com", "chat.completions.create")],
+        the_declared_call(),
+        vec![unexplained(FlowScope::InScope, 54_321)],
+        ReconcileSettings::default(),
     );
+
     assert_eq!(
         outcome.reconciliation_mode,
         periskop_report::coverage::ReconciliationMode::Full
     );
+    assert!(reasons_for(&outcome, DerivedKind::UnmatchedWireTraffic).is_empty());
+    assert_eq!(kinds_of(&outcome), [Kind::UnmatchedWireTraffic]);
 }
 
 #[test]
-fn no_run_of_this_build_derives_a_kind_it_has_no_deriver_for() {
-    // Every combination of sources, and the two wire kinds stay out of all of
-    // them. A guard that only holds for the configuration it was written against
-    // is not a guard.
-    for wire in [WireSource::Absent, WireSource::Present] {
+fn traffic_no_code_and_no_call_explains_is_produced_only_by_a_three_source_run() {
+    // The claim that makes the third source worth having, held against every
+    // combination of sources. The same traffic, the same absent explanation, and
+    // the finding exists in exactly the runs entitled to it.
+    let points = vec![point(EP_ONE, "api.openai.com", "chat.completions.create")];
+    let flows = vec![unexplained(FlowScope::InScope, 54_321)];
+
+    for wire in [WireSource::Absent, WireSource::Present(flows.clone())] {
         for runtime in [RuntimeSource::Absent, RuntimeSource::Present(vec![])] {
             for declared in [
                 DeclaredSource::Absent,
-                DeclaredSource::Present(vec![point(
-                    EP_ONE,
-                    "api.openai.com",
-                    "chat.completions.create",
-                )]),
+                DeclaredSource::Present(points.clone()),
             ] {
+                let entitled = matches!(wire, WireSource::Present(_))
+                    && matches!(declared, DeclaredSource::Present(_));
                 let outcome = reconcile(&ReconcileInputs::new(
-                    Sources::new(declared, runtime.clone(), wire),
+                    Sources::new(declared, runtime.clone(), wire.clone()),
                     LONG_WINDOW,
                 ));
-                let kinds = kinds_of(&outcome);
-                assert!(!kinds.contains(&Kind::UnmatchedWireTraffic));
-                assert!(!kinds.contains(&Kind::VolumeAnomaly));
+                assert_eq!(
+                    kinds_of(&outcome).contains(&Kind::UnmatchedWireTraffic),
+                    entitled,
+                    "{:?}",
+                    outcome.suppressed
+                );
+                // The volume kind needs a declared band as well, and none of
+                // these runs has one.
+                assert!(!kinds_of(&outcome).contains(&Kind::VolumeAnomaly));
             }
         }
     }
+}
+
+#[test]
+fn a_two_source_run_states_why_the_wire_claim_is_missing_rather_than_omitting_it() {
+    // Milestone 55's critical criterion, from the reader's side: a report that
+    // simply lacks the kind is indistinguishable from one that looked and found
+    // nothing.
+    let outcome = run(
+        vec![point(EP_ONE, "api.openai.com", "chat.completions.create")],
+        Vec::new(),
+        LONG_WINDOW,
+    );
+
+    assert_eq!(
+        reasons_for(&outcome, DerivedKind::UnmatchedWireTraffic),
+        [SuppressionReason::WireSourceAbsent]
+    );
+    assert!(outcome.wire.is_none(), "{:?}", outcome.wire);
+}
+
+#[test]
+fn only_the_in_scope_bucket_produces_a_finding_and_the_others_stay_in_the_report() {
+    // Milestone 56's non negotiable pair, and K-15's developer machine gate:
+    // three buckets produce nothing and not one of them disappears. A bucket
+    // that keeps traffic out of the count and then vanishes is a silent swallow,
+    // and a wrong out of scope attribution is a silent miss.
+    let outcome = run_full(
+        vec![point(EP_ONE, "api.openai.com", "chat.completions.create")],
+        the_declared_call(),
+        vec![
+            unexplained(FlowScope::InScope, 54_321),
+            unexplained(FlowScope::OutOfScopeProcess, 54_322),
+            unexplained(FlowScope::KnownBenign, 54_323),
+            unexplained(FlowScope::Undetermined, 54_324),
+        ],
+        ReconcileSettings::default(),
+    );
+
+    assert_eq!(kinds_of(&outcome), [Kind::UnmatchedWireTraffic]);
+    let wire = outcome
+        .wire
+        .expect("a run with a sensor states its buckets");
+    assert_eq!(wire.in_scope_flows, 1);
+    assert_eq!(wire.out_of_scope_flows, 1);
+    assert_eq!(wire.known_benign_flows, 1);
+    assert_eq!(wire.unattributed_flows, 1);
+    // Every one of the four named a host no signature matched.
+    assert_eq!(wire.unclassified_flows, 4);
+    assert_eq!(wire.total(), 4);
+}
+
+#[test]
+fn a_sensor_that_watched_and_saw_nothing_still_states_its_counters() {
+    // The distinction the whole source model rests on, on the wire side. Five
+    // zeros written by a sensor that ran is a different report from no counters
+    // at all, and only the second means nobody was watching.
+    let quiet = run_full(
+        vec![point(EP_ONE, "api.openai.com", "chat.completions.create")],
+        the_declared_call(),
+        Vec::new(),
+        ReconcileSettings::default(),
+    );
+
+    let wire = quiet.wire.expect("the sensor ran");
+    assert_eq!(wire.total(), 0);
+    assert!(kinds_of(&quiet).is_empty());
+}
+
+#[test]
+fn a_volume_claim_without_a_declared_band_is_suppressed_rather_than_invented() {
+    // Milestone 57. The threshold is a policy input; there is no default, and a
+    // run without one derives nothing and says which threshold was missing.
+    let flows = vec![connection(
+        "api.openai.com",
+        "openai",
+        FlowScope::InScope,
+        54_321,
+    )];
+    let events = vec![call(
+        "openai",
+        "chat.completions.create",
+        "api.openai.com",
+        "openai",
+    )];
+    let points = vec![point(EP_ONE, "api.openai.com", "chat.completions.create")];
+
+    let without = run_full(
+        points.clone(),
+        events.clone(),
+        flows.clone(),
+        ReconcileSettings::default(),
+    );
+    assert!(!kinds_of(&without).contains(&Kind::VolumeAnomaly));
+    assert_eq!(
+        reasons_for(&without, DerivedKind::VolumeAnomaly),
+        [SuppressionReason::VolumeBandNotDeclared]
+    );
+
+    // The same three sources with a band a policy declared. 2048 bytes on the
+    // wire against 512 declared is four times, outside a band that admits three.
+    let with = run_full(
+        points,
+        events,
+        flows,
+        ReconcileSettings::default().with_volume_band(VolumeBand::declared(5_000, 30_000).unwrap()),
+    );
+    assert!(kinds_of(&with).contains(&Kind::VolumeAnomaly), "{with:?}");
+    assert!(reasons_for(&with, DerivedKind::VolumeAnomaly).is_empty());
+}
+
+#[test]
+fn the_time_tolerance_decides_how_many_findings_a_burst_of_connections_produces() {
+    // The J1 time constraint, on the data that carries one. Two connections to
+    // the same destination from the same process are one conversation or two
+    // depending on the tolerance, and the tolerance is a stated setting rather
+    // than a constant buried in a deriver.
+    let points = vec![point(EP_ONE, "api.openai.com", "chat.completions.create")];
+    let near = unexplained(FlowScope::InScope, 54_321);
+    let mut later = unexplained(FlowScope::InScope, 54_322);
+    // Ten seconds after the first, on the sensor's one second buckets.
+    later.t_start_bucket += 10;
+
+    let narrow = run_full(
+        points.clone(),
+        the_declared_call(),
+        vec![near.clone(), later.clone()],
+        ReconcileSettings::default(),
+    );
+    let wide = run_full(
+        points,
+        the_declared_call(),
+        vec![near, later],
+        ReconcileSettings::default().with_join_tolerance_ms(60_000),
+    );
+
+    assert_eq!(narrow.findings.len(), 2, "{:?}", narrow.findings);
+    assert_eq!(wide.findings.len(), 1, "{:?}", wide.findings);
 }
 
 #[test]

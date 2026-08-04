@@ -12,6 +12,7 @@
 //! is entitled to make. Two sources cannot produce a three source conclusion, and
 //! the mode is what stops a report from implying otherwise.
 
+use periskop_network_sensor::Flow;
 use periskop_report::coverage::ReconciliationMode;
 use periskop_runtime_collector::event::EgressEvent;
 
@@ -38,16 +39,19 @@ pub enum RuntimeSource {
 
 /// Whether a network sensor fed this run.
 ///
-/// `Present` carries no flows. That is not an oversight: this build has no
-/// deriver that reads them, and the phase that adds the sensor adds the payload
-/// with it. Presence is still an input rather than something inferred, because
-/// both the reconciliation mode and the suppression list are computed from it,
-/// and a build that read "no flows" as "no sensor" would report a silent sensor
-/// as an absent one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The third source, and the one the product's central claim rests on: a
+/// connection that left the machine can be seen here and nowhere else.
+///
+/// Presence is stated by the caller for the same reason it is on the other two.
+/// An empty flow list means the sensor watched and the machine stayed quiet,
+/// which is an observation; an absent sensor means nobody was watching the wire,
+/// and it is what stops `reconciliation_mode` from ever reading `full`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireSource {
+    /// No sensor ran, or its records were not handed over.
     Absent,
-    Present,
+    /// A sensor reported. An empty list means it observed no connections.
+    Present(Vec<Flow>),
 }
 
 /// What this run had to work with.
@@ -100,6 +104,13 @@ impl Sources {
         }
     }
 
+    pub fn flows(&self) -> &[Flow] {
+        match &self.wire {
+            WireSource::Absent => &[],
+            WireSource::Present(flows) => flows,
+        }
+    }
+
     pub fn has_declared(&self) -> bool {
         matches!(self.declared, DeclaredSource::Present(_))
     }
@@ -109,7 +120,7 @@ impl Sources {
     }
 
     pub fn has_wire(&self) -> bool {
-        matches!(self.wire, WireSource::Present)
+        matches!(self.wire, WireSource::Present(_))
     }
 }
 
@@ -144,12 +155,31 @@ mod tests {
             ReconciliationMode::StaticPlusRuntime
         );
         assert_eq!(
-            sources(true, false, WireSource::Present).reconciliation_mode(),
+            sources(true, false, WireSource::Present(Vec::new())).reconciliation_mode(),
             ReconciliationMode::StaticPlusWire
         );
         assert_eq!(
-            sources(true, true, WireSource::Present).reconciliation_mode(),
+            sources(true, true, WireSource::Present(Vec::new())).reconciliation_mode(),
             ReconciliationMode::Full
+        );
+    }
+
+    #[test]
+    fn a_sensor_that_saw_nothing_is_not_an_absent_sensor_either() {
+        // The same distinction as the runtime source, on the source the
+        // product's central claim rests on. `full` says the wire was watched,
+        // and only a caller can say whether it was.
+        let watched = sources(true, true, WireSource::Present(Vec::new()));
+        let unwatched = sources(true, true, WireSource::Absent);
+
+        assert!(watched.flows().is_empty());
+        assert!(unwatched.flows().is_empty());
+        assert!(watched.has_wire());
+        assert!(!unwatched.has_wire());
+        assert_eq!(watched.reconciliation_mode(), ReconciliationMode::Full);
+        assert_eq!(
+            unwatched.reconciliation_mode(),
+            ReconciliationMode::StaticPlusRuntime
         );
     }
 

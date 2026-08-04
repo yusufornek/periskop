@@ -13,9 +13,11 @@ use periskop_core::finding::Finding;
 use periskop_report::coverage::ReconciliationMode;
 
 use crate::capability::Suppression;
+use crate::j1::J1Match;
 use crate::join::J2Match;
 use crate::settings::ReconcileSettings;
 use crate::target::TargetId;
+use crate::wire::WireCoverage;
 
 /// A destination an observation supplied for a code point the scan could not
 /// resolve.
@@ -53,6 +55,18 @@ pub struct ReconcileOutcome {
     /// and the explain surface has to be able to show that link rather than
     /// assert it.
     pub matches: Vec<J2Match>,
+    /// The same, for the join between the wire and the observed calls.
+    pub j1_matches: Vec<J1Match>,
+    /// What the network sensor saw, in the counters the coverage statement
+    /// carries.
+    ///
+    /// `None` when no sensor fed the run, and that is not the same as five
+    /// zeros: a report that wrote zeros would say the sensor watched and found
+    /// nothing. Three of the five count flows that produce no finding, and they
+    /// are written whenever there was a sensor at all, because a bucket that
+    /// keeps traffic out of the count and then vanishes from the report is a
+    /// silent swallow (K-15).
+    pub wire: Option<WireCoverage>,
     /// The thresholds and algorithm version this result was produced with.
     pub settings: ReconcileSettings,
     /// The engine disagreeing with itself. Belongs in the report diagnostics

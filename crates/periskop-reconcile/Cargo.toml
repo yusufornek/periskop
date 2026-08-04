@@ -23,6 +23,13 @@ periskop-report = { workspace = true }
 # contract. Redefining the type here would mean validating the same records
 # twice, against two shapes that are only equal until one of them is edited.
 periskop-runtime-collector = { workspace = true }
+# The same reasoning for the third source: a `Flow` arrives as the sensor wrote
+# it, with its bucket, its process attribution and its scope already checked
+# against `schemas/flow.schema.json`. A second copy of the type here would be
+# free to disagree with the contract, and the bucket rule that decides which
+# traffic may produce a finding is exactly the invariant that must not be
+# restated in two places.
+periskop-network-sensor = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
