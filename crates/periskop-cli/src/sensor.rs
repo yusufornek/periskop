@@ -34,6 +34,8 @@ use periskop_network_sensor::{
 };
 use serde::Serialize;
 
+use crate::write_target::{self, Existing};
+
 /// Name of the record file one pass writes.
 ///
 /// Fixed rather than stamped with a time. The directory is the unit a scan is
@@ -69,8 +71,9 @@ pub enum SensorWriteError {
     #[error("the record directory {0} could not be created: {1}")]
     DirectoryNotCreated(PathBuf, std::io::Error),
 
-    #[error("the record file {0} could not be written: {1}")]
-    FileNotWritten(PathBuf, std::io::Error),
+    /// The path carries the message, so it is not repeated here.
+    #[error("the flow records could not be written: {0}")]
+    FileNotWritten(#[from] write_target::WriteError),
 
     #[error("a record this build produced could not be serialized: {0}")]
     RecordNotSerialized(serde_json::Error),
@@ -172,6 +175,14 @@ pub fn run(request: &SensorRequest<'_>) -> Result<SensorRun, SensorWriteError> {
 /// to without rewriting what it already wrote. The file is truncated rather than
 /// appended to: two passes over one machine describe two windows, and silently
 /// unioning them would let a report count a connection that closed yesterday.
+///
+/// The truncation goes through [`write_target`] rather than `std::fs::write`,
+/// and that is the whole reason this function is not one line. This command is
+/// documented to run with `CAP_BPF` and `CAP_PERFMON`, and `std::fs::write`
+/// follows a symbolic link: with `flows.jsonl` linked at somebody's key file,
+/// the plain call emptied the key file and then reported a sensor that could not
+/// start, which is a privileged command destroying a file while announcing that
+/// it had failed to do anything.
 fn write_records(out_dir: &Path, flows: &[Flow]) -> Result<PathBuf, SensorWriteError> {
     std::fs::create_dir_all(out_dir)
         .map_err(|error| SensorWriteError::DirectoryNotCreated(out_dir.to_path_buf(), error))?;
@@ -184,8 +195,10 @@ fn write_records(out_dir: &Path, flows: &[Flow]) -> Result<PathBuf, SensorWriteE
     }
 
     let path = out_dir.join(RECORD_FILE_NAME);
-    std::fs::write(&path, body)
-        .map_err(|error| SensorWriteError::FileNotWritten(path.clone(), error))?;
+    // `Replace`: a pass overwrites the records the pass before it wrote, and
+    // that file is a regular file this command created. Anything else at the
+    // path, a link most of all, stops the write instead of being followed.
+    write_target::write_public(&path, body.as_bytes(), Existing::Replace)?;
     Ok(path)
 }
 
@@ -312,7 +325,7 @@ fn opaque_host_id(seed: &str) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -410,6 +423,52 @@ mod tests {
         }
         assert!(json.get("state").is_some());
         assert!(json.get("not_measured").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_record_file_that_is_a_symbolic_link_stops_the_pass_and_spares_the_other_file() {
+        // The live failure this pins, on a command documented to run with
+        // `CAP_BPF`: with `flows.jsonl` linked at another file, `std::fs::write`
+        // emptied that other file to zero bytes, left the link in place, and the
+        // command still reported that the sensor could not start. A privileged
+        // write that destroys a file it was never pointed at is the finding; the
+        // exit code it destroyed the file behind is what made it invisible.
+        let out = TempDir::new("symlinked-records");
+        std::fs::create_dir_all(&out.0).unwrap();
+        let victim = out.0.join("victim.txt");
+        std::fs::write(&victim, b"data somebody needs\n").unwrap();
+        std::os::unix::fs::symlink(&victim, out.0.join(RECORD_FILE_NAME)).unwrap();
+
+        let processes = vec!["/usr/bin/python3".to_owned()];
+        match run(&request(&out.0, &processes)) {
+            Err(SensorWriteError::FileNotWritten(_)) => {}
+            Err(other) => panic!("expected the write to be refused, got {other}"),
+            Ok(_) => panic!("the pass wrote through a symbolic link"),
+        }
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"data somebody needs\n",
+            "the linked file was written through"
+        );
+        assert!(std::fs::symlink_metadata(out.0.join(RECORD_FILE_NAME))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn a_second_pass_replaces_the_records_of_the_first() {
+        // The property the symlink refusal must not have cost: two passes over
+        // one machine describe two windows, so the second pass owns the file.
+        let out = TempDir::new("second-pass");
+        let processes = vec!["/usr/bin/python3".to_owned()];
+        let first = run(&request(&out.0, &processes)).unwrap();
+        std::fs::write(&first.record_file, b"leftover from a pass nobody ran\n").unwrap();
+
+        let second = run(&request(&out.0, &processes)).unwrap();
+        let body = std::fs::read_to_string(&second.record_file).unwrap();
+        assert!(!body.contains("leftover"), "{body}");
     }
 
     #[test]

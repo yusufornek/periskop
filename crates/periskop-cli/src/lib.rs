@@ -8,7 +8,8 @@
 //! that reads as unrelated.
 //!
 //! The public surface is deliberately small: the scan, the two front ends that
-//! call it, and the clock the envelope needs.
+//! call it, the clock the envelope needs, and the one module every command goes
+//! through to put a file on disk.
 
 pub mod clock;
 pub mod hook;
@@ -17,3 +18,4 @@ pub mod render;
 pub mod rpc;
 pub mod scan;
 pub mod sensor;
+pub mod write_target;

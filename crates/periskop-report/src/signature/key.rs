@@ -320,14 +320,58 @@ mod tests {
         assert_ne!(a.key_id(), b.key_id());
     }
 
+    /// What the fixed key signs `periskop` to, in the encoding an envelope
+    /// carries. Produced by running this code once and then frozen.
+    ///
+    /// Comparing `sign(x)` against `sign(x)` was the assertion this replaces,
+    /// and it holds for any signing function whatsoever, including one that
+    /// returns a constant. What determinism is worth here is that a signature
+    /// archived last year still verifies today, and only a value that came from
+    /// outside this run can say that.
+    const FIXED_KEY_OVER_PERISKOP: &str =
+        "_kJN7N6Pwx07HwjZhq6OjXXV_uAZRvc5vwKPk6vf3acjDcbUSnIuYzoKm9gJZp5-7RDz7UIMFyC_kBVlKn4DBA";
+
+    /// The identity the fixed key derives, likewise frozen. It ties `key_id` to
+    /// the public half through `derive_key_id`, so a change of domain tag or of
+    /// encoding is caught here rather than in the field of an envelope nobody
+    /// can verify any more.
+    const FIXED_KEY_ID: &str = "key_0824fd9b7f690d5c";
+
+    /// The public half the fixed seed produces, as the file that carries it. A
+    /// public key file is what a verifier is handed, so its text is part of the
+    /// format rather than an internal detail.
+    const FIXED_PUBLIC_KEY_FILE: &str =
+        "periskop-ed25519-public-key-v1 6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw\n";
+
     #[test]
-    fn signing_is_deterministic() {
-        // RFC 8032. This is what lets a signed report be byte comparable across
-        // runs, so it is pinned rather than assumed.
+    fn signing_is_deterministic_against_a_value_from_outside_this_run() {
+        // RFC 8032 §5.1.6. This is what lets a signed report stay byte
+        // comparable across runs and across years, so it is pinned to a
+        // constant rather than to a second call of the same function.
         let key = fixed_key();
+        assert_eq!(
+            base64url::encode(&key.sign(b"periskop").unwrap()),
+            FIXED_KEY_OVER_PERISKOP
+        );
         assert_eq!(
             key.sign(b"periskop").unwrap(),
             key.sign(b"periskop").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_fixed_seed_derives_the_key_id_and_the_public_key_file_it_always_has() {
+        let key = fixed_key();
+        assert_eq!(key.key_id(), FIXED_KEY_ID);
+        assert_eq!(key.verifying_key().to_key_file(), FIXED_PUBLIC_KEY_FILE);
+        // The private key file the golden vector in `sign.rs` is loaded from,
+        // pinned where the seed that produces it is visible.
+        assert_eq!(
+            key.to_key_file().as_str(),
+            format!(
+                "{SECRET_KEY_TAG} {}\n",
+                base64url::encode(&[7u8; KEY_BYTES])
+            )
         );
     }
 

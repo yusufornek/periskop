@@ -14,7 +14,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { EngineBridge } from "./bridge.js";
-import { SENSOR_NOT_RUNNING } from "./sources.js";
+import { HOOKS_NOT_INSTRUMENTED, SENSOR_NOT_RUNNING } from "./sources.js";
 import { getCoverage, getDetail, runScan } from "./tools.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -68,7 +68,7 @@ test("a scan crosses the boundary intact", { skip: !available }, async () => {
         unmatched_wire_traffic: number | null;
       };
       findings: unknown[];
-      coverage: { files_read: number };
+      coverage: { files_read: number; runtime_hooks: string };
     };
 
     // WARN rather than PASS, and that is the correct answer. The fixture set
@@ -112,6 +112,12 @@ test("a scan crosses the boundary intact", { skip: !available }, async () => {
     // Zero rather than null: the count is only null when the findings do not
     // state their kind, so this also proves the engine sends the field.
     assert.equal(result.summary.unmatched_wire_traffic, 0);
+    // The hook state read from a real report rather than a recorded one. This
+    // build ships no hooks, so the engine names the language and says no hook
+    // ran; the answer may say that only because the engine did. An engine that
+    // stopped sending the list would turn this to unknown, which is the state a
+    // recorded report cannot prove the engine never sends.
+    assert.equal(result.coverage.runtime_hooks, HOOKS_NOT_INSTRUMENTED);
   } finally {
     await engine.close();
   }

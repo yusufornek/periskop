@@ -17,6 +17,13 @@ export interface BridgeOptions {
   /** How long a single request may take before it is abandoned. */
   timeoutMs?: number;
   /**
+   * How long one message may be before this side refuses to read it.
+   *
+   * An option rather than a constant so that the bound itself can be exercised
+   * without moving sixteen megabytes through a pipe in a test.
+   */
+  maxMessageChars?: number;
+  /**
    * Where protocol level problems go.
    *
    * A message this side cannot route belongs to no request, so there is no
@@ -56,6 +63,22 @@ const MAX_DIAGNOSTICS = 10;
 
 /** How much of an offending line is quoted: enough to recognise, short enough to read. */
 const QUOTED_LINE_LIMIT = 200;
+
+/**
+ * How long a message may be before this side refuses to read it.
+ *
+ * Generous, because a scan of a large repository is a large report and this must
+ * not become a limit on real answers; bounded, because nothing else was. A
+ * malformed or hostile engine could send a line without an end, and every step
+ * after this one is unbounded work on it: the parse, the projection, and the
+ * caller's context.
+ *
+ * What this does not bound is the read. The line arrives through readline, which
+ * has already buffered it by the time this runs, so an engine that never sends a
+ * newline is still a memory problem on the stream itself. This caps everything
+ * downstream of that, and says so rather than dropping the line quietly.
+ */
+const DEFAULT_MAX_MESSAGE_CHARS = 16 * 1024 * 1024;
 
 /** Renders anything a catch clause can receive. */
 function describe(error: unknown): string {
@@ -157,6 +180,14 @@ export class EngineBridge {
   }
 
   #deliver(line: string): void {
+    const limit = this.options.maxMessageChars ?? DEFAULT_MAX_MESSAGE_CHARS;
+    if (line.length > limit) {
+      this.#report(
+        `engine sent a ${line.length} character message, past the ${limit} character limit, and it was not read: ${quote(line)}`,
+      );
+      return;
+    }
+
     let message: { id?: number | null; result?: unknown; error?: { code: number; message: string } };
     try {
       message = JSON.parse(line);

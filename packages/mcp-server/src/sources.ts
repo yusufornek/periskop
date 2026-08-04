@@ -13,7 +13,7 @@
 // on the strength of its own ignorance, which is the substitution this product
 // exists to refuse: not seeing something is not the same as it not being there.
 
-import type { Coverage, Finding } from "./tools.js";
+import type { Coverage, Finding } from "./report.js";
 
 /** A source that was there. */
 export const SENSOR_RUNNING = "running";
@@ -28,11 +28,33 @@ export const SENSOR_NOT_RUNNING = "not running";
  */
 export const UNKNOWN = "unknown";
 
+/** Hooks were attached, on the report's own word, for at least one language. */
+export const HOOKS_INSTRUMENTED = "instrumented";
+/** Hooks were attached but partially, and no language is fully covered. */
+export const HOOKS_DEGRADED = "degraded";
+/** Every language the report named says no hook ran. */
+export const HOOKS_NOT_INSTRUMENTED = "not instrumented";
+
 /** Modes whose source list includes the wire (coverage-statement.schema.json). */
 const MODES_WITH_WIRE: ReadonlySet<string> = new Set(["full", "static_plus_wire"]);
 
 /** Modes that name their sources and do not include the wire. */
 const MODES_WITHOUT_WIRE: ReadonlySet<string> = new Set(["static_only", "static_plus_runtime"]);
+
+/** A language whose hook was in place, whether or not it saw everything. */
+const STATUS_INSTRUMENTED = "instrumented";
+/** A language whose hook was in place and partial. */
+const STATUS_DEGRADED = "degraded";
+
+/**
+ * Statuses that mean no hook ran for that language
+ * (coverage-statement.schema.json).
+ *
+ * The two are kept apart in the report because one is a user choice and the
+ * other is a gap in the product, and both are read here only for what they have
+ * in common: nothing was hooked.
+ */
+const STATUSES_WITHOUT_HOOK: ReadonlySet<string> = new Set(["not_instrumented", "unsupported"]);
 
 /** The finding kind the wire source exists to produce (finding.schema.json). */
 const UNMATCHED_WIRE_TRAFFIC = "unmatched_wire_traffic";
@@ -70,6 +92,39 @@ export function networkSensor(coverage: Coverage): string {
   if (MODES_WITHOUT_WIRE.has(mode)) return SENSOR_NOT_RUNNING;
   // A mode this server does not know may or may not include the wire. Picking
   // either answer would be a guess about the machine.
+  return UNKNOWN;
+}
+
+/**
+ * Whether runtime hooks fed this run.
+ *
+ * A boolean here was the same substitution the sensor field made, one line
+ * further down. `runtime_coverage.some(status === "instrumented")` answers false
+ * for a report that listed no language at all, and false was published as "the
+ * hooks were not attached": a claim about the user's machine built out of a list
+ * this server never received. The two runs it could not tell apart are the two a
+ * reader acts on differently, since an unhooked run explains away every
+ * unmatched flow it failed to match.
+ *
+ * So the states are the report's, not a boolean's. Absent and empty are the same
+ * answer and it is unknown: an engine older than the field says nothing, and a
+ * report that named no language has said nothing about hooks either. A status
+ * this server has not been taught leaves the run unknown for the reason
+ * `networkSensor` gives, rather than being counted as no hook.
+ *
+ * Degraded keeps its own word. Folded into instrumented it would claim full
+ * coverage the report did not, and folded into not instrumented it would drop
+ * observations that exist; per language detail stays in the coverage tool, which
+ * returns `runtime_coverage` as the engine wrote it.
+ */
+export function runtimeHooks(coverage: Coverage): string {
+  const languages = coverage.runtime_coverage;
+  if (languages === undefined || languages.length === 0) return UNKNOWN;
+  if (languages.some((entry) => entry.status === STATUS_INSTRUMENTED)) return HOOKS_INSTRUMENTED;
+  if (languages.some((entry) => entry.status === STATUS_DEGRADED)) return HOOKS_DEGRADED;
+  if (languages.every((entry) => STATUSES_WITHOUT_HOOK.has(entry.status))) {
+    return HOOKS_NOT_INSTRUMENTED;
+  }
   return UNKNOWN;
 }
 

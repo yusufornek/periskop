@@ -111,6 +111,29 @@ jobs:
           cargo test -p periskop-cli --test benchmark
           cat target/benchmark.json
 
+      # F3's reconciliation numbers, printed for the same reason. This artefact
+      # records what was not measured as well as what was: meets_minimum_sample
+      # is false at eight flows against a floor of two hundred, and fp_rate is
+      # null with the reason beside it. A reviewer who cannot see those two
+      # fields in the log has no way to tell a refused measurement from a
+      # missing one.
+      - name: Reconciliation benchmark
+        run: |
+          cargo test -p periskop-cli --test reconcile_benchmark
+          cat target/reconcile-benchmark.json
+
+      # The F3 gate itself. PERISKOP_REQUIRE_PROOF is set for the reason it is
+      # set on the test steps: a run that skipped the gate did not pass it. The
+      # artefact carries a caveat saying the eBPF capture path did not run, and
+      # printing it here is what keeps that sentence from living only on the
+      # machine that produced the file.
+      - name: F3 gate proof
+        env:
+          PERISKOP_REQUIRE_PROOF: 1
+        run: |
+          cargo test -p periskop-cli --test proof_f3
+          cat target/f3-proof.json
+
       # Two builds of the same tree must agree byte for byte.
       - name: Report is reproducible
         run: |

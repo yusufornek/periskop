@@ -16,11 +16,14 @@
 import { z } from "zod";
 
 import type { ReportSource } from "./bridge.js";
+import { failure } from "./envelope.js";
+import { fetchReport, type Finding } from "./report.js";
 import {
   countUnmatchedWireTraffic,
   flowBuckets,
   networkSensor,
   reconciliationMode,
+  runtimeHooks,
 } from "./sources.js";
 
 export const DEFAULT_PAGE_SIZE = 20;
@@ -39,58 +42,19 @@ export const MAX_PAGE_SIZE = 100;
 export const CONFIDENCE_LEVELS = ["confirmed", "suspect"] as const;
 export type ConfidenceLevel = (typeof CONFIDENCE_LEVELS)[number];
 
-export interface EntityRef {
-  ref_type: string;
-  ref_id: string;
-}
-
-export interface Evidence {
-  evidence_type: string;
-  ref: string;
-}
-
-export interface Finding {
-  finding_id: string;
-  provider_ref: string;
-  confidence: string;
-  detector: { rule_id: string };
-  location?: { path?: string; span?: { start_line: number } };
-  // Read by the reconciliation trace rather than by the scan projection, and
-  // optional here for one reason: an engine older than the field would omit it,
-  // and a required field would turn that into a type error at the boundary
-  // instead of a coverage note in the answer.
-  kind?: string;
-  source?: string;
-  refs?: EntityRef[];
-  evidence?: Evidence[];
-  data_sources?: Array<{ source: string; detector_id?: string | null }>;
-}
-
-export interface Coverage {
-  parsed_files: number;
-  unparsed_files: Array<{ path: string; reason: string }>;
-  undetected_libraries: string[];
-  runtime_coverage: Array<{ language: string; status: string }>;
-  // The observation half of the statement, optional for the same reason
-  // Finding.kind is: an engine older than a field omits it, and requiring it
-  // here would turn that into a type error at the boundary instead of an
-  // unknown in the answer. What each one means is in sources.ts, which is the
-  // only reader.
-  reconciliation_mode?: string;
-  in_scope_flows?: number;
-  out_of_scope_flows?: number;
-  known_benign_flows?: number;
-  unattributed_flows?: number;
-  unclassified_flows?: number;
-}
-
-export interface ScanReport {
-  report_id: string;
-  scan_run_id: string;
-  verdict: string;
-  findings: Finding[];
-  suspect_findings: Finding[];
-  coverage: Coverage;
+/**
+ * The engine answered with something that is not a scan report.
+ *
+ * `CORE_UNAVAILABLE` from the contract's shared code table rather than a new
+ * code, because that table is closed. What the caller has to be able to tell
+ * apart is a scan that found nothing from a scan whose answer never arrived, and
+ * an envelope says which one this is where a thrown TypeError did not.
+ */
+function unreadable(problem: string): Record<string, unknown> {
+  return failure(
+    "CORE_UNAVAILABLE",
+    `the engine answered with something this server cannot read as a scan report: ${problem}`,
+  );
 }
 
 /**
@@ -134,6 +98,27 @@ export const coverageInput = z.object({
   path: z.string().describe("Project directory to report coverage for."),
 });
 
+/**
+ * Where a finding is, as far as the report says and no further.
+ *
+ * The line was defaulted to 1, which is a location rather than the absence of
+ * one: a finding with no span read as `src/app.py:1`, the reader opened the file
+ * at the import block, found nothing that could have produced the finding and
+ * concluded the detector was wrong. Nothing in the answer said the line was this
+ * server's invention.
+ *
+ * So a path with no line states the path. It is what the report carries, it
+ * claims nothing about where in the file, and it still gets the reader to the
+ * right file. Null stays reserved for a finding that names no path at all, which
+ * is the case where there is genuinely nothing to open.
+ */
+function locationOf(finding: Finding): string | null {
+  const path = finding.location?.path;
+  if (!path) return null;
+  const line = finding.location?.span?.start_line;
+  return line === undefined ? path : `${path}:${line}`;
+}
+
 /** One line per finding, enough to decide whether to ask for more. */
 function condense(finding: Finding): Record<string, unknown> {
   return {
@@ -141,10 +126,21 @@ function condense(finding: Finding): Record<string, unknown> {
     provider: finding.provider_ref,
     confidence: finding.confidence,
     rule_id: finding.detector.rule_id,
-    location: finding.location?.path
-      ? `${finding.location.path}:${finding.location.span?.start_line ?? 1}`
-      : null,
+    location: locationOf(finding),
   };
+}
+
+/**
+ * Findings in a list whose own confidence field is not the list's.
+ *
+ * The two lists and the per finding field say the same thing twice, and nothing
+ * checked that they agree. They can disagree only if the report is wrong about
+ * itself, which is exactly when a reader must not be handed either half as
+ * settled: a suspected finding sitting in the confirmed list is paged under
+ * `confidence: "confirmed"` and read as something the engine proved.
+ */
+function disagreeingRows(findings: readonly Finding[], level: ConfidenceLevel): number {
+  return findings.filter((finding) => finding.confidence !== level).length;
 }
 
 /** How many findings one provider accounts for, kept on the confidence axis. */
@@ -192,7 +188,9 @@ export async function runScan(
   bridge: ReportSource,
   input: z.infer<typeof scanInput>,
 ): Promise<Record<string, unknown>> {
-  const report = (await bridge.call("scan", { path: input.path })) as ScanReport;
+  const read = await fetchReport(bridge, input.path);
+  if (!read.ok) return unreadable(read.problem);
+  const report = read.report;
 
   // Which list this page comes from. Paging only the confirmed list was the
   // bug: on a run without hooks every unmatched wire finding is suspected, so
@@ -208,6 +206,7 @@ export async function runScan(
   const cursor = input.cursor ?? 0;
   const page = paged.slice(cursor, cursor + limit);
   const nextCursor = cursor + limit < paged.length ? cursor + limit : null;
+  const disagreeing = disagreeingRows(paged, shown);
 
   return {
     verdict: report.verdict,
@@ -238,9 +237,10 @@ export async function runScan(
       files_read: report.coverage.parsed_files,
       files_unread: report.coverage.unparsed_files.length,
       libraries_without_rules: report.coverage.undetected_libraries,
-      runtime_instrumented: report.coverage.runtime_coverage.some(
-        (r) => r.status === "instrumented",
-      ),
+      // Three states rather than a boolean, for the reason `runtimeHooks` gives:
+      // a report that listed no language answered false here, and false was
+      // published as "the hooks were not attached".
+      runtime_hooks: runtimeHooks(report.coverage),
       // Read from the report, and named the same here as in the coverage tool so
       // that one fact does not answer to two words. It was a constant false
       // until the third source arrived, which was the wrong answer for every run
@@ -267,6 +267,17 @@ export async function runScan(
         fetch_with: { filter: { confidence: other } },
       },
     },
+    // What this answer cannot be read at face value for, in the same field name
+    // the trace tool uses. Never left empty when something is wrong with the
+    // report, and never invented when nothing is: a note on every answer stops
+    // being read.
+    coverage_note:
+      disagreeing > 0
+        ? `${disagreeing} of the ${paged.length} findings in the ${shown} list state a different ` +
+          `confidence of their own. The report puts a finding in one list and labels it as the ` +
+          `other, so neither half can be taken as settled; the rows are returned as the engine ` +
+          `sent them.`
+        : null,
   };
 }
 
@@ -274,19 +285,24 @@ export async function getDetail(
   bridge: ReportSource,
   input: z.infer<typeof detailInput>,
 ): Promise<Record<string, unknown>> {
-  const report = (await bridge.call("scan", { path: input.path })) as ScanReport;
+  const read = await fetchReport(bridge, input.path);
+  if (!read.ok) return unreadable(read.problem);
+  const report = read.report;
   const all = [...report.findings, ...report.suspect_findings];
   const finding = all.find((f) => f.finding_id === input.finding_id);
 
   if (!finding) {
-    return {
-      error: "no finding with that identifier in the current scan",
-      finding_id: input.finding_id,
-      // Identifiers are content addressed, so a stale one means the code moved
-      // on rather than that the caller made a mistake. Saying which is which
-      // saves a round of confusion.
-      hint: "identifiers are derived from the call itself; rescan if the code changed",
-    };
+    // The contract's envelope, the same one the trace tool answers a stale
+    // identifier with. Two shapes of error inside one tool, one an object and one
+    // a bare string, is a caller writing two checks and forgetting the second.
+    //
+    // Identifiers are content addressed, so a stale one means the code moved on
+    // rather than that the caller made a mistake. Saying which is which saves a
+    // round of confusion.
+    return failure(
+      "FINDING_NOT_FOUND",
+      `no finding with the identifier ${input.finding_id} in the current scan; identifiers are derived from the call itself, so rescan if the code changed`,
+    );
   }
 
   return { finding };
@@ -296,15 +312,19 @@ export async function getCoverage(
   bridge: ReportSource,
   input: z.infer<typeof coverageInput>,
 ): Promise<Record<string, unknown>> {
-  const report = (await bridge.call("scan", { path: input.path })) as ScanReport;
-  const coverage = report.coverage;
+  const read = await fetchReport(bridge, input.path);
+  if (!read.ok) return unreadable(read.problem);
+  const coverage = read.report.coverage;
 
   return {
     files_read: coverage.parsed_files,
     unread: coverage.unparsed_files.slice(0, MAX_PAGE_SIZE),
     unread_total: coverage.unparsed_files.length,
     libraries_without_rules: coverage.undetected_libraries,
-    runtime_coverage: coverage.runtime_coverage,
+    // Null rather than an empty list when the report carried no list at all. An
+    // empty array here reads as "every language was checked and none was
+    // hooked", which is the claim `runtimeHooks` refuses to make.
+    runtime_coverage: coverage.runtime_coverage ?? null,
     // Which sources fed the run. The counters below say how much each source
     // could not account for, and none of them can be read without knowing
     // whether the source was there at all.

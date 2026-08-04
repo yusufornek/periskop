@@ -27,7 +27,8 @@
 import { z } from "zod";
 
 import type { ReportSource } from "./bridge.js";
-import type { EntityRef, Evidence, Finding, ScanReport } from "./tools.js";
+import { failure } from "./envelope.js";
+import { fetchReport, type EntityRef, type Evidence, type Finding } from "./report.js";
 
 /** Contract default for the input chain depth (mcp-tools.md section 7). */
 export const DEFAULT_TRACE_DEPTH = 10;
@@ -95,9 +96,17 @@ const SOURCE_OF_REF: Readonly<Record<string, string>> = {
 const JOIN_EVIDENCE = "reconciliation_join";
 const RECONCILED = "reconciled";
 
-/** The common error envelope (mcp-tools.md, shared error shape). */
-function failure(code: string, message: string, retryable = false): Record<string, unknown> {
-  return { error: { code, message, retryable } };
+/**
+ * Reads a key that is present on the table itself.
+ *
+ * A plain index reaches the prototype chain, so `KEY_FIELDS["constructor"]` and
+ * `SOURCE_OF_REF["toString"]` answer with an inherited function rather than
+ * nothing. Both tables are keyed by strings the engine wrote, so an outcome or a
+ * reference type named after an Object member would have been treated as a
+ * recognised one and its unrecognised note would never have been written.
+ */
+function lookup<T>(table: Readonly<Record<string, T>>, key: string): T | undefined {
+  return Object.hasOwn(table, key) ? table[key] : undefined;
 }
 
 export async function traceReconciliation(
@@ -112,7 +121,18 @@ export async function traceReconciliation(
     );
   }
 
-  const report = (await bridge.call("scan", { path: input.path })) as ScanReport;
+  const read = await fetchReport(bridge, input.path);
+  if (!read.ok) {
+    // The contract's closed code table has no entry for an unreadable answer,
+    // and this is the nearest true one: the engine did not give this server a
+    // report. An envelope rather than the TypeError the bare cast used to throw
+    // three lines below.
+    return failure(
+      "CORE_UNAVAILABLE",
+      `the engine answered with something this server cannot read as a scan report: ${read.problem}`,
+    );
+  }
+  const report = read.report;
   const finding = [...report.findings, ...report.suspect_findings].find(
     (candidate) => candidate.finding_id === input.finding_id,
   );
@@ -148,6 +168,23 @@ export function trace(finding: Finding, maxDepth: number): Record<string, unknow
   const refs = finding.refs ?? [];
   const evidence = finding.evidence ?? [];
 
+  // A reconciled finding is the join of at least two records; the join is what
+  // brought it into existence. So neither list can honestly be missing or empty,
+  // and defaulting them to `[]` turned a loss of data into two positive claims:
+  // no source contributed, and nothing was left out of this answer.
+  const refsUnread = refs.length === 0;
+  const evidenceUnread = evidence.length === 0;
+  if (refsUnread) {
+    notes.push(
+      `This finding carries ${finding.refs === undefined ? "no refs field" : "an empty refs list"}, so which records it was joined from could not be read; a reconciled finding rests on at least two.`,
+    );
+  }
+  if (evidenceUnread) {
+    notes.push(
+      `This finding carries ${finding.evidence === undefined ? "no evidence field" : "an empty evidence list"}, so the join path could not be read and is null rather than empty.`,
+    );
+  }
+
   const joinEvidence = evidence.filter((item) => item.evidence_type === JOIN_EVIDENCE);
   const otherEvidence = evidence.length - joinEvidence.length;
   if (otherEvidence > 0) {
@@ -175,7 +212,7 @@ export function trace(finding: Finding, maxDepth: number): Record<string, unknow
     finding_id: finding.finding_id,
     kind: finding.kind ?? null,
     source: finding.source ?? null,
-    join_path: shown,
+    join_path: evidenceUnread ? null : shown,
     contributing_sources: sources,
     discrepancy: found,
     truncated: truncatedByDepth,
@@ -207,7 +244,7 @@ function step(item: Evidence, refs: EntityRef[], notes: string[]): JoinStep {
     );
   }
 
-  const keyFields = KEY_FIELDS[parsed.outcome];
+  const keyFields = lookup(KEY_FIELDS, parsed.outcome);
   if (!keyFields) {
     notes.push(
       `Join outcome ${parsed.outcome} is not one this server has a key list for, so its key fields are reported as empty rather than guessed.`,
@@ -292,12 +329,17 @@ function soleRef(refs: EntityRef[], type: string, notes: string[]): string | nul
  * One entry per source rather than one per reference: a point called a thousand
  * times is still one declared source and one observed one, and listing every
  * reference would put the finding's whole reference list into the answer.
+ *
+ * Null rather than an empty list when nothing could be read. Zero contributing
+ * sources is not a state a reconciled finding can be in, so an empty list here
+ * would not be a fact about the finding but a report of this projection's own
+ * failure, written in the words of a fact.
  */
 function contributingSources(
   finding: Finding,
   refs: EntityRef[],
   notes: string[],
-): ContributingSource[] {
+): ContributingSource[] | null {
   const declared = finding.data_sources;
   if (declared && declared.length > 0) {
     return declared.map((entry) => ({
@@ -309,7 +351,7 @@ function contributingSources(
   const seen = new Map<string, ContributingSource>();
   const unknown = new Set<string>();
   for (const ref of refs) {
-    const source = SOURCE_OF_REF[ref.ref_type];
+    const source = lookup(SOURCE_OF_REF, ref.ref_type);
     if (!source) {
       unknown.add(ref.ref_type);
       continue;
@@ -322,15 +364,19 @@ function contributingSources(
       `Reference ${plural(unknown.size, "type", "types")} ${[...unknown].sort().join(", ")} ${plural(unknown.size, "is", "are")} not mapped to a source and ${plural(unknown.size, "was", "were")} left out.`,
     );
   }
-  if (seen.size > 0) {
-    // The per source detector is only carried when the finding declares
-    // data_sources. Reporting the reconciliation rule id here instead would name
-    // the detector that combined the sources as the one that found them.
-    notes.push(
-      "Per source detector ids are reported as null: this finding carries no data_sources block, so which detector produced each contribution is not recorded.",
-    );
-  }
-  return [...seen.values()].sort((a, b) => a.source.localeCompare(b.source));
+  if (seen.size === 0) return null;
+
+  // The per source detector is only carried when the finding declares
+  // data_sources. Reporting the reconciliation rule id here instead would name
+  // the detector that combined the sources as the one that found them.
+  notes.push(
+    "Per source detector ids are reported as null: this finding carries no data_sources block, so which detector produced each contribution is not recorded.",
+  );
+  // Ordered by code unit rather than by `localeCompare`, which sorts by the
+  // machine's locale: the same report would serialise two ways on two machines
+  // and every diff of two runs would carry the difference. Determinism is a
+  // stated property of every answer here (CLAUDE.md).
+  return [...seen.values()].sort((a, b) => (a.source < b.source ? -1 : a.source > b.source ? 1 : 0));
 }
 
 /**
@@ -340,20 +386,38 @@ function contributingSources(
  * A finding whose evidence names no pair gets null, which is the correct answer
  * for a kind such as a dormant code point: nothing was observed, so there is no
  * observed value to put opposite the declared one.
+ *
+ * Which is why a rung that names one side and not the other cannot be dropped in
+ * silence. Dropping it produced that same null, and the null is read as the
+ * dormant answer: nothing was observed. A rung carrying `observed=` and no
+ * `declared=` says the opposite, and the reader was handed the reverse of what
+ * the engine found.
  */
 function discrepancy(finding: Finding, joinEvidence: Evidence[], notes: string[]): Discrepancy | null {
   const pairs: Discrepancy[] = [];
+  let halfNamed = 0;
   for (const item of joinEvidence) {
     const parsed = parseJoinRef(item.ref);
     if (!parsed) continue;
     const expected = parsed.values.get("declared");
     const observed = parsed.values.get("observed");
-    if (expected === undefined || observed === undefined) continue;
+    if (expected === undefined || observed === undefined) {
+      // Neither side named is the dormant case and belongs to the null above.
+      // One side named is a rung this projection could not turn into a pair.
+      if (expected !== undefined || observed !== undefined) halfNamed += 1;
+      continue;
+    }
     pairs.push({
       kind: parsed.values.get("drift") ?? finding.kind ?? "unknown",
       expected,
       observed,
     });
+  }
+
+  if (halfNamed > 0) {
+    notes.push(
+      `${halfNamed} join ${plural(halfNamed, "step", "steps")} named one side of the difference and not the other, so ${plural(halfNamed, "it was", "they were")} not read as a difference. A null discrepancy here does not state that nothing was observed.`,
+    );
   }
 
   const first = pairs[0];

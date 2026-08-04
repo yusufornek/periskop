@@ -183,6 +183,57 @@ test("an answer to a request that is no longer waiting is reported", async () =>
   }
 });
 
+test("a message past the length limit is reported rather than parsed", async () => {
+  // Nothing bounded the length of a line, so an engine that sent one without an
+  // end handed unbounded work to JSON.parse, to the projection and to the
+  // caller's context. The limit is an option so that the bound can be exercised
+  // without moving sixteen megabytes through a pipe.
+  const binary = fakeEngine(`
+const { createInterface } = require("node:readline");
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  process.stdout.write(JSON.stringify({
+    jsonrpc: "2.0",
+    id: request.id,
+    result: { ok: true, filler: "x".repeat(4096) },
+  }) + "\\n");
+});
+`);
+  const seen: string[] = [];
+  const engine = new EngineBridge({
+    binary,
+    timeoutMs: 800,
+    maxMessageChars: 512,
+    onDiagnostic: (m) => seen.push(m),
+  });
+
+  try {
+    // The over long answer is not delivered, so this request goes unanswered and
+    // fails on the timeout. What it must not do is come back as a result.
+    await assert.rejects(() => engine.call("ping"), /did not answer within/);
+    assert.match(seen.join(" "), /past the 512 character limit/);
+    // The failure carries the reason, rather than leaving the caller with a bare
+    // timeout for an engine that did answer.
+    await assert.rejects(() => engine.call("ping"), /past the 512 character limit/);
+  } finally {
+    await engine.close();
+  }
+});
+
+test("a message inside the limit is delivered as before", async () => {
+  // The bound must not become a limit on real answers.
+  const binary = fakeEngine(
+    answersWith(`{ jsonrpc: "2.0", id: request.id, result: { ok: true } }`),
+  );
+  const engine = new EngineBridge({ binary, timeoutMs: 3000, maxMessageChars: 512 });
+
+  try {
+    assert.deepEqual(await engine.call("ping"), { ok: true });
+  } finally {
+    await engine.close();
+  }
+});
+
 test("a timeout says what the engine printed on stderr", async () => {
   // The engine had already explained itself. The caller waited two minutes and
   // was told only that nobody answered.

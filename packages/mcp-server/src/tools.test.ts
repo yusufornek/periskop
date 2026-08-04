@@ -10,16 +10,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { ReportSource } from "./bridge.js";
-import { SENSOR_NOT_RUNNING, SENSOR_RUNNING, UNKNOWN } from "./sources.js";
+import type { Coverage, Finding, ScanReport } from "./report.js";
 import {
-  getCoverage,
-  getDetail,
-  runScan,
-  scanInput,
-  type Coverage,
-  type Finding,
-  type ScanReport,
-} from "./tools.js";
+  HOOKS_INSTRUMENTED,
+  HOOKS_NOT_INSTRUMENTED,
+  SENSOR_NOT_RUNNING,
+  SENSOR_RUNNING,
+  UNKNOWN,
+} from "./sources.js";
+import { getCoverage, getDetail, runScan, scanInput } from "./tools.js";
 
 /**
  * The shape of a scan answer, named once because seven tests read it.
@@ -63,13 +62,18 @@ function fullCoverage(overrides: Partial<Coverage> = {}): Coverage {
   };
 }
 
-/** A statement from an engine that predates the observation fields. */
+/**
+ * A statement from an engine that predates the observation fields.
+ *
+ * `runtime_coverage` is left out rather than set to an empty list, because those
+ * are two different reports and the server owes them two different answers: one
+ * never carried the field, the other named no language.
+ */
 function olderCoverage(): Coverage {
   return {
     parsed_files: 42,
     unparsed_files: [],
     undetected_libraries: [],
-    runtime_coverage: [],
   };
 }
 
@@ -126,6 +130,11 @@ function source(coverage: Coverage, findings: Finding[], suspects: Finding[] = [
   return { call: () => Promise.resolve(report) };
 }
 
+/** A bridge that answers with something that is not a report at all. */
+function answering(value: unknown): ReportSource {
+  return { call: () => Promise.resolve(value) };
+}
+
 test("a scan with a network sensor does not report the sensor as absent", async () => {
   // The case the hard coded false was wrong about. A run that watched the wire
   // and a run that never looked produced the same answer, and the second is the
@@ -153,6 +162,66 @@ test("the summary says how many sources fed the run", async () => {
   })) as { summary: { reconciliation_mode: string } };
 
   assert.equal(result.summary.reconciliation_mode, "full");
+});
+
+test("a run with a hook attached says the hooks were instrumented", async () => {
+  // The first of the three states the boolean could hold, and the only one it
+  // ever got right.
+  const result = (await runScan(source(fullCoverage(), [declared("fnd_0000000000001001")]), {
+    path: ".",
+  })) as { coverage: { runtime_hooks: string } };
+
+  assert.equal(result.coverage.runtime_hooks, HOOKS_INSTRUMENTED);
+});
+
+test("a run whose languages all report no hook says the hooks were not attached", async () => {
+  // The second state. Both statuses mean no hook ran, and the report named the
+  // languages, so this is a claim the report actually supports.
+  const noHooks = fullCoverage({
+    runtime_coverage: [
+      { language: "python", status: "not_instrumented" },
+      { language: "go", status: "unsupported" },
+    ],
+  });
+
+  const result = (await runScan(source(noHooks, [declared("fnd_0000000000001002")]), {
+    path: ".",
+  })) as { coverage: { runtime_hooks: string } };
+
+  assert.equal(result.coverage.runtime_hooks, HOOKS_NOT_INSTRUMENTED);
+});
+
+test("a report that names no language says unknown, not that the hooks were absent", async () => {
+  // The third state, and the one the boolean could not hold. `some()` over a
+  // list that is empty or was never sent answers false, and false was published
+  // as "the hooks were not attached": a claim about the reader's machine made
+  // out of a list this server never received. It is the same substitution the
+  // sensor field made one line below, and it is worse here, because an unhooked
+  // run is the explanation a reader reaches for when a flow went unmatched.
+  const named = fullCoverage({ runtime_coverage: [] });
+  const empty = (await runScan(source(named, [declared("fnd_0000000000001003")]), {
+    path: ".",
+  })) as { coverage: { runtime_hooks: string } };
+  const absent = (await runScan(source(olderCoverage(), [declared("fnd_0000000000001004")]), {
+    path: ".",
+  })) as { coverage: { runtime_hooks: string } };
+
+  assert.equal(empty.coverage.runtime_hooks, UNKNOWN);
+  assert.equal(absent.coverage.runtime_hooks, UNKNOWN);
+  // The distinction the three states exist for: unknown must not be spelled the
+  // way a report that stated no hooks would be.
+  assert.notEqual(empty.coverage.runtime_hooks, HOOKS_NOT_INSTRUMENTED);
+  assert.notEqual(absent.coverage.runtime_hooks, HOOKS_NOT_INSTRUMENTED);
+});
+
+test("the coverage tool keeps null for a runtime list the report never sent", async () => {
+  // An empty array here would read as "every language was checked and none was
+  // hooked", which is the sentence the summary field refuses to write.
+  const result = (await getCoverage(source(olderCoverage(), []), { path: "." })) as {
+    runtime_coverage: unknown;
+  };
+
+  assert.equal(result.runtime_coverage, null);
 });
 
 test("unmatched wire traffic is counted apart from the confidence totals", async () => {
@@ -323,7 +392,13 @@ test("the two lists never share a page", async () => {
     confirmed.findings.map((f) => f.finding_id),
     ["fnd_0000000000000201", "fnd_0000000000000202"],
   );
-  assert.ok(confirmed.findings.every((f) => f.confidence === "confirmed"));
+  // Written out rather than as `every(...)`, which passes on an empty page and
+  // on a page whose rows lost the field: both are exactly the states this test
+  // is here to catch, and both used to satisfy it.
+  assert.deepEqual(
+    confirmed.findings.map((f) => f.confidence),
+    ["confirmed", "confirmed"],
+  );
 
   const suspect = (await runScan(reports, {
     path: ".",
@@ -333,8 +408,158 @@ test("the two lists never share a page", async () => {
     suspect.findings.map((f) => f.finding_id),
     ["fnd_0000000000000203"],
   );
-  assert.ok(suspect.findings.every((f) => f.confidence === "suspect"));
+  assert.deepEqual(
+    suspect.findings.map((f) => f.confidence),
+    ["suspect"],
+  );
 });
+
+test("a report that contradicts itself about a finding's confidence says so", async () => {
+  // The two lists and the per finding field state the same thing twice, and
+  // nothing checked that they agree. A finding the engine labelled suspect,
+  // sitting in the confirmed list, was paged under confidence: confirmed and
+  // read as something the engine had proved.
+  const mislabelled: Finding = { ...declared("fnd_0000000000001101"), confidence: "suspect" };
+  const reports = source(fullCoverage(), [declared("fnd_0000000000001102"), mislabelled]);
+
+  const result = (await runScan(reports, { path: "." })) as ScanAnswer & {
+    coverage_note: string | null;
+  };
+
+  // The row is returned as the engine sent it, rather than being corrected or
+  // dropped: this server does not know which half of the report is wrong.
+  assert.deepEqual(
+    result.findings.map((f) => f.confidence),
+    ["confirmed", "suspect"],
+  );
+  assert.match(result.coverage_note ?? "", /1 of the 2 findings in the confirmed list/);
+});
+
+test("a report that agrees with itself carries no note", async () => {
+  // A note on every answer stops being read.
+  const result = (await runScan(
+    source(fullCoverage(), [declared("fnd_0000000000001201")], [suspected("fnd_0000000000001202")]),
+    { path: "." },
+  )) as { coverage_note: string | null };
+
+  assert.equal(result.coverage_note, null);
+});
+
+test("a finding with no span is not given line 1", async () => {
+  // The default put `src/app.py:1` in front of a reader who opened the file at
+  // the import block, found nothing that could have produced the finding and
+  // concluded the detector was broken. Nothing in the answer said the line was
+  // this server's invention.
+  const spanless: Finding = {
+    finding_id: "fnd_0000000000001301",
+    provider_ref: "openai",
+    confidence: "confirmed",
+    detector: { rule_id: "py.openai.chat_completions" },
+    kind: "declared_egress_point",
+    source: "declared",
+    location: { path: "src/app.py" },
+  };
+  const pathless: Finding = { ...spanless, finding_id: "fnd_0000000000001302" };
+  delete pathless.location;
+
+  const result = (await runScan(source(fullCoverage(), [spanless, pathless]), {
+    path: ".",
+  })) as { findings: Array<{ location: string | null }> };
+
+  // The file is still named, because the report carried it. The line is not,
+  // because the report did not.
+  assert.equal(result.findings[0]?.location, "src/app.py");
+  assert.notEqual(result.findings[0]?.location, "src/app.py:1");
+  // A finding with no path at all keeps its null: there is nothing to open.
+  assert.equal(result.findings[1]?.location, null);
+});
+
+test("a finding that states its line still carries it", async () => {
+  const result = (await runScan(source(fullCoverage(), [declared("fnd_0000000000001401")]), {
+    path: ".",
+  })) as { findings: Array<{ location: string | null }> };
+
+  assert.equal(result.findings[0]?.location, "src/summarize.py:42");
+});
+
+test("an engine answer that is not a report is an envelope, not a thrown TypeError", async () => {
+  // `as ScanReport` checks nothing at run time, so each of these reached the
+  // projection and failed inside it. The caller received a crash naming a line
+  // in this server rather than an error naming the answer that caused it.
+  const answers: Array<[string, unknown]> = [
+    ["a different result shape", { result: "ok" }],
+    ["a null findings list", { ...scanReportFixture(), findings: null }],
+    ["no coverage statement", { ...scanReportFixture(), coverage: undefined }],
+    ["not an object at all", "scan complete"],
+    ["nothing", null],
+  ];
+
+  for (const [name, answer] of answers) {
+    const scan = (await runScan(answering(answer), { path: "." })) as {
+      error?: { code: string; message: string; retryable: boolean };
+    };
+    assert.equal(scan.error?.code, "CORE_UNAVAILABLE", name);
+    assert.equal(scan.error?.retryable, false, name);
+    // The answer says what was wrong with it, not just that something was.
+    assert.match(scan.error?.message ?? "", /cannot read as a scan report/, name);
+
+    const detail = (await getDetail(answering(answer), {
+      path: ".",
+      finding_id: "fnd_0000000000000001",
+    })) as { error?: { code: string } };
+    assert.equal(detail.error?.code, "CORE_UNAVAILABLE", name);
+
+    const coverage = (await getCoverage(answering(answer), { path: "." })) as {
+      error?: { code: string };
+    };
+    assert.equal(coverage.error?.code, "CORE_UNAVAILABLE", name);
+  }
+});
+
+test("a stale identifier is refused in the same envelope as every other failure", async () => {
+  // One tool answering with two shapes of error, an object here and a bare
+  // string there, is a caller writing two checks and forgetting the second.
+  const result = (await getDetail(source(fullCoverage(), [declared("fnd_0000000000001601")]), {
+    path: ".",
+    finding_id: "fnd_ffffffffffffffff",
+  })) as { error?: { code: string; message: string; retryable: boolean } };
+
+  assert.equal(result.error?.code, "FINDING_NOT_FOUND");
+  assert.equal(result.error?.retryable, false);
+  // Why it is stale, rather than only that it is: content addressed identifiers
+  // move when the code moves.
+  assert.match(result.error?.message ?? "", /rescan if the code changed/);
+});
+
+test("a finding whose fields are the wrong type is refused rather than half read", async () => {
+  // Dropping the row instead would be the silent loss the check exists to
+  // prevent: a scan that reported one finding fewer than the engine found, with
+  // nothing in the answer saying so.
+  const broken = {
+    ...scanReportFixture(),
+    findings: [{ finding_id: "fnd_0000000000001501", provider_ref: "openai", confidence: 3 }],
+  };
+
+  const result = (await runScan(answering(broken), { path: "." })) as {
+    error?: { code: string; message: string };
+  };
+
+  assert.equal(result.error?.code, "CORE_UNAVAILABLE");
+  // Which field, so the reader can tell an old engine from a broken one.
+  assert.match(result.error?.message ?? "", /findings\.0\.confidence/);
+});
+
+/** A report that would pass, so that a test can spoil exactly one thing about it. */
+function scanReportFixture(): ScanReport {
+  return {
+    report_id: "rpt_0000000000000001",
+    scan_run_id: "scan_0000000000000001",
+    verdict: "PASS",
+    findings: [],
+    suspect_findings: [],
+    coverage: fullCoverage(),
+  };
+}
 
 test("a page says which list it came from", async () => {
   // A reader who cannot see which list a page is has to infer it from the rows,

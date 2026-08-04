@@ -25,7 +25,8 @@ import {
   trace,
   traceReconciliation,
 } from "./reconciliation.js";
-import { runScan, type Finding, type ScanReport } from "./tools.js";
+import type { Finding, ScanReport } from "./report.js";
+import { runScan } from "./tools.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "../../..");
@@ -248,6 +249,123 @@ test("a dormant point has no difference to report", async () => {
     result.contributing_sources.map((entry) => entry.source),
     ["declared"],
   );
+});
+
+test("a finding that lost its refs and evidence reports the loss, not an empty join", async () => {
+  // Both lists defaulted to empty, and the answer that came out said two things
+  // that cannot be true of a reconciled finding: no source contributed to it,
+  // and nothing was left out of this response. A finding is reconciled because a
+  // join tied at least two records together, so zero of either is a report of
+  // this projection's own blindness written in the words of a fact.
+  const stripped = drift();
+  delete stripped.refs;
+  delete stripped.evidence;
+
+  const result = trace(stripped, DEFAULT_TRACE_DEPTH) as {
+    join_path: unknown;
+    contributing_sources: unknown;
+    coverage_note: string | null;
+  };
+
+  assert.equal(result.contributing_sources, null);
+  assert.equal(result.join_path, null);
+  assert.match(result.coverage_note ?? "", /no refs field/);
+  assert.match(result.coverage_note ?? "", /no evidence field/);
+});
+
+test("empty lists are reported too, and are named as empty rather than absent", async () => {
+  // The other half of the same loss. A field that arrived empty and a field that
+  // never arrived are two different reports, and the note says which one this
+  // was so the reader knows whether to look at the engine or at its version.
+  const emptied = drift({ refs: [], evidence: [] });
+
+  const result = trace(emptied, DEFAULT_TRACE_DEPTH) as {
+    contributing_sources: unknown;
+    coverage_note: string | null;
+  };
+
+  assert.equal(result.contributing_sources, null);
+  assert.match(result.coverage_note ?? "", /an empty refs list/);
+  assert.match(result.coverage_note ?? "", /an empty evidence list/);
+});
+
+test("a join step that names one side of the difference is not dropped in silence", async () => {
+  // Dropping it produced discrepancy: null, and null is the dormant answer:
+  // nothing was observed. This rung says something was observed and names it.
+  // The reader was handed the reverse of what the engine found.
+  const halfNamed = drift({
+    evidence: [
+      {
+        evidence_type: "reconciliation_join",
+        ref: "J2:target_only observed=llm-gateway.internal:443 drift=host_changed",
+      },
+    ],
+  });
+
+  const result = trace(halfNamed, DEFAULT_TRACE_DEPTH) as {
+    discrepancy: unknown;
+    coverage_note: string | null;
+  };
+
+  assert.equal(result.discrepancy, null);
+  assert.match(result.coverage_note ?? "", /named one side of the difference/);
+  // The sentence the null must not be read as, said out loud.
+  assert.match(result.coverage_note ?? "", /does not state that nothing was observed/);
+});
+
+test("a rung that names neither side stays silent, because that is the dormant case", async () => {
+  // The note above must not appear here, or it appears on every dormant point
+  // and stops being read.
+  const dormant = drift({
+    evidence: [
+      {
+        evidence_type: "reconciliation_join",
+        ref: "J2:none observation_window_ms=3600000 observed_calls=0",
+      },
+    ],
+  });
+
+  const result = trace(dormant, DEFAULT_TRACE_DEPTH) as {
+    discrepancy: unknown;
+    coverage_note: string | null;
+  };
+
+  assert.equal(result.discrepancy, null);
+  assert.doesNotMatch(result.coverage_note ?? "", /named one side of the difference/);
+});
+
+test("an outcome named after an Object member is unrecognised, not inherited", async () => {
+  // A plain index reaches the prototype chain, so the key list for outcome
+  // `constructor` was Object's constructor function: a truthy answer, so the
+  // step was reported as recognised and its key fields came out of the
+  // language's own object rather than out of the engine's join.
+  const inherited = drift({
+    refs: [{ ref_type: "constructor", ref_id: "ep_0000000000000001" }],
+    evidence: [{ evidence_type: "reconciliation_join", ref: "J2:constructor declared=a observed=b" }],
+  });
+
+  const result = trace(inherited, DEFAULT_TRACE_DEPTH) as {
+    join_path: Array<{ outcome: string; key_fields: unknown }>;
+    contributing_sources: unknown;
+    coverage_note: string | null;
+  };
+
+  assert.deepEqual(result.join_path[0]?.key_fields, []);
+  assert.match(result.coverage_note ?? "", /not one this server has a key list for/);
+  // The same lookup on the reference side: `constructor` is not a source.
+  assert.equal(result.contributing_sources, null);
+  assert.match(result.coverage_note ?? "", /not mapped to a source/);
+});
+
+test("an engine answer that is not a report is an envelope, not a thrown TypeError", async () => {
+  const result = (await traceReconciliation({ call: () => Promise.resolve({ result: "ok" }) }, {
+    path: ".",
+    finding_id: "fnd_7c1e4a90b3d25f61",
+  })) as { error?: { code: string; message: string; retryable: boolean } };
+
+  assert.equal(result.error?.code, "CORE_UNAVAILABLE");
+  assert.equal(result.error?.retryable, false);
+  assert.match(result.error?.message ?? "", /cannot read as a scan report/);
 });
 
 test("a real scan's findings are turned away with the contract's code", { skip: !available }, async () => {

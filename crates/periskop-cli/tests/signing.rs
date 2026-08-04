@@ -540,6 +540,258 @@ fn a_replaced_private_key_is_narrowed_rather_than_inheriting_old_permissions() {
 
 #[cfg(unix)]
 #[test]
+fn key_generation_refuses_to_write_through_a_symbolic_link() {
+    // Live behaviour this closes: with `link.key` pointing at `victim.txt`, the
+    // private key was written into `victim.txt` and the command exited zero. The
+    // key was not leaked, since the file was narrowed to its owner on the way,
+    // but a file nobody named was destroyed, and the README's promise that a key
+    // goes only where you put it was not true of the file it landed in.
+    let scratch = Scratch::new("keygen-symlink");
+    let victim = scratch.path("victim.txt");
+    let link = scratch.path("link.key");
+    let public = scratch.path("k.public");
+    std::fs::write(&victim, "data somebody needs\n").unwrap();
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+    for force in [vec![], vec!["--force"]] {
+        let mut args = vec![
+            "key",
+            "generate",
+            "--secret-key",
+            link.to_str().unwrap(),
+            "--public-key",
+            public.to_str().unwrap(),
+        ];
+        args.extend(force);
+        let outcome = run(&args);
+        assert_eq!(outcome.code, ERROR, "{}", outcome.stderr);
+    }
+
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "data somebody needs\n"
+    );
+    assert!(std::fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
+fn key_generation_refuses_to_put_both_halves_in_one_file() {
+    // The worst shape a failure can take: `--secret-key P --public-key P
+    // --force` exited zero, printed both paths, and left P holding the public
+    // key alone. The private key existed for the length of one write and then
+    // nothing on the machine had a copy of it.
+    let scratch = Scratch::new("keygen-one-path");
+    let both = scratch.path("P");
+
+    for force in [vec![], vec!["--force"]] {
+        let mut args = vec![
+            "key",
+            "generate",
+            "--secret-key",
+            both.to_str().unwrap(),
+            "--public-key",
+            both.to_str().unwrap(),
+        ];
+        args.extend(force);
+        let outcome = run(&args);
+        assert_eq!(outcome.code, ERROR, "{}", outcome.stderr);
+        assert!(!both.exists(), "a file was written anyway");
+    }
+}
+
+#[test]
+fn key_generation_refuses_two_spellings_of_one_path() {
+    // `k` and `./k` are one file, and a check that compared the strings would
+    // have let the second spelling through into the same loss.
+    let scratch = Scratch::new("keygen-one-path-spelled-twice");
+    let plain = scratch.path("k");
+    let dotted = scratch.path("./k");
+
+    let outcome = run(&[
+        "key",
+        "generate",
+        "--secret-key",
+        plain.to_str().unwrap(),
+        "--public-key",
+        dotted.to_str().unwrap(),
+        "--force",
+    ]);
+    assert_eq!(outcome.code, ERROR, "{}", outcome.stderr);
+    assert!(!plain.exists(), "a file was written anyway");
+}
+
+#[cfg(unix)]
+#[test]
+fn signing_refuses_a_key_file_the_rest_of_the_machine_can_read() {
+    // A key anybody on the box can read is a key whose copies are unaccounted
+    // for. `key generate` never produces one, so a key file in this state was
+    // either not written here or was widened afterwards, and both are worth
+    // stopping for rather than signing under.
+    use std::os::unix::fs::PermissionsExt as _;
+    let scratch = Scratch::new("lax-key-mode");
+    let (secret, _public) = scratch.key_pair("k");
+    let report = scratch.report("scan.report.json", "PASS");
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let outcome = sign(&report, &secret);
+    assert_eq!(outcome.code, ERROR, "{}", outcome.stderr);
+    assert!(outcome.stderr.contains("chmod 600"), "{}", outcome.stderr);
+    assert!(!envelope_of(&report).exists());
+
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(sign(&report, &secret).code, PASS);
+}
+
+#[test]
+fn signing_refuses_to_write_the_envelope_over_the_report() {
+    // `--out <the report> --force` wrote the envelope over the document it
+    // attests to and exited zero. The signed bytes were gone, and what was left
+    // was a signature describing a file that no longer existed.
+    let scratch = Scratch::new("out-over-report");
+    let (secret, _public) = scratch.key_pair("k");
+    let report = scratch.report("scan.report.json", "PASS");
+    let before = std::fs::read(&report).unwrap();
+
+    let outcome = run(&[
+        "sign",
+        "--report",
+        report.to_str().unwrap(),
+        "--key",
+        secret.to_str().unwrap(),
+        "--out",
+        report.to_str().unwrap(),
+        "--force",
+    ]);
+    assert_eq!(outcome.code, ERROR, "{}", outcome.stderr);
+    assert_eq!(std::fs::read(&report).unwrap(), before);
+}
+
+#[test]
+fn signing_refuses_to_write_the_envelope_over_the_signing_key() {
+    let scratch = Scratch::new("out-over-key");
+    let (secret, _public) = scratch.key_pair("k");
+    let report = scratch.report("scan.report.json", "PASS");
+    let before = std::fs::read(&secret).unwrap();
+
+    let outcome = run(&[
+        "sign",
+        "--report",
+        report.to_str().unwrap(),
+        "--key",
+        secret.to_str().unwrap(),
+        "--out",
+        secret.to_str().unwrap(),
+        "--force",
+    ]);
+    assert_eq!(outcome.code, ERROR, "{}", outcome.stderr);
+    assert_eq!(std::fs::read(&secret).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn signing_refuses_to_write_the_envelope_through_a_symbolic_link() {
+    let scratch = Scratch::new("out-symlink");
+    let (secret, _public) = scratch.key_pair("k");
+    let report = scratch.report("scan.report.json", "PASS");
+    let victim = scratch.path("victim.txt");
+    let link = scratch.path("out.sig.json");
+    std::fs::write(&victim, "data somebody needs\n").unwrap();
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+    let outcome = run(&[
+        "sign",
+        "--report",
+        report.to_str().unwrap(),
+        "--key",
+        secret.to_str().unwrap(),
+        "--out",
+        link.to_str().unwrap(),
+        "--force",
+    ]);
+    assert_eq!(outcome.code, ERROR, "{}", outcome.stderr);
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "data somebody needs\n"
+    );
+}
+
+#[test]
+fn a_timestamp_the_verifier_would_refuse_is_never_signed() {
+    // The command used to accept any text at all here, exit zero, and leave an
+    // envelope that its own `verify` rejects. The reader of the report then sees
+    // a signature that does not hold, which is what tampering looks like.
+    let scratch = Scratch::new("bad-timestamp");
+    let (secret, _public) = scratch.key_pair("k");
+    let report = scratch.report("scan.report.json", "PASS");
+
+    let outcome = run(&[
+        "sign",
+        "--report",
+        report.to_str().unwrap(),
+        "--key",
+        secret.to_str().unwrap(),
+        "--signed-at",
+        "yesterday, probably",
+    ]);
+    assert_eq!(outcome.code, ERROR, "{}", outcome.stdout);
+    assert!(outcome.stderr.contains("signed_at"), "{}", outcome.stderr);
+    assert!(!envelope_of(&report).exists());
+}
+
+#[test]
+fn a_timestamp_the_verifier_accepts_signs_and_verifies() {
+    // The other half of the rule, so the fix above is a refusal of what is
+    // wrong rather than a refusal of the flag.
+    let scratch = Scratch::new("good-timestamp");
+    let (secret, public) = scratch.key_pair("k");
+    let report = scratch.report("scan.report.json", "PASS");
+
+    let signed = run(&[
+        "sign",
+        "--report",
+        report.to_str().unwrap(),
+        "--key",
+        secret.to_str().unwrap(),
+        "--signed-at",
+        "2026-08-04T09:00:00Z",
+    ]);
+    assert_eq!(signed.code, PASS, "{}", signed.stderr);
+    let verified = verify(&report, &public);
+    assert_eq!(verified.code, PASS, "{}", verified.stderr);
+}
+
+#[test]
+fn a_signature_path_that_is_not_there_is_an_error_rather_than_a_verdict() {
+    // A caller who named `--signature` and mistyped it asked a question that
+    // never reached a signature. Reported as `1`, a pipeline reads it as "this
+    // report is not trustworthy", and the report was never the problem.
+    let scratch = Scratch::new("mistyped-signature");
+    let (secret, public) = scratch.key_pair("k");
+    let report = scratch.report("scan.report.json", "PASS");
+    assert_eq!(sign(&report, &secret).code, PASS);
+
+    let outcome = run(&[
+        "verify",
+        "--report",
+        report.to_str().unwrap(),
+        "--signature",
+        scratch.path("typo.sig.json").to_str().unwrap(),
+        "--public-key",
+        public.to_str().unwrap(),
+    ]);
+    assert_eq!(outcome.code, ERROR, "{}", outcome.stderr);
+
+    // The report with no envelope beside it stays a verdict, so the two are not
+    // collapsed into one answer by the fix.
+    let unsigned = scratch.report("other.report.json", "PASS");
+    assert_eq!(verify(&unsigned, &public).code, FAIL);
+}
+
+#[cfg(unix)]
+#[test]
 fn a_generated_private_key_is_not_readable_by_anyone_else() {
     use std::os::unix::fs::PermissionsExt as _;
     let scratch = Scratch::new("keygen-mode");

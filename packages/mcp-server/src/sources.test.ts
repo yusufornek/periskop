@@ -9,7 +9,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import type { Coverage, Finding } from "./report.js";
 import {
+  HOOKS_DEGRADED,
+  HOOKS_INSTRUMENTED,
+  HOOKS_NOT_INSTRUMENTED,
   SENSOR_NOT_RUNNING,
   SENSOR_RUNNING,
   UNKNOWN,
@@ -17,16 +21,21 @@ import {
   flowBuckets,
   networkSensor,
   reconciliationMode,
+  runtimeHooks,
 } from "./sources.js";
-import type { Coverage, Finding } from "./tools.js";
 
-/** A coverage statement carrying only the fields a static scan has always had. */
+/**
+ * A coverage statement carrying only the fields a static scan has always had.
+ *
+ * `runtime_coverage` is not among them. It is left out so that a test which
+ * cares about the hook state has to say which state it means, rather than
+ * inheriting an empty list that reads like an answer.
+ */
 function coverage(overrides: Partial<Coverage> = {}): Coverage {
   return {
     parsed_files: 10,
     unparsed_files: [],
     undetected_libraries: [],
-    runtime_coverage: [],
     ...overrides,
   };
 }
@@ -98,12 +107,69 @@ test("a mode this server does not know leaves the sensor unknown rather than gue
   assert.equal(networkSensor(coverage({ reconciliation_mode: "static_plus_something" })), UNKNOWN);
 });
 
-test("a pcap run with no stated platform still reports its sensor as running", () => {
+test("a pcap run whose platform class is none still reports its sensor as running", () => {
   // The engine writes sensor_platform_class none whenever the capture mechanism
   // does not identify a platform, which pcap never does. Reading the sensor
   // state off that field would report the sensor as absent on every macOS run.
-  const pcap = coverage({ reconciliation_mode: "full" });
+  // The field is set here rather than left out, so the report actually contains
+  // the trap the answer has to walk past; without it this test was the wire mode
+  // test above, written twice.
+  const pcap = coverage({ reconciliation_mode: "full", sensor_platform_class: "none" });
   assert.equal(networkSensor(pcap), SENSOR_RUNNING);
+  assert.notEqual(networkSensor(pcap), SENSOR_NOT_RUNNING);
+});
+
+test("a language with a hook attached makes the run instrumented", () => {
+  const hooked = coverage({
+    runtime_coverage: [
+      { language: "python", status: "instrumented" },
+      { language: "go", status: "unsupported" },
+    ],
+  });
+  assert.equal(runtimeHooks(hooked), HOOKS_INSTRUMENTED);
+});
+
+test("a run whose every language says no hook ran says so", () => {
+  const unhooked = coverage({
+    runtime_coverage: [
+      { language: "python", status: "not_instrumented" },
+      { language: "go", status: "unsupported" },
+    ],
+  });
+  assert.equal(runtimeHooks(unhooked), HOOKS_NOT_INSTRUMENTED);
+});
+
+test("a hook that ran partially keeps its own word", () => {
+  // Folded into instrumented it would claim coverage the report did not state;
+  // folded into not instrumented it would drop observations that exist.
+  const partial = coverage({
+    runtime_coverage: [
+      { language: "python", status: "degraded" },
+      { language: "go", status: "not_instrumented" },
+    ],
+  });
+  assert.equal(runtimeHooks(partial), HOOKS_DEGRADED);
+  assert.notEqual(runtimeHooks(partial), HOOKS_INSTRUMENTED);
+  assert.notEqual(runtimeHooks(partial), HOOKS_NOT_INSTRUMENTED);
+});
+
+test("a report that names no language leaves the hooks unknown rather than absent", () => {
+  // The two shapes that answered false under the old boolean: a list that never
+  // arrived, and a list that arrived with nothing in it. Neither says a hook
+  // failed to run, and an unhooked run is the explanation a reader reaches for
+  // when a flow went unmatched.
+  assert.equal(runtimeHooks(coverage()), UNKNOWN);
+  assert.equal(runtimeHooks(coverage({ runtime_coverage: [] })), UNKNOWN);
+  assert.notEqual(runtimeHooks(coverage()), HOOKS_NOT_INSTRUMENTED);
+});
+
+test("a hook status this server has not been taught leaves the run unknown", () => {
+  // Same rule as an unrecognised reconciliation mode: a status this server
+  // cannot place may or may not mean a hook ran, and either answer is a guess
+  // about the machine.
+  const future = coverage({ runtime_coverage: [{ language: "python", status: "sampled" }] });
+  assert.equal(runtimeHooks(future), UNKNOWN);
+  assert.notEqual(runtimeHooks(future), HOOKS_NOT_INSTRUMENTED);
 });
 
 test("the buckets are null when the report omits them, not zero", () => {

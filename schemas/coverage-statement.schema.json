@@ -149,7 +149,7 @@
     "observation_window_ms": {
       "type": "integer",
       "minimum": 0,
-      "description": "Duration only. Carries no wall clock stamp. Zero means no runtime or network observation."
+      "description": "Duration only. Carries no wall clock stamp. Zero carries two different facts this integer cannot separate: a window that was measured and came out zero, and a window that could not be measured at all because no hook stated how long it was watching. Both write 0, and only a diagnostic beside it says which happened. A zero read without the diagnostics therefore does not establish that nothing was observed."
     },
     "reconciliation_mode": {
       "enum": ["full", "static_only", "static_plus_runtime", "static_plus_wire"],

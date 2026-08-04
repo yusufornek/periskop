@@ -11,9 +11,13 @@
 //! unsigned report, never as a partly accepted one.
 //!
 //! `2` is reserved for the run that could not happen at all: an unreadable report
-//! file, an unreadable or malformed public key. The distinction is for the
-//! pipeline that has to tell "this report is not trustworthy" apart from "the
-//! check never ran", which are different incidents with different responses.
+//! file, an unreadable or malformed public key, or a `--signature` path that is
+//! not there. The last one is the distinction worth naming, because it is easy
+//! to get backwards. A report with no envelope beside it is unsigned and that is
+//! a verdict; an envelope the caller named and mistyped is a question that never
+//! reached the signature. The pipeline has to tell "this report is not
+//! trustworthy" apart from "the check never ran", which are different incidents
+//! with different responses.
 //!
 //! What a `0` does not mean is worth as much as what it means. It says the bytes
 //! came from the named key unaltered. It says nothing about whether the scan
@@ -58,12 +62,25 @@ pub fn run(args: &VerifyArgs) -> ExitCode {
         }
     };
 
+    // Whether the caller named the envelope decides what its absence means, so
+    // the two cases are kept apart here rather than collapsed into one path.
+    let named = args.signature.is_some();
     let envelope_path = args
         .signature
         .clone()
         .unwrap_or_else(|| envelope_path(&args.report));
     let envelope = match std::fs::read(&envelope_path) {
         Ok(bytes) => bytes,
+        // A path the caller typed and got wrong is a run that could not happen,
+        // which is a `2`. Reporting it as a `1` tells a pipeline the report is
+        // not trustworthy, and the report is not the thing that was wrong.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && named => {
+            eprintln!(
+                "periskop: no signature envelope at {}, which is where --signature points",
+                envelope_path.display()
+            );
+            return ExitCode::from(exit::ERROR);
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Not an error and not a pass. An unsigned report is a perfectly
             // valid report, but `verify` was asked whether this one is signed,

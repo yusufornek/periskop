@@ -7,14 +7,13 @@
 //! place". A tool that quietly leaves key material somewhere has decided, on its
 //! owner's behalf, that the owner did not need to know where the key is.
 
-use std::fs::OpenOptions;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Args;
 use zeroize::Zeroizing;
 
+use periskop_cli::write_target::{self, Existing, Restriction};
 use periskop_report::signature::{self, SigningKey};
 
 use crate::exit;
@@ -105,8 +104,23 @@ pub fn run(args: &SignArgs) -> ExitCode {
         .out
         .clone()
         .unwrap_or_else(|| envelope_path(&args.report));
-    if let Err(e) = write_file(&target, text.as_bytes(), args.force, Visibility::Public) {
-        eprintln!("periskop: cannot write {}: {e}", target.display());
+    // The envelope is a file beside the report, never one of the files the
+    // signature was made from. `--out <the report> --force` used to write the
+    // envelope over the document it attests to: the signed bytes were gone, the
+    // envelope described a file that no longer existed, and the command exited
+    // zero. The same flag aimed at the key destroys the key.
+    for (path, name) in [(&args.report, "report"), (&args.key, "signing key")] {
+        if names_one_file(&target, path) {
+            eprintln!(
+                "periskop: --out names the {name} at {}. The envelope is written beside a report, never over a file the signature is made from.",
+                path.display()
+            );
+            return ExitCode::from(exit::ERROR);
+        }
+    }
+
+    if let Err(e) = write_target::write_public(&target, text.as_bytes(), existing(args.force)) {
+        eprintln!("periskop: {e}");
         return ExitCode::from(exit::ERROR);
     }
 
@@ -126,9 +140,26 @@ pub fn run(args: &SignArgs) -> ExitCode {
 /// Both paths are checked before either file is written, so a run that would
 /// have collided does not leave half a key pair behind.
 pub fn run_key_generate(args: &KeyGenerateArgs) -> ExitCode {
+    // One file cannot hold both halves, and the failure is silent in the worst
+    // way: the second write lands on the first, the file ends up holding the
+    // public key alone, the private key is gone with no copy anywhere, and the
+    // command prints both paths and exits zero. Refused before anything is
+    // written rather than reported after.
+    if names_one_file(&args.secret_key, &args.public_key) {
+        eprintln!(
+            "periskop: --secret-key and --public-key both name {}. One file cannot hold both halves, and writing them in turn would leave the public half and lose the private key.",
+            args.secret_key.display()
+        );
+        return ExitCode::from(exit::ERROR);
+    }
+
     if !args.force {
         for path in [&args.secret_key, &args.public_key] {
-            if path.exists() {
+            // `symlink_metadata` rather than `exists`, which follows a link and
+            // answers "no" for one that dangles. The path is occupied either
+            // way, and a write there would have created the link's target
+            // instead of the file the user named.
+            if std::fs::symlink_metadata(path).is_ok() {
                 eprintln!(
                     "periskop: {} is already there. Pass --force to replace it, but read the warning first: replacing a private key makes every report signed under it unverifiable.",
                     path.display()
@@ -146,29 +177,29 @@ pub fn run_key_generate(args: &KeyGenerateArgs) -> ExitCode {
         }
     };
 
-    if let Err(e) = write_file(
+    match write_target::write_private(
         &args.secret_key,
         key.to_key_file().as_bytes(),
-        args.force,
-        Visibility::Private,
+        existing(args.force),
     ) {
-        eprintln!("periskop: cannot write {}: {e}", args.secret_key.display());
-        return ExitCode::from(exit::ERROR);
+        Ok(restriction) => report_restriction(&args.secret_key, restriction),
+        Err(e) => {
+            eprintln!("periskop: {e}");
+            return ExitCode::from(exit::ERROR);
+        }
     }
 
-    if let Err(e) = write_file(
+    if let Err(e) = write_target::write_public(
         &args.public_key,
         key.verifying_key().to_key_file().as_bytes(),
-        args.force,
-        Visibility::Public,
+        existing(args.force),
     ) {
         // Said out loud rather than cleaned up silently. Deleting the private key
         // that was just written would be the tidy answer and the wrong one: if
         // the delete also failed, the user would be told nothing about a key
         // sitting on their disk.
         eprintln!(
-            "periskop: cannot write {}: {e}\n  → the private key was already written to {}. Delete it yourself if you are starting over.",
-            args.public_key.display(),
+            "periskop: {e}\n  → the private key was already written to {}. Delete it yourself if you are starting over.",
             args.secret_key.display()
         );
         return ExitCode::from(exit::ERROR);
@@ -204,6 +235,7 @@ pub fn envelope_path(report: &Path) -> PathBuf {
 
 /// Reads a private key file, keeping the text in a buffer that clears itself.
 fn read_signing_key(path: &Path) -> Result<SigningKey, ExitCode> {
+    refuse_a_widely_readable_key(path)?;
     let text = match std::fs::read_to_string(path) {
         Ok(text) => Zeroizing::new(text),
         Err(e) => {
@@ -226,52 +258,110 @@ fn read_signing_key(path: &Path) -> Result<SigningKey, ExitCode> {
     })
 }
 
-/// Whether a file may be read by anyone on the machine.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Visibility {
-    Private,
-    Public,
+/// Refuses a signing key the rest of the machine can read.
+///
+/// `key generate` writes a private key readable by its owner alone and narrows a
+/// replaced one to the same, so a key file anybody else can read was either not
+/// written by this command or was widened after it was. Signing with it would be
+/// signing with a key whose copies are not accounted for, and the tool whose
+/// README argues that an unprotected key is the problem cannot be the tool that
+/// uses one without a word. The rule is ssh's, and so is the reason.
+#[cfg(unix)]
+fn refuse_a_widely_readable_key(path: &Path) -> Result<(), ExitCode> {
+    use std::os::unix::fs::PermissionsExt as _;
+    // `metadata` rather than `symlink_metadata`: what gets read is the file at
+    // the end of the path, and a link's own mode bits decide nothing about who
+    // can read the key. A path that cannot be inspected at all is left to the
+    // read that follows, which has the better message for it.
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        eprintln!(
+            "periskop: {} is readable by more than its owner (mode {mode:04o}), so it is not a key this command can treat as private. Run `chmod 600` on it, or generate a key that has never been exposed.",
+            path.display()
+        );
+        return Err(ExitCode::from(exit::ERROR));
+    }
+    Ok(())
 }
 
-fn write_file(
-    path: &Path,
-    contents: &[u8],
-    force: bool,
-    visibility: Visibility,
-) -> std::io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true);
+/// Says that the key's protection went unchecked, rather than passing quietly.
+///
+/// This build reads Unix mode bits and knows no other access control, so on any
+/// other platform the question was not asked. A reader of the log is told that
+/// instead of being left to assume an answer.
+#[cfg(not(unix))]
+fn refuse_a_widely_readable_key(path: &Path) -> Result<(), ExitCode> {
+    eprintln!(
+        "periskop: who may read {} was not checked: this build reads file permissions on Unix only.",
+        path.display()
+    );
+    Ok(())
+}
+
+/// Says out loud when a private key landed somewhere its access could not be
+/// narrowed.
+///
+/// What this replaced discarded the answer, so a key written on a platform this
+/// build cannot restrict a file on looked exactly like one written where it can.
+fn report_restriction(path: &Path, restriction: Restriction) {
+    if restriction == Restriction::NotEnforceable {
+        eprintln!(
+            "periskop: {} was written without narrowing who may read it: this build sets file permissions on Unix only. Restrict it yourself before signing anything under it.",
+            path.display()
+        );
+    }
+}
+
+/// What `--force` means to a write.
+fn existing(force: bool) -> Existing {
     if force {
-        options.create(true).truncate(true);
+        Existing::Replace
     } else {
-        // `create_new` rather than a prior existence check: the check and the
-        // write would be two steps, and a file created between them would be
-        // overwritten by a command that promised not to.
-        options.create_new(true);
+        Existing::Refuse
     }
+}
 
-    #[cfg(unix)]
-    if visibility == Visibility::Private {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        // Applied at creation rather than afterwards, so a newly created key is
-        // never world readable, not even for the moment between two calls.
-        options.mode(0o600);
+/// Whether two paths lead to one file, decided before either has been written.
+///
+/// Two questions, because neither answers alone. The device and inode numbers
+/// settle the aliases, a hard link or a second name for one file, but only for
+/// paths that already exist. Making both absolute settles the spellings, `k` and
+/// `./k`, which is the ordinary case for a key that is about to be generated.
+///
+/// A link and the file it points at are correctly two files here. A write
+/// through the link is refused by `write_target`, which is the place that can
+/// refuse it without also refusing the honest case.
+fn names_one_file(one: &Path, other: &Path) -> bool {
+    if same_existing_file(one, other) {
+        return true;
     }
-    #[cfg(not(unix))]
-    let _ = visibility;
-
-    let mut file = options.open(path)?;
-
-    // `mode` above only applies to a file this call created. Under `--force` the
-    // file was already there and keeps whatever permissions it had, so a key
-    // written over a world readable file would stay world readable. Narrowed
-    // before the bytes go in, not after.
-    #[cfg(unix)]
-    if visibility == Visibility::Private {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    match (std::path::absolute(one), std::path::absolute(other)) {
+        (Ok(one), Ok(other)) => one == other,
+        // A path that cannot be made absolute is compared as it was written.
+        // Answering "different" on a comparison that failed would turn a lost
+        // answer into permission to overwrite.
+        _ => one == other,
     }
+}
 
-    file.write_all(contents)?;
-    file.sync_all()
+#[cfg(unix)]
+fn same_existing_file(one: &Path, other: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (
+        std::fs::symlink_metadata(one),
+        std::fs::symlink_metadata(other),
+    ) {
+        (Ok(one), Ok(other)) => one.dev() == other.dev() && one.ino() == other.ino(),
+        _ => false,
+    }
+}
+
+/// Without inode numbers the aliases cannot be seen, so the spelling comparison
+/// in the caller is the whole answer on this platform.
+#[cfg(not(unix))]
+fn same_existing_file(_one: &Path, _other: &Path) -> bool {
+    false
 }

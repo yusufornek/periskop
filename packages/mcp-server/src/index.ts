@@ -54,7 +54,11 @@ async function main(): Promise<void> {
         "are in the other. summary.by_provider counts findings per provider and keeps that " +
         "same split, so a provider seen only in suspected findings is still named. " +
         "On a project with no runtime hooks installed the unmatched wire " +
-        "findings are suspected, so a caller that never asks for that list never sees them.",
+        "findings are suspected, so a caller that never asks for that list never sees them. " +
+        "coverage.runtime_hooks is one of instrumented, degraded, not instrumented or unknown, " +
+        "and unknown means the report named no language rather than that no hook ran. " +
+        "coverage_note is null unless something in the answer cannot be read at face value, " +
+        "such as a report that puts a finding in one list and labels it as the other.",
       inputSchema: scanInput.shape,
     },
     async (args) => ({
@@ -115,7 +119,10 @@ async function main(): Promise<void> {
         "Returns the join steps, the contributing sources and the difference behind a finding " +
         "whose source is reconciled. Use when a finding says the code and the run disagree and " +
         "you need to see what tied the two together. Declared and observed findings have no " +
-        "reconciliation trace; get_finding_detail is what covers those.",
+        "reconciliation trace; get_finding_detail is what covers those. join_path and " +
+        "contributing_sources are null, never empty, when the finding carried nothing to read " +
+        "them from: a reconciled finding always rests on at least two records, so an empty list " +
+        "would state something that cannot be true, and coverage_note says what was missing.",
       inputSchema: traceInput.shape,
     },
     async (args) => ({

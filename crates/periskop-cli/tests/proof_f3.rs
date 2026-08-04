@@ -405,12 +405,33 @@ struct ProofEvidence {
     confidence_reason: &'static str,
 }
 
+/// Writes the artefact this gate is read through, and fails the test if it
+/// cannot.
+///
+/// The discards this replaces made the artefact worse than absent. A failed
+/// write left the previous run's `f3-proof.json` sitting in `target/` while this
+/// run reported success, so the file a reader opens to see what was proved would
+/// have been the evidence of a run that is no longer the one being described.
+/// The stale file is removed before the new one is written, for the same reason:
+/// between those two lines there must be no moment where an old artefact could
+/// be mistaken for a new one.
 fn record_outcome(record: &ProofRecord) {
     let out = repo_root().join("target/f3-proof.json");
     if let Some(parent) = out.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)
+            .unwrap_or_else(|e| panic!("{} could not be created: {e}", parent.display()));
     }
-    let _ = std::fs::write(&out, serde_json::to_string_pretty(record).unwrap());
+    match std::fs::remove_file(&out) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!(
+            "the artefact of an earlier run at {} could not be removed: {e}",
+            out.display()
+        ),
+    }
+    let text = serde_json::to_string_pretty(record).unwrap();
+    std::fs::write(&out, text)
+        .unwrap_or_else(|e| panic!("{} could not be written: {e}", out.display()));
 }
 
 const CAPTURE: &str =
