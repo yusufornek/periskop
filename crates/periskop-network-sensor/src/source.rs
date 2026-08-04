@@ -24,6 +24,8 @@
 //! the same tests on every platform in the workspace. The one visible
 //! difference is which cause an attach reports.
 
+use std::collections::BTreeMap;
+
 use crate::assemble::FlowAssembler;
 use crate::kernel::{self, KernelEvents, PlatformKernel};
 use crate::observation::Observation;
@@ -37,13 +39,32 @@ use crate::resolve::DnsObservation;
 /// mechanism inherit "DNS was fine, nothing was dropped" without ever having
 /// checked, and a coverage statement assembled out of defaults is worse than
 /// none: it reads as a measurement.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// Not `Copy`, since the rejected sample tally is a map. A copy of a tally is a
+/// tally that stops counting, and the shape it has here is the one the open
+/// request against `coverage-statement.schema.json` asks the contract for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceCoverage {
     /// Events the transport lost before user space read them.
     pub dropped_events: u64,
     /// Events that named a connection the pass never saw open.
     pub unlinked_events: u64,
     pub dns_observation: DnsObservation,
+    /// Payload samples the parsers refused, by fixed cause label.
+    ///
+    /// The connection behind such a sample was still seen; what was lost is its
+    /// destination name. A run that lost a thousand of them and one that lost
+    /// none must not read alike, which is what carrying the tally here rather
+    /// than leaving it inside the kernel object is for.
+    pub rejected_payload_samples: BTreeMap<&'static str, u64>,
+    /// Names the DNS map dropped to stay inside its address budget.
+    pub dns_names_evicted: u64,
+    /// Evictions whose address the map could no longer remember.
+    ///
+    /// While this is above zero a flow carrying no `map_overflow` reason may
+    /// still have lost a name, and the run says so rather than presenting the
+    /// per flow answers as complete.
+    pub dns_evictions_forgotten: u64,
 }
 
 /// A capture mechanism the sensor can read observations from.
@@ -135,6 +156,12 @@ impl<K: KernelEvents> FlowSource for EbpfFlowSource<K> {
             dropped_events: self.assembler.dropped_events(),
             unlinked_events: self.assembler.unlinked_events(),
             dns_observation: self.assembler.dns_observation(),
+            // Read from the kernel object rather than the assembler: a sample
+            // the parsers refused never became an event, so the assembler never
+            // saw it and only the seam knows it existed.
+            rejected_payload_samples: self.kernel.rejected_samples(),
+            dns_names_evicted: self.assembler.dns_names_evicted(),
+            dns_evictions_forgotten: self.assembler.dns_evictions_forgotten(),
         }
     }
 }
@@ -190,7 +217,7 @@ impl FlowSource for StubFlowSource {
     }
 
     fn coverage(&self) -> SourceCoverage {
-        self.coverage
+        self.coverage.clone()
     }
 }
 
@@ -199,6 +226,7 @@ impl FlowSource for StubFlowSource {
 pub(crate) struct ScriptedKernel {
     attach: Result<(), SensorUnavailable>,
     batches: Vec<kernel::KernelBatch>,
+    rejected: BTreeMap<&'static str, u64>,
     pub(crate) planned: Option<kernel::AttachPlan>,
 }
 
@@ -208,8 +236,20 @@ impl ScriptedKernel {
         Self {
             attach: Ok(()),
             batches: vec![batch],
+            rejected: BTreeMap::new(),
             planned: None,
         }
+    }
+
+    /// A kernel that also handed up samples no parser could read.
+    ///
+    /// Scriptable because the real path to this state needs the loader feature
+    /// and a machine that can hold eBPF programs, and the property under test
+    /// is on this side of the seam: what the sensor does with a count the
+    /// kernel object reports.
+    pub(crate) fn refusing_samples(mut self, cause: &'static str, count: u64) -> Self {
+        self.rejected.insert(cause, count);
+        self
     }
 }
 
@@ -229,6 +269,10 @@ impl KernelEvents for ScriptedKernel {
             return kernel::KernelBatch::quiet();
         }
         self.batches.remove(0)
+    }
+
+    fn rejected_samples(&self) -> BTreeMap<&'static str, u64> {
+        self.rejected.clone()
     }
 }
 
@@ -348,6 +392,29 @@ mod tests {
         source.attach(&grant()).unwrap();
         source.drain();
         assert_eq!(source.coverage().dropped_events, 42);
+    }
+
+    #[test]
+    fn samples_no_parser_could_read_reach_the_coverage_the_run_reports() {
+        // The gap this closes: the seam counted refused samples by cause and
+        // nothing outside its own tests could read the number, so a run where
+        // every ClientHello was unreadable reported the same coverage as a run
+        // where every destination resolved. The connections were seen either
+        // way; what differs is how many of them the report can name.
+        let mut source = EbpfFlowSource::over(
+            ScriptedKernel::yielding(connect_batch()).refusing_samples("tls_not_client_hello", 7),
+            "h_1",
+        );
+        source.attach(&grant()).unwrap();
+        source.drain();
+
+        let coverage = source.coverage();
+        assert_eq!(
+            coverage
+                .rejected_payload_samples
+                .get("tls_not_client_hello"),
+            Some(&7)
+        );
     }
 
     #[test]

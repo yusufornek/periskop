@@ -50,4 +50,15 @@ pub trait KernelEvents {
     /// facts this whole product exists to keep apart, and only the second is a
     /// measurement.
     fn poll(&mut self) -> KernelBatch;
+
+    /// Payload samples this kernel handed up that no parser could read, by
+    /// fixed cause label.
+    ///
+    /// On the trait and without a default, for the reason
+    /// [`crate::source::SourceCoverage`] has none: a default would let an
+    /// implementation inherit "nothing was refused" without having counted, and
+    /// a sample nobody could parse is a destination the run failed to name. The
+    /// tally is what carries that loss out of the seam and into the run's own
+    /// statement of what it could not do.
+    fn rejected_samples(&self) -> std::collections::BTreeMap<&'static str, u64>;
 }

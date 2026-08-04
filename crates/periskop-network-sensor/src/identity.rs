@@ -40,6 +40,30 @@
 //!
 //! The request is filed in `hub/memory/interfaces.md` against the owner of the
 //! two contract documents. Until it is answered this build follows the contract.
+//!
+//! # The network namespace, and why it is not in here
+//!
+//! `netns` is not hashed, and the cost is a collision rather than a lost trail.
+//! Two containers on one host that open the same connection key inside one time
+//! bucket receive **one** `flow_id`, and a report cannot then say there were
+//! two connections or whose volume belonged to whom.
+//!
+//! The contract is not of one mind about this, which is why the resolution is a
+//! request rather than a code change. `docs/04-contracts/flow-schema.md` fixes
+//! the derivation twice, at the `flow_id` field description and again in
+//! determinism invariant 2, and both list four inputs with no namespace among
+//! them. The same document's table of removed fields says `src_ip` was taken
+//! out because it names the machine rather than the connection, and that what
+//! it used to carry now lives in "`host_id` (stable, opaque) + `netns`
+//! (container separation)". A namespace that separates containers while sitting
+//! outside the identity separates nothing that the identity can see.
+//!
+//! The formula wins here, because it is the normative statement and the table
+//! is its rationale: a sensor that hashed a fifth field would write identities
+//! no other reader of the contract could reproduce. What this build owes
+//! instead is that the collision is measured rather than silent, and
+//! [`crate::sensor::SensorOutcome::shared_identities`] is where it is counted.
+//! The test below produces one.
 
 use periskop_core::ids::{short_hash, FlowId};
 
@@ -104,12 +128,75 @@ mod tests {
             .to_string()
     }
 
+    /// The identity fixed inputs must keep producing, pinned as a literal.
+    ///
+    /// Inputs: `h_9f2c4a17be0d5386`, `b_3f0a91c7d4e28b56`, the connection key
+    /// `54321/104.18.7.1/443/tcp` and bucket `1785834000`, under the domain tag
+    /// `fl/v1`.
+    ///
+    /// Written out rather than recomputed, following the golden vector in
+    /// `periskop-report/src/signature/key.rs`. The test this replaced compared
+    /// the function with itself and passed for every possible derivation: a
+    /// reordered field list, a changed separator, a different domain tag and a
+    /// dropped input all keep two calls agreeing with each other. Each of those
+    /// silently renames every flow in every stored report, and only a value
+    /// from outside the function can notice.
+    const GOLDEN_FLOW_ID: &str = "fl_2a9cdf9e96bdacab";
+
     #[test]
-    fn derivation_is_stable_across_calls() {
-        let tuple = five_tuple();
+    fn the_derivation_still_produces_the_identity_it_produced_before() {
         assert_eq!(
-            id("h_1", Some("b_1"), &tuple, 1_785_834_000),
-            id("h_1", Some("b_1"), &tuple, 1_785_834_000)
+            id(
+                "h_9f2c4a17be0d5386",
+                Some("b_3f0a91c7d4e28b56"),
+                &five_tuple(),
+                1_785_834_000
+            ),
+            GOLDEN_FLOW_ID,
+            "the derivation changed: every flow identity in every stored report now names a \
+             different connection, so this is a contract change and not a refactor"
+        );
+    }
+
+    #[test]
+    fn two_namespaces_on_one_host_are_given_one_identity() {
+        // Finding O6 at the derivation. The contract hashes four inputs and the
+        // namespace is not one of them, so the same connection key opened from
+        // two containers inside one bucket collapses to a single identity. The
+        // consequence is not an unreadable report but a wrong one: two
+        // connections are counted as one and one container's volume is
+        // attributed to both.
+        //
+        // Asserted as equality because that is what the contract's formula
+        // requires today. The day `netns` enters the derivation this fails and
+        // names the property that changed, which is the opposite of a collision
+        // disappearing without anyone noticing.
+        let host = Observation::new(
+            "h_9f2c4a17be0d5386",
+            1_785_834_000,
+            five_tuple(),
+            SniSource::Absent,
+        )
+        .with_boot_id("b_3f0a91c7d4e28b56")
+        .with_netns("4026531840");
+        let container = Observation::new(
+            "h_9f2c4a17be0d5386",
+            1_785_834_000,
+            five_tuple(),
+            SniSource::Absent,
+        )
+        .with_boot_id("b_3f0a91c7d4e28b56")
+        .with_netns("4026532008");
+
+        let host = Flow::from_observation(host, FlowScope::Undetermined, Mechanism::Ebpf).unwrap();
+        let container =
+            Flow::from_observation(container, FlowScope::Undetermined, Mechanism::Ebpf).unwrap();
+
+        assert_ne!(host.netns, container.netns);
+        assert_eq!(
+            host.flow_id, container.flow_id,
+            "the namespace reached the identity, so the contract request in interfaces.md can be \
+             closed and this test replaced by one asserting the separation"
         );
     }
 

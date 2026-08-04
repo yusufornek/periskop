@@ -25,7 +25,7 @@
 use crate::flow::{DegradedReason, ResolvedHostSource, SniSource};
 use crate::parse::tls::ClientHelloFacts;
 
-use super::DnsObservation;
+use super::{DnsObservation, NameMapLoss};
 
 /// What a flow may say about the name of its destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,10 +62,16 @@ impl Default for NameVerdict {
 /// `hello` is `None` when no ClientHello was seen for this flow at all, which
 /// is the ordinary case for plain TCP, for UDP, and for any connection the
 /// `tc` helper could not observe because it was never attached.
+///
+/// `name_map_loss` says whether this destination is one whose names the map had
+/// to drop. It is a separate argument rather than something read off the empty
+/// list, because an empty list is exactly what the two cases have in common and
+/// the record has to keep them apart.
 pub fn arbitrate(
     hello: Option<&ClientHelloFacts>,
     dns_names: Vec<String>,
     dns_observation: DnsObservation,
+    name_map_loss: NameMapLoss,
 ) -> NameVerdict {
     let mut verdict = NameVerdict {
         dns_names,
@@ -109,6 +115,14 @@ pub fn arbitrate(
         verdict.degraded_reasons.push(DegradedReason::EncryptedDns);
     }
 
+    if verdict.dns_names.is_empty() && name_map_loss == NameMapLoss::NamesDropped {
+        // The map knew what this address was called and threw the answer away
+        // to stay inside its budget. Without this the record would read
+        // `opaque`, which the contract defines as no name having existed, and
+        // the reader would attribute a limit of this build to the traffic.
+        verdict.degraded_reasons.push(DegradedReason::MapOverflow);
+    }
+
     verdict
 }
 
@@ -142,6 +156,7 @@ mod tests {
             Some(&hello("api.openai.com")),
             Vec::new(),
             DnsObservation::Available,
+            NameMapLoss::Intact,
         );
         assert_eq!(verdict.resolved_host.as_deref(), Some("api.openai.com"));
         assert_eq!(verdict.resolved_host_source, Some(ResolvedHostSource::Sni));
@@ -158,6 +173,7 @@ mod tests {
             Some(&hello("api.openai.com")),
             names(&["api.openai.com"]),
             DnsObservation::Available,
+            NameMapLoss::Intact,
         );
         assert_eq!(
             verdict.resolved_host_source,
@@ -174,6 +190,7 @@ mod tests {
             Some(&hello("api.openai.com")),
             names(&["edge.cdn.example"]),
             DnsObservation::Available,
+            NameMapLoss::Intact,
         );
         assert_eq!(verdict.resolved_host.as_deref(), Some("api.openai.com"));
         assert_eq!(verdict.resolved_host_source, Some(ResolvedHostSource::Sni));
@@ -192,6 +209,7 @@ mod tests {
             Some(&hello("api.openai.com")),
             names(&["a.cdn.example", "b.cdn.example"]),
             DnsObservation::Available,
+            NameMapLoss::Intact,
         );
         assert_eq!(verdict.sni.as_deref(), Some("api.openai.com"));
         assert_eq!(verdict.dns_names.len(), 2);
@@ -206,6 +224,7 @@ mod tests {
             Some(&hello("api.openai.com")),
             names(&["api.openai.com", "edge.cdn.example"]),
             DnsObservation::Available,
+            NameMapLoss::Intact,
         );
         assert_eq!(
             verdict.resolved_host_source,
@@ -222,6 +241,7 @@ mod tests {
             Some(&ClientHelloFacts::Encrypted),
             Vec::new(),
             DnsObservation::Available,
+            NameMapLoss::Intact,
         );
         assert_eq!(verdict.sni_source, SniSource::EncryptedClientHello);
         assert_eq!(verdict.sni, None);
@@ -239,6 +259,7 @@ mod tests {
             Some(&ClientHelloFacts::Encrypted),
             names(&["edge.cdn.example"]),
             DnsObservation::Available,
+            NameMapLoss::Intact,
         );
         assert_eq!(verdict.resolved_host, None);
         assert_eq!(verdict.dns_names, names(&["edge.cdn.example"]));
@@ -246,7 +267,12 @@ mod tests {
 
     #[test]
     fn without_a_handshake_the_dns_map_names_the_destination() {
-        let verdict = arbitrate(None, names(&["api.openai.com"]), DnsObservation::Available);
+        let verdict = arbitrate(
+            None,
+            names(&["api.openai.com"]),
+            DnsObservation::Available,
+            NameMapLoss::Intact,
+        );
         assert_eq!(verdict.resolved_host.as_deref(), Some("api.openai.com"));
         assert_eq!(verdict.resolved_host_source, Some(ResolvedHostSource::Dns));
         assert_eq!(verdict.sni_source, SniSource::Absent);
@@ -259,6 +285,7 @@ mod tests {
             Some(&ClientHelloFacts::NoServerName),
             Vec::new(),
             DnsObservation::Available,
+            NameMapLoss::Intact,
         );
         assert_eq!(verdict.sni_source, SniSource::Absent);
         assert!(!verdict.degraded_reasons.contains(&DegradedReason::Ech));
@@ -272,11 +299,13 @@ mod tests {
             None,
             names(&["b.example", "a.example"]),
             DnsObservation::Available,
+            NameMapLoss::Intact,
         );
         let backwards = arbitrate(
             None,
             names(&["a.example", "b.example"]),
             DnsObservation::Available,
+            NameMapLoss::Intact,
         );
         assert_eq!(forwards.resolved_host.as_deref(), Some("a.example"));
         assert_eq!(forwards.resolved_host, backwards.resolved_host);
@@ -286,7 +315,12 @@ mod tests {
     fn nothing_readable_at_all_leaves_the_destination_unnamed() {
         // Which the record turns into `opaque`, the line of the report that
         // matters most. It must not be reachable by accident.
-        let verdict = arbitrate(None, Vec::new(), DnsObservation::Available);
+        let verdict = arbitrate(
+            None,
+            Vec::new(),
+            DnsObservation::Available,
+            NameMapLoss::Intact,
+        );
         assert_eq!(verdict.resolved_host, None);
         assert_eq!(verdict.resolved_host_source, None);
         assert_eq!(verdict.sni_source, SniSource::Absent);
@@ -297,8 +331,67 @@ mod tests {
     fn an_encrypted_resolver_is_named_as_the_reason_the_map_was_empty() {
         // Otherwise an unresolved destination and a destination nobody looked
         // up read identically.
-        let verdict = arbitrate(None, Vec::new(), DnsObservation::UnavailableEncryptedDns);
+        let verdict = arbitrate(
+            None,
+            Vec::new(),
+            DnsObservation::UnavailableEncryptedDns,
+            NameMapLoss::Intact,
+        );
         assert_eq!(verdict.degraded_reasons, vec![DegradedReason::EncryptedDns]);
+    }
+
+    #[test]
+    fn a_name_the_map_dropped_is_declared_instead_of_reported_as_no_name() {
+        // The substitution this product exists to refuse. The map knew what
+        // this address was called and evicted the answer to stay inside its
+        // address budget; the flow that follows resolves nothing and is written
+        // `opaque`, which the contract defines as "there was never a name to
+        // look at". Without the reason beside it the reader takes a limit of
+        // this build for a property of the traffic.
+        let verdict = arbitrate(
+            None,
+            Vec::new(),
+            DnsObservation::Available,
+            NameMapLoss::NamesDropped,
+        );
+        assert_eq!(verdict.resolved_host, None);
+        assert_eq!(verdict.degraded_reasons, vec![DegradedReason::MapOverflow]);
+    }
+
+    #[test]
+    fn an_overflowing_map_is_not_blamed_where_a_name_did_survive() {
+        // The address lost one of its names and kept another. The record
+        // carries the name it has, and claiming a loss beside it would make the
+        // value meaningless through noise.
+        let verdict = arbitrate(
+            None,
+            names(&["api.openai.com"]),
+            DnsObservation::Available,
+            NameMapLoss::NamesDropped,
+        );
+        assert_eq!(verdict.resolved_host.as_deref(), Some("api.openai.com"));
+        assert!(!verdict
+            .degraded_reasons
+            .contains(&DegradedReason::MapOverflow));
+    }
+
+    #[test]
+    fn a_dropped_name_and_an_encrypted_resolver_are_declared_side_by_side() {
+        // Two different losses with two different remedies: one is this build's
+        // address budget, the other is the network's resolver. Collapsing them
+        // into one reason would send an operator to fix the wrong one.
+        let verdict = arbitrate(
+            None,
+            Vec::new(),
+            DnsObservation::UnavailableEncryptedDns,
+            NameMapLoss::NamesDropped,
+        );
+        assert!(verdict
+            .degraded_reasons
+            .contains(&DegradedReason::EncryptedDns));
+        assert!(verdict
+            .degraded_reasons
+            .contains(&DegradedReason::MapOverflow));
     }
 
     #[test]
@@ -309,6 +402,7 @@ mod tests {
             None,
             names(&["api.openai.com"]),
             DnsObservation::UnavailableEncryptedDns,
+            NameMapLoss::Intact,
         );
         assert!(!verdict
             .degraded_reasons
@@ -323,6 +417,7 @@ mod tests {
             Some(&ClientHelloFacts::Encrypted),
             Vec::new(),
             DnsObservation::UnavailableEncryptedDns,
+            NameMapLoss::Intact,
         );
         assert!(verdict.degraded_reasons.contains(&DegradedReason::Ech));
         assert!(verdict

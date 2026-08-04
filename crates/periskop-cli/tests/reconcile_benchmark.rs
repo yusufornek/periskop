@@ -14,9 +14,22 @@
 //! O1 and O2 and explicitly not one for O3, where the gate is attribution
 //! accuracy instead.
 //!
-//! **A cell below the minimum sample reports no rate at all.** Two hundred
-//! provider directed flows per class, and below that the cell says so instead of
-//! printing a ratio nobody should act on.
+//! **A cell below the minimum sample reports no rate at all, and that now
+//! covers every gate metric rather than the false positive rate alone.**
+//! `benchmarks.md` section (c) says it in as many words: under two hundred
+//! provider directed flows, the false positive rate, the attribution accuracy
+//! and the silent miss count are all computable and none of them may be read as
+//! a gate. The reason is the whole of the argument: a hundred percent over eight
+//! cases and a hundred percent over two hundred are not the same sentence. The
+//! first says how many cases the corpus holds, the second says what the tool
+//! does.
+//!
+//! This file used to write `meets_minimum_sample: false` and
+//! `attribution_accuracy_basis_points: 10000` into one document with nothing
+//! between them. The second field is O3's gate metric, and quoted on its own it
+//! reads as a closed gate. Below the minimum the gate fields are now `null` with
+//! their reason in `not_measured`, and the numbers themselves live under
+//! `below_minimum_sample`, where the name says what they are not.
 //!
 //! # What this file measures, and what it refuses to
 //!
@@ -87,10 +100,24 @@ fn repo_root() -> PathBuf {
 /// The label is not a second opinion about the classifier's answer. It is a fact
 /// about how the observation was constructed, so a disagreement is the
 /// classifier being wrong rather than two graders differing.
+///
+/// **A label that restates the rule is not a fact and does not belong here.** If
+/// the expected bucket is derived from what `ScopePolicy::classify` is specified
+/// to do, then agreement is guaranteed by construction and the case scores the
+/// rule against itself. Such a case goes to [`Unscored`] with its reason, so it
+/// is still built, still run through the pipeline, and no longer moves a number.
 struct Labeled {
     case: &'static str,
     observation: Observation,
     truth: FlowScope,
+}
+
+/// A flow the corpus builds and refuses to score, with the reason in the
+/// artifact rather than only in a comment.
+struct Unscored {
+    case: &'static str,
+    observation: Observation,
+    reason: &'static str,
 }
 
 fn observation(src_port: u16, dst_ip: &str) -> Observation {
@@ -184,19 +211,31 @@ fn corpus() -> Vec<Labeled> {
                 .kernel_attributed(process(None, None)),
             truth: FlowScope::Undetermined,
         },
-        Labeled {
-            case: "the codebase process named only by its short name",
-            observation: observation(54_328, "104.18.7.7")
-                .resolved("api.openai.com", DnsAndSni)
-                .with_provider_ref("openai")
-                .kernel_attributed(process(None, Some("python3"))),
-            // The policy declares an executable path, and this record carries
-            // only the short name. Filing it as somebody else's traffic is the
-            // right answer: a short name is not evidence of ownership, and
-            // guessing would produce the accusation the buckets exist to avoid.
-            truth: FlowScope::OutOfScopeProcess,
-        },
     ]
+}
+
+/// The cases the corpus builds and does not score.
+///
+/// One so far, and it is here rather than deleted because the behaviour is
+/// worth pinning; what it is not worth is a percentage point.
+fn unscored_corpus() -> Vec<Unscored> {
+    use periskop_network_sensor::flow::ResolvedHostSource::DnsAndSni;
+
+    vec![Unscored {
+        case: "the codebase process named only by its short name",
+        observation: observation(54_328, "104.18.7.7")
+            .resolved("api.openai.com", DnsAndSni)
+            .with_provider_ref("openai")
+            .kernel_attributed(process(None, Some("python3"))),
+        reason: "this flow was constructed from the codebase's own interpreter, so the fact about \
+                 it is that it belongs to the scan; the enrichment that would have shown the path \
+                 did not run. The policy files it as out_of_scope_process, which is the right \
+                 call and is also a miss. The corpus used to label it out_of_scope_process and \
+                 count the agreement as a success, which scores the rule against itself: the \
+                 label was a copy of the rule rather than an independent fact, so it could not \
+                 fail. Scored honestly it is a silent miss, and it is a known gap in enrichment \
+                 rather than a defect in the classifier",
+    }]
 }
 
 /// One environment class's cell in the benchmark table.
@@ -224,17 +263,45 @@ struct BenchmarkReport {
     false_positives: Option<u64>,
     fp_rate: Option<String>,
     fp_rate_ci95: Option<String>,
-    /// Measured. The share of flows placed in the bucket they belong in, in
-    /// basis points, over the labeled corpus.
-    attribution_accuracy_basis_points: u64,
-    /// Flows wrongly filed as somebody else's traffic, which disappear from the
-    /// accounting with nothing in the report to show they were seen.
-    silent_misses: u64,
+    /// O3's gate metric, and `null` while the window is under the minimum
+    /// sample.
+    ///
+    /// The number is still computed and still printed, one field down. What is
+    /// withheld is the reading a release check would take, because a gate
+    /// metric quoted apart from the sample it came from is the sentence
+    /// `benchmarks.md` forbids.
+    attribution_accuracy_basis_points: Option<u64>,
+    /// Also a gate number, and `null` for the same reason: a silent miss count
+    /// over eight cases says how many cases there were.
+    silent_misses: Option<u64>,
     /// Flows wrongly filed as the codebase's, which become accusations.
-    wrong_in_scope_attributions: u64,
+    wrong_in_scope_attributions: Option<u64>,
+    /// The same three numbers, under a name that says what they are not.
+    ///
+    /// Present exactly when the window is under the minimum sample, which is
+    /// the only state in which they are readable at all: the rule says such
+    /// numbers may be computed and reported and may not be read as a gate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    below_minimum_sample: Option<UngatedReadings>,
     /// Per case, so a drop names the behaviour that broke rather than a number.
     cases: BTreeMap<&'static str, &'static str>,
+    /// Cases the corpus built and refused to score, with the reason.
+    cases_excluded_from_accuracy: BTreeMap<&'static str, &'static str>,
     not_measured: BTreeMap<&'static str, &'static str>,
+}
+
+/// Numbers a regression net may read and a release note may not.
+#[derive(Debug, serde::Serialize)]
+struct UngatedReadings {
+    /// How many labeled cases the share below was computed over. Beside the
+    /// value rather than elsewhere in the document, so the two cannot be quoted
+    /// apart from each other.
+    scored_cases: usize,
+    attribution_accuracy_basis_points: u64,
+    silent_misses: u64,
+    wrong_in_scope_attributions: u64,
+    /// Why none of the three closes a gate.
+    reading: &'static str,
 }
 
 fn write_report(report: &BenchmarkReport) {
@@ -340,9 +407,24 @@ fn measure() -> (BenchmarkReport, scan::ScanOutcome) {
                 .expect("a record built from a corpus observation satisfies the contract"),
         );
     }
+    let scored_cases = flows.len();
+
+    // The unscored cases go through the pipeline like any other flow. They are
+    // real records and the bucket counts should include them; what they do not
+    // do is enter the accuracy fraction.
+    let mut excluded: BTreeMap<&'static str, &'static str> = BTreeMap::new();
+    for unscored in unscored_corpus() {
+        excluded.insert(unscored.case, unscored.reason);
+        let placed = policy.classify(&unscored.observation);
+        flows.push(
+            Flow::from_observation(unscored.observation, placed, Mechanism::Ebpf)
+                .expect("a record built from a corpus observation satisfies the contract"),
+        );
+    }
 
     let total = flows.len();
-    let accuracy_basis_points = correct * 10_000 / total as u64;
+    let accuracy_basis_points = correct * 10_000 / scored_cases as u64;
+    let meets_minimum_sample = total >= MINIMUM_LABELED_FLOWS;
 
     // The pipeline half: the same records through the shipped scan, so the
     // bucket counts in the report are the ones a reader would see.
@@ -382,6 +464,27 @@ fn measure() -> (BenchmarkReport, scan::ScanOutcome) {
         "window",
         "no observation window: the corpus was constructed rather than watched",
     );
+    if !meets_minimum_sample {
+        // Both gate numbers, named. Without an entry here the null reads as an
+        // omission, and the number under `below_minimum_sample` reads as the
+        // measurement that was omitted.
+        not_measured.insert(
+            "attribution_accuracy_basis_points",
+            "O3's gate metric, computed and not readable as a gate: the window holds fewer than \
+             the minimum sample, and benchmarks.md section (c) applies that rule to every gate \
+             metric rather than to the false positive rate alone. The computed share is under \
+             below_minimum_sample with the case count beside it",
+        );
+        not_measured.insert(
+            "silent_misses",
+            "counted over the same window, so it carries the same limit: a zero over a handful of \
+             cases says how many cases there were",
+        );
+        not_measured.insert(
+            "wrong_in_scope_attributions",
+            "counted over the same window, so it carries the same limit",
+        );
+    }
 
     let report = BenchmarkReport {
         benchmark: "reconciliation (milestone 59)",
@@ -389,7 +492,7 @@ fn measure() -> (BenchmarkReport, scan::ScanOutcome) {
         window: None,
         total_llm_flows: total,
         minimum_sample: MINIMUM_LABELED_FLOWS,
-        meets_minimum_sample: total >= MINIMUM_LABELED_FLOWS,
+        meets_minimum_sample,
         in_scope_flows: coverage.in_scope_flows,
         out_of_scope_flows: coverage.out_of_scope_flows,
         known_benign_flows: coverage.known_benign_flows,
@@ -398,10 +501,26 @@ fn measure() -> (BenchmarkReport, scan::ScanOutcome) {
         false_positives: None,
         fp_rate: None,
         fp_rate_ci95: None,
-        attribution_accuracy_basis_points: accuracy_basis_points,
-        silent_misses,
-        wrong_in_scope_attributions: wrong_in_scope,
+        // Gate readings only where the window earns them. Publishing the
+        // number here and the sample verdict elsewhere is what let
+        // "one hundred percent attribution accuracy" be quoted off a corpus of
+        // eight hand written cases.
+        attribution_accuracy_basis_points: meets_minimum_sample.then_some(accuracy_basis_points),
+        silent_misses: meets_minimum_sample.then_some(silent_misses),
+        wrong_in_scope_attributions: meets_minimum_sample.then_some(wrong_in_scope),
+        below_minimum_sample: (!meets_minimum_sample).then_some(UngatedReadings {
+            scored_cases,
+            attribution_accuracy_basis_points: accuracy_basis_points,
+            silent_misses,
+            wrong_in_scope_attributions: wrong_in_scope,
+            reading: "a regression floor over a constructed corpus, not a measurement of a \
+                      machine. It catches the attribution getting worse between now and the day \
+                      somebody runs the live measurement, and it closes no gate: O3 is decided \
+                      over a developer's real machine with a window of at least two hundred \
+                      provider directed flows",
+        }),
         cases,
+        cases_excluded_from_accuracy: excluded,
         not_measured,
     };
     (report, outcome)
@@ -413,9 +532,16 @@ fn reconciliation_benchmark_scores_what_it_can_measure_and_declares_what_it_cann
     write_report(&report);
 
     let coverage = &outcome.report.coverage;
-    let accuracy_basis_points = report.attribution_accuracy_basis_points;
-    let silent_misses = report.silent_misses;
-    let wrong_in_scope = report.wrong_in_scope_attributions;
+    // Read from the ungated block, which is where the numbers live while the
+    // window is short. The regression net is entitled to them; a release note
+    // is not, and the two are now different fields.
+    let readings = report
+        .below_minimum_sample
+        .as_ref()
+        .expect("a corpus this size has no gate reading, so the ungated block is where it is");
+    let accuracy_basis_points = readings.attribution_accuracy_basis_points;
+    let silent_misses = readings.silent_misses;
+    let wrong_in_scope = readings.wrong_in_scope_attributions;
     let total = report.total_llm_flows;
 
     // The regression net. None of these is the release gate, and the report says
@@ -481,5 +607,90 @@ fn the_benchmark_never_prints_a_false_positive_rate_it_did_not_earn() {
     assert!(
         !measured.meets_minimum_sample,
         "the corpus grew past the minimum sample, which would let a rate be read off it: {report}"
+    );
+}
+
+#[test]
+fn no_gate_number_is_published_while_the_window_is_below_the_minimum_sample() {
+    // The failure this prevents is one sentence in a release note: "attribution
+    // accuracy 100%". The artifact used to carry `meets_minimum_sample: false`
+    // and `attribution_accuracy_basis_points: 10000` as two independent fields,
+    // and the second quoted alone closes O3's gate over eight hand written
+    // cases. `benchmarks.md` section (c) extends the minimum sample rule to
+    // every gate metric for exactly this reason.
+    let (measured, _) = measure();
+    let report: serde_json::Value = serde_json::to_value(&measured).unwrap();
+
+    assert!(!measured.meets_minimum_sample, "{report}");
+    for gate in [
+        "attribution_accuracy_basis_points",
+        "silent_misses",
+        "wrong_in_scope_attributions",
+    ] {
+        assert!(
+            report[gate].is_null(),
+            "{gate} was published as a gate number over {} flows: {report}",
+            measured.total_llm_flows
+        );
+        assert!(
+            report["not_measured"][gate].is_string(),
+            "{gate} is null with no reason beside it, which reads as an omission: {report}"
+        );
+    }
+
+    // The numbers are still there, and still readable as what they are: a
+    // regression floor with its case count attached.
+    let ungated = &report["below_minimum_sample"];
+    assert_eq!(ungated["attribution_accuracy_basis_points"], 10_000);
+    assert!(ungated["scored_cases"].as_u64().unwrap() < MINIMUM_LABELED_FLOWS as u64);
+    assert!(ungated["reading"].is_string(), "{report}");
+}
+
+#[test]
+fn a_case_whose_label_would_restate_the_policy_rule_is_not_scored() {
+    // The second half of the finding. The corpus carried a flow built from the
+    // codebase's own interpreter, arriving with only the kernel's short name
+    // because user space enrichment did not run, and labeled it
+    // `out_of_scope_process`. That label is what `ScopePolicy::classify` is
+    // specified to do with a record carrying no path, so agreement was
+    // guaranteed by construction: the case could not fail, and it lifted the
+    // accuracy of the corpus by an eighth.
+    //
+    // Scored against the fact of its construction it is a silent miss: a flow
+    // that belongs to the scan, filed as somebody else's. The classifier is not
+    // wrong to do it, because a short name is not evidence of ownership; what
+    // is wrong is counting the miss as a success. So the case is built, run
+    // through the pipeline, and left out of the fraction with its reason in the
+    // artifact.
+    let policy = ScopePolicy::for_codebase([CODEBASE_PROCESS.to_owned()])
+        .with_declared_benign_host(BENIGN_HOST.to_owned());
+
+    for unscored in unscored_corpus() {
+        assert_eq!(
+            policy.classify(&unscored.observation),
+            FlowScope::OutOfScopeProcess,
+            "{}",
+            unscored.case
+        );
+        assert!(!unscored.reason.is_empty());
+    }
+
+    let (measured, _) = measure();
+    let report: serde_json::Value = serde_json::to_value(&measured).unwrap();
+    for unscored in unscored_corpus() {
+        assert!(
+            report["cases_excluded_from_accuracy"][unscored.case].is_string(),
+            "an excluded case left the artifact without its reason: {report}"
+        );
+        assert!(
+            report["cases"].get(unscored.case).is_none(),
+            "an unscored case is being scored again: {report}"
+        );
+    }
+    assert_eq!(
+        measured.below_minimum_sample.as_ref().unwrap().scored_cases + unscored_corpus().len(),
+        measured.total_llm_flows,
+        "the flows and the scored cases stopped adding up, so a case went missing rather than \
+         being excluded: {report}"
     );
 }

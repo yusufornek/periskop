@@ -76,15 +76,14 @@ pub struct PlatformKernel {
     loader: ebpf::EbpfLoader,
     /// Payload samples the parsers refused, counted by cause.
     ///
-    /// **This does not reach the coverage statement yet, and that is a stated
-    /// gap rather than an oversight.** `SourceCoverage` and the coverage
-    /// statement schema have no field for samples a parser rejected; the
-    /// `DnsParseError` documentation says these are meant to be counted in one,
-    /// so the field is missing rather than unwanted. Changing a contract is the
-    /// integrator's decision, so the request is filed in
-    /// `hub/memory/interfaces.md` and this build keeps the count where a test
-    /// can see it instead of dropping it. Bounded by the number of distinct
-    /// causes, which is nine, so it cannot grow with traffic.
+    /// Carried out of here by [`KernelEvents::rejected_samples`], into
+    /// `SourceCoverage` and from there into the status the `sensor` command
+    /// prints. **The JSON coverage statement still has no field for it**: that
+    /// schema is closed (`additionalProperties: false`) and belongs to the
+    /// integrator, so the request stays open in `hub/memory/interfaces.md`.
+    /// What changed is that the count is no longer readable only by this
+    /// module's own tests. Bounded by the number of distinct causes, which is
+    /// nine, so it cannot grow with traffic.
     #[cfg(feature = "ebpf-loader")]
     rejected_samples: BTreeMap<&'static str, u64>,
     /// Whether a load has succeeded on this kernel.
@@ -98,15 +97,6 @@ pub struct PlatformKernel {
     attached: bool,
 }
 
-#[cfg(feature = "ebpf-loader")]
-impl PlatformKernel {
-    /// Payload samples the parsers refused since this kernel was created, by
-    /// cause.
-    pub fn rejected_samples(&self) -> &BTreeMap<&'static str, u64> {
-        &self.rejected_samples
-    }
-}
-
 #[cfg(not(feature = "ebpf-loader"))]
 impl KernelEvents for PlatformKernel {
     fn attach(&mut self, _plan: &AttachPlan) -> Result<(), SensorUnavailable> {
@@ -115,6 +105,13 @@ impl KernelEvents for PlatformKernel {
         } else {
             Err(SensorUnavailable::UnsupportedPlatform)
         }
+    }
+
+    /// Empty rather than absent, and the two are not the same claim: with no
+    /// loader compiled in no sample was ever handed up, so none could be
+    /// refused. The run's own `unavailable_reason` is what says why.
+    fn rejected_samples(&self) -> std::collections::BTreeMap<&'static str, u64> {
+        std::collections::BTreeMap::new()
     }
 
     fn poll(&mut self) -> KernelBatch {
@@ -146,6 +143,10 @@ impl KernelEvents for PlatformKernel {
         // attached.
         self.attached = loaded.is_ok();
         loaded
+    }
+
+    fn rejected_samples(&self) -> BTreeMap<&'static str, u64> {
+        self.rejected_samples.clone()
     }
 
     fn poll(&mut self) -> KernelBatch {
@@ -454,6 +455,7 @@ mod loader_backed_tests {
             cap_perfmon: false,
             cap_net_admin: true,
             btf_available: true,
+            statement: crate::privilege::PrivilegeStatement::Read,
         };
         let capabilities = capabilities_from(&privileges);
         assert!(capabilities.root);

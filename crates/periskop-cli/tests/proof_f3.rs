@@ -277,6 +277,13 @@ impl KernelEvents for AcceptedConnectionKernel {
         }
         self.batches.remove(0)
     }
+
+    /// The measured connection carried no payload sample, so no parser was
+    /// asked and none refused. Empty is what was counted rather than a default
+    /// standing in for a count nobody took.
+    fn rejected_samples(&self) -> std::collections::BTreeMap<&'static str, u64> {
+        std::collections::BTreeMap::new()
+    }
 }
 
 /// Turns the measured connection into records, through the shipped sensor.

@@ -74,6 +74,25 @@ impl SensorUnavailable {
     }
 }
 
+/// Whether the kernel's statement about this process could be read at all.
+///
+/// Kept apart from the capability flags because the two answer different
+/// questions and point at different remedies. All flags false can mean "the
+/// kernel says this process holds nothing", which an operator fixes by granting
+/// capabilities, or "nothing could be read", which granting capabilities does
+/// not fix and which the report used to present as the first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PrivilegeStatement {
+    /// `/proc/self/status` was read and its capability line parsed. The flags
+    /// below are the kernel's answer.
+    Read,
+    /// The file could not be read, or carried no capability line this build
+    /// recognises. The flags carry no answer, and the default is this one so a
+    /// value nobody filled in cannot claim to be a measurement.
+    #[default]
+    Unreadable,
+}
+
 /// What the machine grants this process.
 ///
 /// Plain data with no probing of its own, so the evaluation below can be tested
@@ -90,6 +109,8 @@ pub struct Privileges {
     /// and loses SNI resolution, which is a declared loss and not an error.
     pub cap_net_admin: bool,
     pub btf_available: bool,
+    /// Whether the flags above are an answer or the absence of one.
+    pub statement: PrivilegeStatement,
 }
 
 impl Privileges {
@@ -107,14 +128,14 @@ impl Privileges {
     ///
     /// Split from [`Self::probe`] so the parse is exercised on every platform
     /// the workspace builds on, not only on the one where the file exists. An
-    /// unreadable or unrecognised blob yields no privileges, which fails
-    /// closed: the sensor declines to start and says so.
+    /// unreadable or unrecognised blob yields no privileges **and says so**,
+    /// which fails closed twice over: the sensor declines to start, and the
+    /// reason it states is the one an operator can act on.
     pub fn from_proc_status(status: &str, btf_available: bool) -> Self {
         let capabilities = status
             .lines()
             .find_map(|line| line.strip_prefix("CapEff:"))
-            .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
-            .unwrap_or(0);
+            .and_then(|value| u64::from_str_radix(value.trim(), 16).ok());
 
         // Uid: real effective saved filesystem. The effective one decides what
         // the process may do right now.
@@ -124,12 +145,23 @@ impl Privileges {
             .and_then(|value| value.split_whitespace().nth(1))
             .and_then(|value| value.parse().ok());
 
+        let Some(capabilities) = capabilities else {
+            // No capability line means no answer, not an answer of zero. The
+            // uid is dropped with it: on its own it would let a process read as
+            // root on the strength of half a file this build could not parse.
+            return Self {
+                btf_available,
+                ..Self::default()
+            };
+        };
+
         Self {
             effective_uid,
             cap_bpf: has_capability(capabilities, CAP_BPF),
             cap_perfmon: has_capability(capabilities, CAP_PERFMON),
             cap_net_admin: has_capability(capabilities, CAP_NET_ADMIN),
             btf_available,
+            statement: PrivilegeStatement::Read,
         }
     }
 }
@@ -154,14 +186,29 @@ pub struct Grant {
 ///
 /// The checks run in a fixed order so that the reason a report carries does not
 /// depend on which condition happened to be evaluated first: platform, then
-/// privileges, then kernel support. A machine can fail more than one at once,
-/// and an operator reading the report needs the same answer every time.
+/// whether the machine could be asked at all, then privileges, then kernel
+/// support. A machine can fail more than one at once, and an operator reading
+/// the report needs the same answer every time.
+///
+/// **Why an unreadable status is not `missing_capability`.** That label names a
+/// permission the operator can grant, and this build used to write it whenever
+/// `/proc/self/status` could not be read: on a Linux host with no procfs
+/// mounted, the report told an operator to grant `CAP_BPF` to a process that
+/// may well have held it already, and no amount of granting would have changed
+/// the outcome. The vocabulary is closed at four values by ADR-014, so this
+/// build picks the one whose remedy is not wrong rather than inventing a fifth;
+/// the request for a value that names the cause exactly is filed in
+/// `hub/memory/interfaces.md`.
 pub fn evaluate(
     platform: SensorPlatformClass,
     privileges: &Privileges,
 ) -> Result<Grant, SensorUnavailable> {
     if platform != SensorPlatformClass::LinuxEbpf {
         return Err(SensorUnavailable::UnsupportedPlatform);
+    }
+
+    if privileges.statement == PrivilegeStatement::Unreadable {
+        return Err(SensorUnavailable::KernelUnsupported);
     }
 
     let by_capability = privileges.cap_bpf && privileges.cap_perfmon;
@@ -191,6 +238,18 @@ mod tests {
             cap_perfmon: true,
             cap_net_admin: true,
             btf_available: true,
+            statement: PrivilegeStatement::Read,
+        }
+    }
+
+    /// A machine that answered, and answered that this process holds nothing.
+    ///
+    /// Not `Privileges::default()`, which is the machine that did not answer at
+    /// all. Keeping the two apart in the fixtures is the point of the finding.
+    fn unprivileged() -> Privileges {
+        Privileges {
+            statement: PrivilegeStatement::Read,
+            ..Privileges::default()
         }
     }
 
@@ -211,6 +270,7 @@ mod tests {
             cap_perfmon: false,
             cap_net_admin: false,
             btf_available: true,
+            statement: PrivilegeStatement::Read,
         };
         let grant = evaluate(SensorPlatformClass::LinuxEbpf, &root).unwrap();
         assert!(grant.elevated_as_root);
@@ -219,7 +279,7 @@ mod tests {
 
     #[test]
     fn a_denied_sensor_names_a_cause_an_operator_can_act_on() {
-        let denied = evaluate(SensorPlatformClass::LinuxEbpf, &Privileges::default()).unwrap_err();
+        let denied = evaluate(SensorPlatformClass::LinuxEbpf, &unprivileged()).unwrap_err();
         assert_eq!(denied, SensorUnavailable::MissingCapability);
         assert_eq!(denied.as_str(), "missing_capability");
     }
@@ -228,7 +288,7 @@ mod tests {
     fn half_the_capabilities_is_not_enough() {
         let partial = Privileges {
             cap_bpf: true,
-            ..Privileges::default()
+            ..unprivileged()
         };
         assert_eq!(
             evaluate(SensorPlatformClass::LinuxEbpf, &partial),
@@ -274,6 +334,35 @@ mod tests {
     }
 
     #[test]
+    fn a_status_file_that_could_not_be_read_is_not_reported_as_a_missing_capability() {
+        // The finding, produced: a Linux host whose `/proc/self/status` cannot
+        // be read (no procfs, a restricted sandbox, a format this build does
+        // not recognise) used to answer `missing_capability`, which sends the
+        // operator to grant `CAP_BPF` and `CAP_PERFMON`. The process may hold
+        // both already; nothing about granting them makes the file readable, so
+        // the remedy the report names cannot work.
+        let unreadable = Privileges::from_proc_status("", true);
+        assert_eq!(unreadable.statement, PrivilegeStatement::Unreadable);
+        assert_eq!(
+            evaluate(SensorPlatformClass::LinuxEbpf, &unreadable),
+            Err(SensorUnavailable::KernelUnsupported),
+            "an unreadable privilege statement was reported as a permission the operator can grant"
+        );
+    }
+
+    #[test]
+    fn a_status_file_without_a_capability_line_states_nothing_rather_than_zero() {
+        // A blob with a uid and no `CapEff:` is half an answer. Taking the uid
+        // from it would let a process read as root on the strength of a file
+        // this build could not parse, and the capability flags would read as a
+        // kernel statement that the process holds nothing.
+        let partial = Privileges::from_proc_status("Uid:\t0\t0\t0\t0\n", true);
+        assert_eq!(partial.statement, PrivilegeStatement::Unreadable);
+        assert_eq!(partial.effective_uid, None);
+        assert!(!partial.is_root());
+    }
+
+    #[test]
     fn the_status_blob_is_parsed_the_way_the_kernel_writes_it() {
         // CAP_BPF is bit 39 and CAP_PERFMON bit 38, so the two together are
         // 0xc000000000; CAP_NET_ADMIN is bit 12, which this mask lacks.
@@ -305,7 +394,7 @@ mod tests {
         assert_eq!(privileges.effective_uid, None);
         assert_eq!(
             evaluate(SensorPlatformClass::LinuxEbpf, &privileges),
-            Err(SensorUnavailable::MissingCapability)
+            Err(SensorUnavailable::KernelUnsupported)
         );
     }
 

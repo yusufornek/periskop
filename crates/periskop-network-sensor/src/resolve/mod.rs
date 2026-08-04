@@ -13,6 +13,28 @@ use serde::{Deserialize, Serialize};
 pub use cache::DnsCache;
 pub use naming::{arbitrate, NameVerdict};
 
+/// Whether the name map still holds what it learned about an address.
+///
+/// Per address rather than per run, which is the difference from
+/// [`DnsObservation`]: an encrypted resolver costs the whole run its plaintext
+/// answers, while an overflowing map costs the addresses it had to drop and
+/// nothing else.
+///
+/// It exists so that a dropped name and an absent name cannot be spelled the
+/// same way. Both leave `names_for` empty, and a flow built on an empty list
+/// alone is written `opaque`, which the contract defines as "there was never a
+/// name to look at". Saying that about a name this build measured and then
+/// threw away is the substitution the product argues against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NameMapLoss {
+    /// Nothing this map learned about the address has been dropped.
+    #[default]
+    Intact,
+    /// A name the map held for this address was evicted to stay inside the
+    /// address budget.
+    NamesDropped,
+}
+
 /// Whether DNS could be watched at all during a run.
 ///
 /// Declared in the coverage statement rather than per flow, because it is a

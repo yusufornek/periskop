@@ -185,6 +185,12 @@ impl KernelEvents for ReplayKernel {
     fn poll(&mut self) -> KernelBatch {
         self.batch.take().unwrap_or_default()
     }
+
+    /// A replay carries only events, so nothing here was ever refused by a
+    /// parser. Empty is the measurement, not a stand in for one.
+    fn rejected_samples(&self) -> std::collections::BTreeMap<&'static str, u64> {
+        std::collections::BTreeMap::new()
+    }
 }
 
 fn grant() -> Grant {
@@ -466,14 +472,52 @@ fn a_malformed_packet_is_a_reported_loss_and_never_a_record() {
 fn a_source_that_cannot_attach_produces_no_records_and_a_stated_reason() {
     // The privilege behaviour this crate will not trade away: the sensor
     // declines, says why, and the scan is expected to carry on.
+    //
+    // **Which cause is not this test's subject, and pinning it measured the
+    // machine instead of the code.** This assertion used to accept
+    // `loader_not_built` or `unsupported_platform` and nothing else. Those are
+    // the two answers a macOS development machine and a default feature build
+    // give; a Linux runner with `--all-features` reaches the real loader and
+    // answers whatever that machine actually lacks, which is normally
+    // `missing_capability` on an unprivileged container or `kernel_unsupported`
+    // where BTF is absent. All four are correct answers about the machine they
+    // were produced on, so a test that names two of them fails on a green
+    // build and says nothing about this crate.
+    //
+    // What the name promises is what is asserted: no records, and a cause that
+    // was stated rather than defaulted. The vocabulary is checked as a closed
+    // set, so this does not degrade into "any answer will do": a cause outside
+    // the four, or a fifth appearing without a report being taught to carry it,
+    // still fails here.
+    let vocabulary = [
+        SensorUnavailable::UnsupportedPlatform,
+        SensorUnavailable::MissingCapability,
+        SensorUnavailable::KernelUnsupported,
+        SensorUnavailable::LoaderNotBuilt,
+    ];
+
     let mut source = EbpfFlowSource::new(HOST_ID);
     let refusal = source.attach(&grant()).unwrap_err();
-    assert!(matches!(
-        refusal,
-        SensorUnavailable::LoaderNotBuilt | SensorUnavailable::UnsupportedPlatform
-    ));
-    assert!(!refusal.as_str().is_empty());
-    assert!(source.drain().is_empty());
+
+    assert!(
+        vocabulary.contains(&refusal),
+        "the refusal is outside the sensor's closed vocabulary: {refusal:?}"
+    );
+    assert!(
+        !refusal.as_str().is_empty(),
+        "a refusal with no label reaches a report as an empty reason"
+    );
+    // The label a report carries is the dictionary spelling and not a debug
+    // rendering, which is what makes a fleet wide count of one cause mean one
+    // thing.
+    assert_eq!(
+        serde_json::to_value(refusal).unwrap(),
+        serde_json::json!(refusal.as_str())
+    );
+    assert!(
+        source.drain().is_empty(),
+        "a source that refused to attach handed back observations as if it had looked"
+    );
 }
 
 /// Loads the real programs against this machine's kernel.

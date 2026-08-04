@@ -37,6 +37,7 @@ pub struct SensorOutcome {
     tally: ScopeTally,
     rejected: Vec<&'static str>,
     coverage: SourceCoverage,
+    shared_identities: u64,
 }
 
 impl SensorOutcome {
@@ -48,6 +49,7 @@ impl SensorOutcome {
             tally: ScopeTally::default(),
             rejected: Vec::new(),
             coverage: SourceCoverage::default(),
+            shared_identities: 0,
         }
     }
 
@@ -128,6 +130,43 @@ impl SensorOutcome {
     pub fn unlinked_events(&self) -> u64 {
         self.coverage.unlinked_events
     }
+
+    /// Payload samples this pass handed to a parser that refused them, by
+    /// fixed cause label.
+    ///
+    /// The connection was still observed; what was lost is its destination
+    /// name. Exposed here because until it was, the count lived inside the
+    /// kernel object and no report path could read it.
+    pub fn rejected_payload_samples(&self) -> &std::collections::BTreeMap<&'static str, u64> {
+        &self.coverage.rejected_payload_samples
+    }
+
+    /// Names the DNS map dropped to stay inside its address budget.
+    pub fn dns_names_evicted(&self) -> u64 {
+        self.coverage.dns_names_evicted
+    }
+
+    /// Evictions the map could no longer remember the address of, so the flows
+    /// concerned carry no `map_overflow` reason although they may have lost a
+    /// name.
+    pub fn dns_evictions_forgotten(&self) -> u64 {
+        self.coverage.dns_evictions_forgotten
+    }
+
+    /// Connections in this pass that two different network namespaces had to
+    /// share one identity for.
+    ///
+    /// Counted rather than resolved. `netns` is not one of the four inputs the
+    /// contract hashes (`docs/04-contracts/flow-schema.md`, `flow_id`), so two
+    /// containers on one host opening the same connection key inside one time
+    /// bucket produce one `flow_id` for two connections, and their volumes are
+    /// read as one flow's. This build does not change the derivation, because
+    /// the derivation is not the sensor's to change; it reports how often the
+    /// collision happened so the loss is measured rather than invisible. The
+    /// request is filed in `hub/memory/interfaces.md`.
+    pub fn shared_identities(&self) -> u64 {
+        self.shared_identities
+    }
 }
 
 /// Runs one observation pass on this machine.
@@ -196,6 +235,7 @@ pub(crate) fn observe_on<S: FlowSource>(
     // listed them may reach the output.
     flows.sort_by(|a, b| a.flow_id.cmp(&b.flow_id).then_with(|| a.cmp(b)));
     rejected.sort_unstable();
+    let shared_identities = shared_identities(&flows);
 
     SensorOutcome {
         detected_platform,
@@ -206,7 +246,40 @@ pub(crate) fn observe_on<S: FlowSource>(
         // Read after the drain, because a mechanism only knows what it lost
         // once it has finished handing over what it kept.
         coverage: source.coverage(),
+        shared_identities,
     }
+}
+
+/// Counts the connections that had to share an identity with another one.
+///
+/// Only namespaces are compared, because that is the collision the contract's
+/// own rationale predicts: `src_ip` was taken out of the connection key and
+/// `netns` was named as what carries the container separation instead
+/// (`flow-schema.md`, "Removed fields"), but the identity formula in the same
+/// document hashes four inputs and `netns` is not among them. Two records that
+/// agree on the namespace and share an identity are the same connection
+/// observed twice, which is not a loss; two that disagree are two connections
+/// the report can no longer tell apart.
+///
+/// The flows arrive sorted by identity, so one pass over neighbours is enough
+/// and the answer does not depend on arrival order.
+fn shared_identities(flows: &[Flow]) -> u64 {
+    let mut collisions = 0u64;
+    let mut group_start = 0usize;
+    for index in 1..=flows.len() {
+        let ends_group = index == flows.len() || flows[index].flow_id != flows[group_start].flow_id;
+        if !ends_group {
+            continue;
+        }
+        let group = &flows[group_start..index];
+        let namespaces: std::collections::BTreeSet<Option<&str>> =
+            group.iter().map(|flow| flow.netns.as_deref()).collect();
+        if namespaces.len() > 1 {
+            collisions = collisions.saturating_add(group.len() as u64);
+        }
+        group_start = index;
+    }
+    collisions
 }
 
 #[cfg(test)]
@@ -229,6 +302,17 @@ mod tests {
             cap_perfmon: true,
             cap_net_admin: true,
             btf_available: true,
+            statement: crate::privilege::PrivilegeStatement::Read,
+        }
+    }
+
+    /// A machine that answered and holds nothing, which is what
+    /// `missing_capability` is the honest label for. `Privileges::default()` is
+    /// a machine that could not be asked, and it now reports a different cause.
+    fn unprivileged() -> Privileges {
+        Privileges {
+            statement: crate::privilege::PrivilegeStatement::Read,
+            ..Privileges::default()
         }
     }
 
@@ -263,7 +347,7 @@ mod tests {
         let outcome = observe_on(
             SensorPlatformClass::LinuxEbpf,
             &mut StubFlowSource::yielding(Vec::new()),
-            &Privileges::default(),
+            &unprivileged(),
             &policy(),
         );
         assert_eq!(
@@ -282,7 +366,7 @@ mod tests {
         let outcome = observe_on(
             SensorPlatformClass::LinuxEbpf,
             &mut StubFlowSource::yielding(Vec::new()),
-            &Privileges::default(),
+            &unprivileged(),
             &policy(),
         );
         assert_eq!(outcome.detected_platform(), SensorPlatformClass::LinuxEbpf);
@@ -337,7 +421,7 @@ mod tests {
         let outcome = observe_on(
             SensorPlatformClass::LinuxEbpf,
             &mut StubFlowSource::yielding(Vec::new()),
-            &Privileges::default(),
+            &unprivileged(),
             &policy(),
         );
         assert_eq!(outcome.dns_observation(), None);
@@ -352,6 +436,7 @@ mod tests {
             dropped_events: 1_000,
             unlinked_events: 3,
             dns_observation: DnsObservation::UnavailableEncryptedDns,
+            ..SourceCoverage::default()
         });
         let outcome = observe_on(
             SensorPlatformClass::LinuxEbpf,
@@ -513,6 +598,86 @@ mod tests {
 
         assert_eq!(outcome.flows().len(), 1);
         assert_eq!(outcome.rejected(), ["attribution_disagrees_with_process"]);
+    }
+
+    #[test]
+    fn two_containers_opening_the_same_connection_share_one_identity_and_it_is_counted() {
+        // Finding O6, produced rather than described. Two network namespaces on
+        // one host, same destination, same source port, same time bucket: the
+        // contract hashes host, boot, connection key and bucket, and the
+        // namespace is in none of them, so both records carry one `flow_id`.
+        // A reader counting flows sees one connection where there were two, and
+        // the volume of one is read as the volume of both.
+        //
+        // The assertion is `eq` because that is what the contract says this
+        // build must derive. What the build owes on top of it is the count: the
+        // day the derivation gains the namespace, this test fails and says
+        // which property changed instead of a collision quietly disappearing.
+        let in_container = observation("104.18.7.1").with_netns("4026532008");
+        let on_host = observation("104.18.7.1").with_netns("4026531840");
+        let mut source = StubFlowSource::yielding(vec![in_container, on_host]);
+
+        let outcome = observe_on(
+            SensorPlatformClass::LinuxEbpf,
+            &mut source,
+            &capable(),
+            &policy(),
+        );
+
+        assert_eq!(outcome.flows().len(), 2);
+        assert_eq!(
+            outcome.flows()[0].flow_id,
+            outcome.flows()[1].flow_id,
+            "the identity derivation gained the namespace, so the collision this counter reports \
+             no longer happens and the contract request can be closed"
+        );
+        assert_ne!(outcome.flows()[0].netns, outcome.flows()[1].netns);
+        assert_eq!(outcome.shared_identities(), 2);
+    }
+
+    #[test]
+    fn one_connection_observed_in_one_namespace_is_not_counted_as_a_collision() {
+        // The counter has to name a real loss. Two records of the same
+        // connection, or one record on its own, share nothing the report needed
+        // to keep apart.
+        let mut source = StubFlowSource::yielding(vec![
+            observation("104.18.7.1").with_netns("4026531840"),
+            observation("104.18.7.2").with_netns("4026531840"),
+        ]);
+        let outcome = observe_on(
+            SensorPlatformClass::LinuxEbpf,
+            &mut source,
+            &capable(),
+            &policy(),
+        );
+        assert_eq!(outcome.shared_identities(), 0);
+    }
+
+    #[test]
+    fn what_the_parsers_refused_and_the_name_map_dropped_reach_the_outcome() {
+        // Both numbers used to stop before the report: the refused samples
+        // inside the kernel object, the evicted names inside the DNS map. A run
+        // that could name none of its destinations has to look different from
+        // one that named all of them.
+        let mut source = StubFlowSource::yielding(Vec::new()).losing(SourceCoverage {
+            dns_names_evicted: 12,
+            dns_evictions_forgotten: 3,
+            rejected_payload_samples: [("dns_truncated", 4)].into_iter().collect(),
+            ..SourceCoverage::default()
+        });
+        let outcome = observe_on(
+            SensorPlatformClass::LinuxEbpf,
+            &mut source,
+            &capable(),
+            &policy(),
+        );
+
+        assert_eq!(outcome.dns_names_evicted(), 12);
+        assert_eq!(outcome.dns_evictions_forgotten(), 3);
+        assert_eq!(
+            outcome.rejected_payload_samples().get("dns_truncated"),
+            Some(&4)
+        );
     }
 
     #[test]

@@ -116,6 +116,24 @@ impl FlowAssembler {
         self.unlinked_events
     }
 
+    /// Names the DNS map threw away to stay inside its address budget.
+    ///
+    /// A run level number beside the per flow `map_overflow` reason: the flows
+    /// say which destinations lost a name, this says how much resolution the
+    /// budget cost the run as a whole.
+    pub fn dns_names_evicted(&self) -> u64 {
+        self.dns.evicted()
+    }
+
+    /// Evictions the map could not even remember the address of.
+    ///
+    /// Above zero means a flow reporting no name loss may still have had one,
+    /// so the run has to declare the gap rather than presenting the per flow
+    /// answers as complete.
+    pub fn dns_evictions_forgotten(&self) -> u64 {
+        self.dns.forgotten_evictions()
+    }
+
     pub fn record_dropped(&mut self, count: u64) {
         self.dropped_events = self.dropped_events.saturating_add(count);
     }
@@ -232,7 +250,16 @@ impl FlowAssembler {
         dns_observation: DnsObservation,
     ) -> Observation {
         let dns_names = self.dns.names_for(&key.dst_ip, pending.at_secs);
-        let verdict = arbitrate(pending.hello.as_ref(), dns_names, dns_observation);
+        // Asked per destination, because an empty name list is what a dropped
+        // answer and an unanswered address have in common and the record has to
+        // separate them.
+        let name_map_loss = self.dns.name_loss_for(&key.dst_ip);
+        let verdict = arbitrate(
+            pending.hello.as_ref(),
+            dns_names,
+            dns_observation,
+            name_map_loss,
+        );
 
         let mut observation = Observation::new(
             self.host_id.clone(),
@@ -442,6 +469,59 @@ mod tests {
         assert_eq!(named.resolved_host.as_deref(), Some("api.openai.com"));
         assert_eq!(named.resolved_host_source, Some(ResolvedHostSource::Dns));
         assert_eq!(named.dns_names, vec!["api.openai.com".to_owned()]);
+    }
+
+    #[test]
+    fn a_destination_whose_name_the_map_dropped_says_so_instead_of_reading_as_opaque() {
+        // Finding O7, produced end to end rather than argued. The map learns
+        // what 104.18.7.1 is called, a busy run then fills it past its address
+        // budget and that answer is evicted, and the connection to the same
+        // address arrives afterwards. Everything downstream sees an empty name
+        // list, which is the same thing it sees for an address nobody ever
+        // resolved, and the record is written `opaque`: "there was never a name
+        // to look at". The name existed and this build threw it away, so the
+        // record has to carry the reason.
+        let mut assembler = assembler();
+        let resolver = key("10.0.0.53", 53, 40_000);
+        let flow = key("104.18.7.1", 443, 54_321);
+        assembler.ingest(dns_answer(&resolver, [104, 18, 7, 1], "api.openai.com", 1));
+
+        // One address more than the map holds, each with a longer lifetime, so
+        // the answer above is the one that goes.
+        for index in 0..8_192u32 {
+            let octets = index.to_be_bytes();
+            assembler.ingest(KernelEvent::Payload(PayloadEvent {
+                key: resolver.clone(),
+                t_start_bucket: START,
+                at_secs: 2,
+                facts: PayloadFacts::Dns(DnsAnswers {
+                    query_name: None,
+                    mappings: vec![DnsMapping {
+                        ip: IpAddr::from(octets),
+                        name: format!("host{index}.example"),
+                        ttl_secs: 3_600,
+                    }],
+                    truncated_by_server: false,
+                }),
+            }));
+        }
+        assembler.ingest(connect(&flow, 3));
+
+        let observation = assembler
+            .seal()
+            .into_iter()
+            .find(|observation| observation.five_tuple.dst_ip == "104.18.7.1")
+            .unwrap();
+        assert!(observation.dns_names.is_empty());
+        assert_eq!(observation.resolved_host, None);
+        assert!(
+            observation
+                .degraded_reasons
+                .contains(&DegradedReason::MapOverflow),
+            "a name this run measured and dropped was reported as a name that never existed: {:?}",
+            observation.degraded_reasons
+        );
+        assert!(assembler.dns_names_evicted() > 0);
     }
 
     #[test]

@@ -21,10 +21,23 @@
 //! vendor agent. Printing a bare assignment would read as correct and quietly
 //! drop whatever was there, which is the same class of damage as overwriting a
 //! file.
+//!
+//! Every byte this module puts on disk goes through [`crate::write_target`],
+//! and that is a security property rather than a style choice. `--target` names
+//! a directory that belongs to an interpreter, which on a shared machine means
+//! a directory this command may be run against with more authority than the
+//! person who arranged its contents holds. `std::fs::copy` follows a symbolic
+//! link at the destination and writes through it, so a link planted at a
+//! payload path turns an installation into a write to a file nobody named. The
+//! collision check below sees such a link and refuses, but a check and a copy
+//! are two steps and the path can be swapped between them; the write target
+//! module closes that window by creating the file exclusively.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+
+use crate::write_target::{self, Existing};
 
 /// Which runtime the hook is being installed for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +170,13 @@ pub enum HookError {
     /// containing one cannot be written down correctly, and writing it down
     /// incorrectly produces a variable that looks right and loads nothing.
     UnquotablePath { path: PathBuf },
+    /// A payload file could not be written where it was meant to go.
+    ///
+    /// Separate from [`Self::Io`] because it is the refusal that protects
+    /// somebody else's file: the destination was a link, a directory, or a path
+    /// something else claimed between the collision check and the write. The
+    /// inner error names the path and what was in the way.
+    NotWritten { error: write_target::WriteError },
     Io {
         path: PathBuf,
         error: std::io::Error,
@@ -198,6 +218,11 @@ impl HookError {
                 "install the hook under a path without a quote character, or pass --target"
                     .to_owned()
             }
+            Self::NotWritten { .. } => {
+                "look at what is at that path before removing it: a hook is never written through \
+                 a link, so whatever is there belongs to something else"
+                    .to_owned()
+            }
             Self::Io { .. } => "check that the path exists and is writable".to_owned(),
         }
     }
@@ -234,6 +259,7 @@ impl fmt::Display for HookError {
                 "NODE_OPTIONS cannot carry a path containing a quote character: {}",
                 path.display()
             ),
+            Self::NotWritten { error } => write!(f, "a hook file was not written: {error}"),
             Self::Io { path, error } => write!(f, "{}: {error}", path.display()),
         }
     }
@@ -243,6 +269,7 @@ impl std::error::Error for HookError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { error, .. } => Some(error),
+            Self::NotWritten { error } => Some(error),
             _ => None,
         }
     }
@@ -618,16 +645,30 @@ fn is_development_residue(name: &str) -> bool {
     name == "__pycache__" || name.contains(".test.")
 }
 
+/// Puts one payload file at its destination, and never through a link.
+///
+/// Read and written rather than `std::fs::copy`d. The copy call follows a
+/// symbolic link at the destination, so with `periskop-hook.pth` linked at an
+/// operator's key file a privileged install overwrote that file with the hook's
+/// contents while reporting a successful installation. `Existing::Refuse` is
+/// what the destination is opened with: `install` has already refused or
+/// removed whatever was at the path, so anything there by now appeared in the
+/// window between that check and this call, and a file appearing in that window
+/// is the attack this is guarding against rather than a state to write over.
+///
+/// The file mode is not carried across from the source. Both payloads are
+/// modules an interpreter imports, so nothing depends on an execute bit, and
+/// the alternative is a second write of somebody else's permissions.
 fn copy_file(from: &Path, to: &Path) -> Result<(), HookError> {
     if let Some(parent) = to.parent() {
         create_dir_all(parent)?;
     }
-    std::fs::copy(from, to)
-        .map(drop)
-        .map_err(|error| HookError::Io {
-            path: to.to_path_buf(),
-            error,
-        })
+    let contents = std::fs::read(from).map_err(|error| HookError::Io {
+        path: from.to_path_buf(),
+        error,
+    })?;
+    write_target::write_public(to, &contents, Existing::Refuse)
+        .map_err(|error| HookError::NotWritten { error })
 }
 
 fn create_dir_all(path: &Path) -> Result<(), HookError> {
@@ -867,5 +908,57 @@ mod tests {
         assert!(std::fs::symlink_metadata(target.join("periskop-hook.pth"))
             .unwrap()
             .is_file());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_payload_file_is_never_written_through_a_link_at_its_destination() {
+        // CL-SEC2, at the write itself. The collision check above is one guard
+        // and it is not the last one: it looks, and then the copy writes, and a
+        // path can change between the two. On a machine where the target
+        // directory is writable by somebody other than the operator, a link
+        // planted in that window used to be followed by `std::fs::copy`, which
+        // overwrote the file it pointed at. `hook install --target` is run
+        // against interpreter directories and can run privileged, so the file
+        // it overwrites is chosen by whoever planted the link.
+        //
+        // The link here is real and is at the destination when the write
+        // happens, which is exactly the state the window produces.
+        let tree = TempTree::new("copy-through-link");
+        let source = tree.write("hooks/python/periskop-hook.pth", "import periskop_hook\n");
+        let victim = tree.write("keys/id_ed25519", "PRIVATE KEY\n");
+        let destination = tree.path("site-packages/periskop-hook.pth");
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&victim, &destination).unwrap();
+
+        let error = copy_file(&source, &destination).unwrap_err();
+        assert!(
+            matches!(error, HookError::NotWritten { .. }),
+            "wrote through the link instead: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "PRIVATE KEY\n",
+            "the linked file was written through"
+        );
+        assert!(std::fs::symlink_metadata(&destination)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn a_payload_file_still_arrives_where_nothing_is_in_the_way() {
+        // The refusal must not have cost the ordinary case: the guard is worth
+        // nothing if the installation it protects no longer happens.
+        let tree = TempTree::new("copy-plain");
+        let source = tree.write("hooks/python/periskop-hook.pth", "import periskop_hook\n");
+        let destination = tree.path("site-packages/periskop-hook.pth");
+
+        copy_file(&source, &destination).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "import periskop_hook\n"
+        );
     }
 }

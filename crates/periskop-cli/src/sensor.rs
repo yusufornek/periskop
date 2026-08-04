@@ -107,6 +107,18 @@ pub struct SensorStatus {
     pub rejected_observations: BTreeMap<&'static str, u64>,
     pub dropped_events: u64,
     pub unlinked_events: u64,
+    /// Payload samples no parser could read, by fixed cause label.
+    ///
+    /// The connection behind each was still observed; what was lost is the
+    /// name of its destination. Printed because a run that could name none of
+    /// its destinations and one that named all of them produce the same flow
+    /// count and have to be told apart somewhere.
+    pub rejected_payload_samples: BTreeMap<&'static str, u64>,
+    /// Names the DNS map dropped to stay inside its address budget.
+    pub dns_names_evicted: u64,
+    /// Connections that had to share a `flow_id` with a connection in another
+    /// network namespace.
+    pub flow_identities_shared: u64,
     /// Absent on a pass that never started: the coverage contract closes this
     /// field at two values and both are claims about a run that happened.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -233,6 +245,9 @@ fn status_of(
         rejected_observations: rejected,
         dropped_events: outcome.dropped_events(),
         unlinked_events: outcome.unlinked_events(),
+        rejected_payload_samples: outcome.rejected_payload_samples().clone(),
+        dns_names_evicted: outcome.dns_names_evicted(),
+        flow_identities_shared: outcome.shared_identities(),
         dns_observation: outcome.dns_observation().map(|dns| dns.as_str()),
         not_measured: not_measured(outcome, host_id_source, request),
     }
@@ -286,6 +301,35 @@ fn not_measured(
              it cannot attribute to the project under scan"
                 .to_owned(),
         );
+    }
+    if outcome.shared_identities() > 0 {
+        notes.push(format!(
+            "{} flows share an identity with a flow from another network namespace, because the \
+             contract derives flow_id without netns: those connections cannot be told apart and \
+             their volumes are read as one connection's",
+            outcome.shared_identities()
+        ));
+    }
+    if outcome.dns_names_evicted() > 0 {
+        notes.push(format!(
+            "{} names were dropped from the DNS map to stay inside its address budget, so the \
+             flows carrying map_overflow had a destination name this run measured and discarded",
+            outcome.dns_names_evicted()
+        ));
+    }
+    if outcome.dns_evictions_forgotten() > 0 {
+        notes.push(format!(
+            "{} evictions happened whose address the map could no longer record, so a flow \
+             without map_overflow may still have lost a name",
+            outcome.dns_evictions_forgotten()
+        ));
+    }
+    if !outcome.rejected_payload_samples().is_empty() {
+        let total: u64 = outcome.rejected_payload_samples().values().sum();
+        notes.push(format!(
+            "{total} payload samples could not be parsed, so those connections were observed with \
+             no destination name: see rejected_payload_samples for the causes"
+        ));
     }
     notes
 }
@@ -423,6 +467,21 @@ mod tests {
         }
         assert!(json.get("state").is_some());
         assert!(json.get("not_measured").is_some());
+        // The losses the sensor now measures, including their zeroes. A counter
+        // that disappears when it is empty takes its zero with it, and the zero
+        // is the answer to a question the reader asked: on this pass, was any
+        // destination name dropped, was any sample unreadable, did any two
+        // namespaces have to share an identity.
+        for measured in [
+            "rejected_payload_samples",
+            "dns_names_evicted",
+            "flow_identities_shared",
+        ] {
+            assert!(
+                json.get(measured).is_some(),
+                "{measured} is missing: {json}"
+            );
+        }
     }
 
     #[cfg(unix)]

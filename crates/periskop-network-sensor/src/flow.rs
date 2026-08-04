@@ -95,6 +95,17 @@ pub enum FlowError {
     /// source without a name is a claim about nothing.
     #[error("resolved_host does not agree with resolved_host_source")]
     ResolvedHostSourceDisagrees,
+
+    /// The record carries a filesystem path where it may carry only a name.
+    ///
+    /// Determinism invariant 3 in `docs/04-contracts/flow-schema.md`: the body
+    /// carries no payload, no raw command line, no machine name and no absolute
+    /// path. An executable path is the machine's own layout, so two hosts
+    /// running the same program produce reports that differ on a line that has
+    /// nothing to do with what was observed, and a report meant to be compared
+    /// across machines cannot be.
+    #[error("a process path reached the record body, which the contract reserves for names")]
+    PathInRecordBody,
 }
 
 impl FlowError {
@@ -116,6 +127,7 @@ impl FlowError {
             }
             Self::AttributionDisagreesWithProcess => "attribution_disagrees_with_process",
             Self::ResolvedHostSourceDisagrees => "resolved_host_source_disagrees",
+            Self::PathInRecordBody => "path_in_record_body",
         }
     }
 }
@@ -281,6 +293,20 @@ pub struct ProcessRecord {
     /// user space could enrich the record.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comm: Option<String>,
+    /// The executable, **as a name and never as a path**.
+    ///
+    /// An observation carries what `/proc/<pid>/exe` resolved to, which is an
+    /// absolute path and is what the scope policy matches against. The record
+    /// does not: determinism invariant 3 keeps absolute paths out of the body,
+    /// and [`Flow::from_observation`] reduces the value to its final component
+    /// on the way in. What is kept is the part that says something about the
+    /// program rather than about the machine, and it is worth keeping: `comm`
+    /// is truncated by the kernel at sixteen bytes, so the two are not the same
+    /// string for a program with a longer name.
+    ///
+    /// Absent means user space could not enrich the record at all, which the
+    /// component spec assigns a meaning to; it must not be produced by
+    /// redaction, and it is not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exe: Option<String>,
     /// The command line is hashed, never carried: it routinely holds
@@ -324,6 +350,12 @@ pub struct Flow {
     pub five_tuple: FiveTuple,
     /// Interface the connection was seen on. A `utun` name is the reason this
     /// is worth carrying: it says the traffic went through a tunnel.
+    ///
+    /// **No capture path in this build fills it.** The kernel events carry a
+    /// namespace and a connection key and no interface index, so the field is
+    /// populated only when a record written by a producer that had one is read
+    /// back. It had a setter until the setter's only caller turned out to be a
+    /// test fixture, which is a field that looks produced and is not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interface: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -378,12 +410,30 @@ impl Flow {
     /// The identity is derived, not accepted: letting a caller supply one would
     /// let two spellings of the same connection into the pipeline, and the
     /// duplicate would surface as two observations of one thing.
+    /// Reduces an executable path to the name the record may carry.
+    ///
+    /// Applied here rather than at the capture mechanism because the path is
+    /// what the scope policy matches against: the observation needs it, the
+    /// record must not have it, and this is the one door between the two. The
+    /// bucket the path decided is already in `flow_scope` by the time this
+    /// runs, so nothing that used the path loses it.
+    fn record_name_of(exe: &str) -> String {
+        exe.rsplit(['/', '\\'])
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(exe)
+            .to_owned()
+    }
+
     pub fn from_observation(
         mut observation: Observation,
         flow_scope: FlowScope,
         mechanism: Mechanism,
     ) -> Result<Self, FlowError> {
         let dns_names = std::mem::take(&mut observation.dns_names);
+        if let Some(process) = observation.process.as_mut() {
+            process.exe = process.exe.as_deref().map(Self::record_name_of);
+        }
         let flow_id = derive_flow_id(
             &observation.host_id,
             observation.boot_id.as_deref(),
@@ -443,17 +493,6 @@ impl Flow {
 
     pub fn id(&self) -> &str {
         &self.flow_id
-    }
-
-    /// Names the interface the connection was seen on.
-    ///
-    /// A setter on the record rather than a field of `Observation`, because it
-    /// arrives from the capture attachment rather than from anything a hook
-    /// reported. The classification detail below is a setter for the same kind
-    /// of reason: it is decided by rule matching, after the observation exists.
-    pub fn on_interface(mut self, interface: impl Into<String>) -> Self {
-        self.interface = Some(interface.into());
-        self
     }
 
     /// Records the names DNS mapped to this destination.
@@ -558,8 +597,32 @@ impl Flow {
             return Err(FlowError::ResolvedHostSourceDisagrees);
         }
 
+        // Checked on read back as well as on construction. The producer of a
+        // stored record is not necessarily this build, and a path arriving from
+        // one is exactly the case the invariant exists for: it would be read
+        // straight into a report and make that report incomparable with the
+        // same scan run on another machine.
+        if self
+            .process
+            .as_ref()
+            .and_then(|process| process.exe.as_deref())
+            .is_some_and(carries_a_path)
+        {
+            return Err(FlowError::PathInRecordBody);
+        }
+
         Ok(())
     }
+}
+
+/// Whether a value spells a location on a machine rather than a name.
+///
+/// A separator is what makes it one, on either platform. The contract names the
+/// absolute path, and a separator is the observable form of it: a record that
+/// carries `venv/bin/python3` says as much about the machine's layout as one
+/// carrying the leading slash.
+fn carries_a_path(value: &str) -> bool {
+    value.contains('/') || value.contains('\\')
 }
 
 /// Schema pattern `^\d+\.\d+\.\d+$`.
@@ -671,19 +734,27 @@ pub(crate) mod tests {
 
     /// A record carrying every optional field the contract allows.
     ///
-    /// The three setters are what the packet parsing helper and the capture
-    /// attachment add after the observation is placed. They are exercised here
-    /// rather than only in their own tests, because the key set assertion below
-    /// is only a guarantee if this record is complete.
+    /// The setters are what the packet parsing helper adds after the
+    /// observation is placed. They are exercised here rather than only in their
+    /// own tests, because the key set assertion below is only a guarantee if
+    /// this record is complete.
+    ///
+    /// `interface` is assigned rather than set through a builder: no capture
+    /// path in this build produces one, so a setter for it would be a function
+    /// with a test for its only caller. The field is still written here,
+    /// because the key set assertion has to cover every key the type can
+    /// serialize, including the ones only a read back record carries.
     pub(crate) fn full_flow() -> Flow {
-        Flow::from_observation(full_observation(), FlowScope::InScope, Mechanism::Ebpf)
-            .unwrap()
-            .on_interface("utun4")
-            .with_dns_names(vec!["api.openai.com".to_owned()])
-            .with_sni("api.openai.com")
-            .unwrap()
-            .classified_by(ProviderConfidence::Confirmed, "1.4.0")
-            .unwrap()
+        let mut flow =
+            Flow::from_observation(full_observation(), FlowScope::InScope, Mechanism::Ebpf)
+                .unwrap()
+                .with_dns_names(vec!["api.openai.com".to_owned()])
+                .with_sni("api.openai.com")
+                .unwrap()
+                .classified_by(ProviderConfidence::Confirmed, "1.4.0")
+                .unwrap();
+        flow.interface = Some("utun4".to_owned());
+        flow
     }
 
     fn keys_of(value: &serde_json::Value) -> BTreeSet<String> {
@@ -1114,5 +1185,59 @@ pub(crate) mod tests {
         assert_eq!(record.scope_key(), Some("python3"));
         record.exe = Some("/srv/app/venv/bin/python3".to_owned());
         assert_eq!(record.scope_key(), Some("/srv/app/venv/bin/python3"));
+    }
+
+    #[test]
+    fn an_executable_path_never_reaches_the_record_body() {
+        // Determinism invariant 3 in the contract, produced rather than
+        // described. The observation carries the path, because the scope policy
+        // matches against it; the record carries the name, because the same
+        // scan run on two machines has to produce reports that differ only on
+        // what was observed. A developer's checkout under a home directory
+        // would otherwise put that directory into every flow it attributed.
+        let observed = Observation::new("h_1", 1, five_tuple(), SniSource::Absent)
+            .kernel_attributed(ProcessRecord {
+                exe: Some("/Users/someone/checkout/venv/bin/python3".to_owned()),
+                ..process()
+            });
+        let flow = Flow::from_observation(observed, FlowScope::InScope, Mechanism::Ebpf).unwrap();
+
+        let exe = flow
+            .process
+            .as_ref()
+            .and_then(|process| process.exe.as_deref());
+        assert_eq!(exe, Some("python3"));
+        let json = serde_json::to_string(&flow).unwrap();
+        assert!(!json.contains("/Users/someone"), "{json}");
+    }
+
+    #[test]
+    fn enrichment_that_never_happened_is_not_spelled_like_a_redaction() {
+        // The absence of `exe` means user space could not read it, which the
+        // component spec assigns a meaning to. Reducing a path to a name must
+        // not produce that absence, or a live process and a dead one become
+        // indistinguishable in the record.
+        let observed = Observation::new("h_1", 1, five_tuple(), SniSource::Absent)
+            .kernel_attributed(process());
+        let flow = Flow::from_observation(observed, FlowScope::InScope, Mechanism::Ebpf).unwrap();
+        assert_eq!(
+            flow.process
+                .as_ref()
+                .and_then(|process| process.exe.as_deref()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_stored_record_carrying_a_path_is_rejected_rather_than_reported() {
+        // A record written by a build that is not this one. Reading it into a
+        // report would carry another machine's layout into this one's output,
+        // and the rejection is counted like any other so the shortfall is not
+        // silent.
+        let mut flow = full_flow();
+        if let Some(process) = flow.process.as_mut() {
+            process.exe = Some("/srv/app/venv/bin/python3".to_owned());
+        }
+        assert_eq!(flow.validate().unwrap_err().reason(), "path_in_record_body");
     }
 }
