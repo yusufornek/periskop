@@ -266,9 +266,32 @@ fn evaluate<'a>(
     let source = parsed.source();
     let capture = |name: &str| capture_node(compiled, m, name);
 
+    // Two ways to return nothing from here, and they are not the same event.
+    //
+    // A rule that looked at a match and said no is the rule working, and it stays
+    // silent: the method was not one it names, or the receiver resolved to a
+    // different library. A rule that matched and then could not be *evaluated* is
+    // the engine failing, and it leaves an `INTERNAL` diagnostic naming the rule,
+    // because from the report alone the two are indistinguishable and a possible
+    // egress call is what sits between them.
+    //
+    // Why the second case is worth this much code. This tool exists to find the
+    // places where a program sends data somewhere without saying so. An engine
+    // that drops its own matches without saying so has no standing to report
+    // that, and every `?` below used to do exactly that: no finding, no coverage
+    // entry, no diagnostic, and a clean looking file. Defect AK-001 was three of
+    // five Java fixtures lost that way for an entire phase.
+
     // Cheap check first.
     if let Some(method) = &spec.method {
-        let node = capture(&method.capture)?;
+        let Some(node) = capture(&method.capture) else {
+            faults.push(format!(
+                "rule {:?} [[match]] {match_index} names a method capture @{} that its own \
+                 query does not produce, so the match was dropped without being judged",
+                rule.rule_id, method.capture
+            ));
+            return None;
+        };
         let called = source[node.byte_range()].to_owned();
         if !method.one_of.contains(&called) {
             return None;
@@ -278,8 +301,25 @@ fn evaluate<'a>(
     // A binding that does not resolve is not a weaker finding. It means the
     // receiver came from somewhere else entirely, so there is nothing to report.
     if let Some(binding) = &spec.binding {
-        let node = capture(&binding.capture)?;
-        let root = bindings::root_identifier(node, source)?;
+        let Some(node) = capture(&binding.capture) else {
+            faults.push(format!(
+                "rule {:?} [[match]] {match_index} names a binding capture @{} that its own \
+                 query does not produce, so the match was dropped without being judged",
+                rule.rule_id, binding.capture
+            ));
+            return None;
+        };
+        let Some(root) = bindings::root_identifier(node, source) else {
+            faults.push(format!(
+                "rule {:?} [[match]] {match_index} matched, but this engine cannot walk a \
+                 {} receiver in {:?} source back to the name it starts from, so the binding \
+                 was never checked and the match was dropped without being judged",
+                rule.rule_id,
+                node.kind(),
+                compiled.language()
+            ));
+            return None;
+        };
         if !table.satisfies(
             &root,
             &binding.resolves_to.module,

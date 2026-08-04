@@ -25,6 +25,8 @@ use std::collections::BTreeMap;
 
 use tree_sitter::Node;
 
+use crate::engine::bindings_java;
+
 /// The name a Python method uses for the instance it was called on.
 ///
 /// Convention rather than syntax: the grammar sees an ordinary parameter. Keying
@@ -280,9 +282,18 @@ fn assignment_target(left: Node<'_>, source: &str) -> Option<String> {
 
 /// The table key an attribute chain reads from: `a.b.c` yields `a`.
 ///
-/// Node names differ per grammar, so both vocabularies are listed. Python calls
-/// the node `attribute`, JavaScript calls it `member_expression`, and a resolver
-/// that only knows one of them silently stops resolving in the other language.
+/// Node names differ per grammar, so every vocabulary the engine parses is listed
+/// here. Python calls the node `attribute`, JavaScript calls it
+/// `member_expression`, Java calls it `field_access` and reaches a method through
+/// `method_invocation`. A resolver that only knows some of them stops resolving
+/// in the rest, and the cost is not a weaker answer but no answer at all: the
+/// caller cannot tell "this receiver is not that library" from "I could not read
+/// this receiver", and only the first of those is a rejection.
+///
+/// Java is the language that made that distinction expensive. Its rules capture
+/// the receiver as `object: (_) @recv`, so `client.chat().completions().create(p)`
+/// arrives here as a `method_invocation`, fell into `_ => None`, and three of the
+/// five Java fixtures produced nothing end to end (defect AK-001).
 ///
 /// A chain rooted at the instance receiver yields the qualified field key instead
 /// of the receiver itself. `self` and `this` name no value on their own, so
@@ -317,6 +328,18 @@ pub fn root_identifier(node: Node<'_>, source: &str) -> Option<String> {
             "call" | "call_expression" | "new_expression" | "parenthesized_expression" => {
                 current = current.child_by_field_name("function")?;
             }
+            // The Java vocabulary. Knowing the node names is only half of what
+            // Java needs: a receiver may be a package path written out in full
+            // (`com.openai.client.okhttp.OpenAIOkHttpClient.builder()`), and a
+            // field of `this` is bound under its plain name rather than under a
+            // qualified key the way Python and JavaScript fields are. Those rules
+            // belong to the Java collector, so the walk hands the node over
+            // instead of restating them here where the two copies would drift.
+            "method_invocation"
+            | "field_access"
+            | "object_creation_expression"
+            | "type_identifier"
+            | "scoped_type_identifier" => return bindings_java::root_identifier(current, source),
             _ => return None,
         }
     }
@@ -497,5 +520,61 @@ mod tests {
             Language::Python,
         );
         assert_eq!(key.as_deref(), Some("client"));
+    }
+
+    /// The key the receiver of the first Java call to `method` resolves to.
+    fn java_receiver_key(source: &str, method: &str) -> Option<String> {
+        let parsed = parse_as("T.java", source, Language::Java).ok()?;
+        let mut cursor = parsed.root_node().walk();
+        let mut stack = vec![parsed.root_node()];
+        while let Some(node) = stack.pop() {
+            let named = (node.kind() == "method_invocation")
+                .then(|| node.child_by_field_name("name"))
+                .flatten()
+                .map(|n| parsed.source()[n.byte_range()].to_owned());
+            if named.as_deref() == Some(method) {
+                let receiver = node.child_by_field_name("object")?;
+                return root_identifier(receiver, parsed.source());
+            }
+            stack.extend(node.children(&mut cursor));
+        }
+        None
+    }
+
+    #[test]
+    fn a_java_accessor_chain_resolves_through_the_shared_entry_point() {
+        // Defect AK-001, pinned where it actually broke. `detect` calls this
+        // function for every language, so a Java receiver that stops here stops
+        // the whole detection; the Java collector's own tests never saw it
+        // because they call the Java walker directly.
+        let key = java_receiver_key(
+            "class T {\n  void f(Object p) {\n    client.chat().completions().create(p);\n  }\n}\n",
+            "create",
+        );
+        assert_eq!(key.as_deref(), Some("client"));
+    }
+
+    #[test]
+    fn a_java_field_of_this_resolves_to_its_plain_name() {
+        // Java diverges from JavaScript here and the divergence is not cosmetic:
+        // the Java collector binds a field under its plain name, so returning the
+        // qualified `this.client` would look resolved and match nothing.
+        let key = java_receiver_key(
+            "class T {\n  void f(Object p) {\n    this.client.messages().create(p);\n  }\n}\n",
+            "create",
+        );
+        assert_eq!(key.as_deref(), Some("client"));
+    }
+
+    #[test]
+    fn a_fully_qualified_java_receiver_keeps_its_package_path() {
+        let key = java_receiver_key(
+            "class T {\n  void f() {\n    com.openai.client.okhttp.OpenAIOkHttpClient.builder().build();\n  }\n}\n",
+            "builder",
+        );
+        assert_eq!(
+            key.as_deref(),
+            Some("com.openai.client.okhttp.OpenAIOkHttpClient")
+        );
     }
 }

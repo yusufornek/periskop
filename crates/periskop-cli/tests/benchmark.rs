@@ -86,26 +86,6 @@ const MINIMUM_LABELED_EGRESS_POINTS: usize = 100;
 /// files is not a release gate whatever its value.
 const RECALL_FLOOR_BASIS_POINTS: u64 = 6_500;
 
-/// Root cause behind every `java` entry in [`OPEN_DEFECTS`].
-///
-/// `engine/bindings.rs::root_identifier` walks a receiver back to the name it
-/// started from, and it knows the Python node kinds (`attribute`, `call`) and
-/// the TypeScript ones (`member_expression`, `call_expression`,
-/// `new_expression`). Java's `method_invocation` and `field_access` fall through
-/// to `_ => None`. The Java rules capture the receiver as `object: (_) @recv`,
-/// so an ordinary accessor chain such as `client.chat().completions().create(p)`
-/// resolves to nothing, and `detect.rs::evaluate` then drops the match on the
-/// `?` after that call without recording an engine fault. A real provider call
-/// leaves the engine with no finding, no coverage entry and no diagnostic.
-///
-/// The Go rules avoid it by pinning the whole chain in the query and capturing
-/// `@recv` as an `(identifier)`, so Go is unaffected today by rule style rather
-/// than by anything in the engine.
-const DEFECT_JAVA_RECEIVER_CHAIN: &str =
-    "bindings.rs::root_identifier has no Java receiver node kinds, so a chained \
-     receiver resolves to nothing and detect.rs::evaluate drops the match \
-     silently. Owner: static-scanner engine (F2-B follow up).";
-
 /// Labeled fixtures currently lost to an open defect, with the defect named.
 ///
 /// This is deliberately not the gap catalogue and deliberately not a tolerated
@@ -118,19 +98,15 @@ const DEFECT_JAVA_RECEIVER_CHAIN: &str =
 /// entry starts being detected, so fixing the defect forces the entry out
 /// instead of leaving a stale exemption behind that would mask the next
 /// regression on the same fixture.
-const OPEN_DEFECTS: [(&str, &str, &str); 3] = [
-    (
-        "java",
-        "AnthropicMessagesCall.java",
-        DEFECT_JAVA_RECEIVER_CHAIN,
-    ),
-    ("java", "OpenAiClientCall.java", DEFECT_JAVA_RECEIVER_CHAIN),
-    (
-        "java",
-        "WildcardImportClient.java",
-        DEFECT_JAVA_RECEIVER_CHAIN,
-    ),
-];
+///
+/// Empty, and that is the intended resting state rather than an oversight. The
+/// three `java` entries this array held were the receiver chain defect AK-001:
+/// `bindings.rs::root_identifier` knew no Java node kinds, so `detect.rs`
+/// dropped a matched rule on a `?` and the file came back clean. Both halves are
+/// fixed (Java receivers resolve, and a match the engine cannot evaluate now
+/// leaves an `INTERNAL` diagnostic), so the entries are gone and the fixtures are
+/// back under the ordinary regression assertions.
+const OPEN_DEFECTS: [(&str, &str, &str); 0] = [];
 
 fn open_defects(language_dir: &str) -> BTreeSet<String> {
     OPEN_DEFECTS

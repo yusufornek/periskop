@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use periskop_core::finding::Confidence;
-use periskop_static_scanner::engine::detect;
+use periskop_static_scanner::engine::{detect, FileFindings};
 use periskop_static_scanner::language::Language;
 use periskop_static_scanner::parser::parse_as;
 use periskop_static_scanner::rules::{compile, load_directory, CompiledRules, RuleFile};
@@ -35,14 +35,18 @@ fn go_rules() -> (CompiledRules, Vec<RuleFile>) {
     (compiled, go)
 }
 
-fn scan(source: &str, name: &str) -> Vec<(String, Confidence)> {
+/// Everything one scan of one file produced: findings, coverage and faults.
+fn scan_all(source: &str, name: &str) -> FileFindings {
     let (compiled, rules) = go_rules();
     let parsed = match parse_as(name, source, Language::Go) {
         Ok(p) => p,
         Err(e) => panic!("{name} did not parse: {e}"),
     };
-    let result = detect(&parsed, &compiled, &rules);
-    result
+    detect(&parsed, &compiled, &rules)
+}
+
+fn scan(source: &str, name: &str) -> Vec<(String, Confidence)> {
+    scan_all(source, name)
         .findings
         .into_iter()
         .map(|f| (f.detector.rule_id, f.confidence))
@@ -242,11 +246,66 @@ fn scanning_the_same_source_twice_gives_the_same_result() {
 fn an_unknown_import_is_reported_as_unclaimed() {
     // "We have no detector for this" and "there is nothing here" are different
     // statements, and only the first one is true.
-    let (compiled, rules) = go_rules();
     let source = "package main\n\nimport \"github.com/acme/private-llm-go\"\n";
-    let parsed = parse_as("a.go", source, Language::Go).unwrap();
-    let result = detect(&parsed, &compiled, &rules);
-    assert!(result
+    assert!(scan_all(source, "a.go")
         .unclaimed_imports
         .contains(&"github.com/acme/private-llm-go".to_owned()));
+}
+
+#[test]
+fn every_engine_fault_over_the_corpus_is_one_this_suite_accounts_for() {
+    // A diagnostics channel nobody reads is the same as no diagnostics channel.
+    // The engine records a fault whenever it disagrees with itself, and until
+    // this test existed the Go suite never looked at one.
+    //
+    // The single class accounted for today is a declared downgrade the engine
+    // cannot evaluate: `base_url` sits on the constructor, and
+    // `constructor_arguments` indexes only the Python and TypeScript
+    // vocabularies, so for Go it reports "not evaluable" rather than guessing a
+    // destination. That is a limitation stated out loud, not a lost match.
+    //
+    // Anything else fails here. In particular a fault saying a match was dropped
+    // without being judged is defect AK-001 reappearing in Go, and the point of
+    // the assertion is that it would be read rather than buried in a report.
+    for group in ["positive", "negative", "evasion"] {
+        for (name, source) in fixtures(group) {
+            for fault in scan_all(&source, &name).engine_faults {
+                assert!(
+                    fault.contains("downgrades on"),
+                    "{name} produced an unaccounted engine fault: {fault:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_go_binding_capture_is_pinned_to_an_identifier() {
+    // Why Go was untouched by AK-001, written down so it stays a decision rather
+    // than a coincidence. The Java rules capture the receiver as `object: (_)`,
+    // which hands the engine whatever shape the source had; the Go rules pin
+    // theirs to `(identifier)`, so the receiver the engine has to walk back to a
+    // name is already a name.
+    //
+    // The engine no longer loses a match either way: an unwalkable receiver
+    // leaves an `INTERNAL` diagnostic now. But a rule loosened to `(_)` moves the
+    // whole family onto that path, which is a deliberate change and should not be
+    // possible to make by accident.
+    let (_, rules) = go_rules();
+    for rule in &rules {
+        for (index, spec) in rule.matches.iter().enumerate() {
+            let Some(binding) = &spec.binding else {
+                continue;
+            };
+            let pinned = format!("(identifier) @{}", binding.capture);
+            assert!(
+                spec.query.contains(&pinned),
+                "{} [[match]] {index} binds @{} to a receiver its query does not \
+                 pin to an identifier; the engine path that shape takes is the one \
+                 defect AK-001 lived on",
+                rule.rule_id,
+                binding.capture
+            );
+        }
+    }
 }
