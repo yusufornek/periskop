@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://periskop.dev/schemas/signature-envelope.schema.json",
+  "title": "SignatureEnvelope",
+  "type": "object",
+  "description": "Detached signature for a ScanReport. Kept outside the report so that a signed and an unsigned report are byte identical and key rotation does not rewrite the report.",
+  "$comment": "body_hash = blake3-256(canonical(ScanReport without envelope)). The signature covers the domain separation tag periskop/report-sig/v1 followed by body_hash.",
+  "required": [
+    "schema_version",
+    "report_id",
+    "body_hash",
+    "algorithm",
+    "key_id",
+    "value"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^\\d+\\.\\d+$" },
+    "report_id": { "type": "string", "pattern": "^rpt_[0-9a-f]{16}$" },
+    "body_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "blake3-256 over the canonical report body. The envelope block is the only field excluded from the scope."
+    },
+    "algorithm": {
+      "enum": ["ed25519"],
+      "description": "Extending this enum is a MAJOR change: it splits verifiers."
+    },
+    "key_id": { "type": "string", "minLength": 1 },
+    "value": {
+      "type": "string",
+      "minLength": 1,
+      "description": "base64url without padding."
+    },
+    "signed_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Outside the body hash scope."
+    }
+  }
+}

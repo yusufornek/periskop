@@ -1,0 +1,21 @@
+[package]
+name = "periskop-cli"
+description = "Command line interface. The only binary target in the workspace."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "periskop"
+path = "src/main.rs"
+
+[dependencies]
+periskop-core = { workspace = true }
+periskop-report = { workspace = true }
+periskop-static-scanner = { workspace = true }

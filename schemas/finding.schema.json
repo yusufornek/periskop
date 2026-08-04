@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://periskop.dev/schemas/finding.schema.json",
+  "title": "Finding",
+  "description": "A single evidence-backed assertion about an observed egress entity. A blind spot is not a Finding; it is counted in the coverage statement.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "finding_id",
+    "kind",
+    "source",
+    "confidence",
+    "provider_ref",
+    "refs",
+    "evidence",
+    "detector"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+$",
+      "description": "MAJOR.MINOR. Three segment semver is not used."
+    },
+    "finding_id": {
+      "type": "string",
+      "pattern": "^fnd_[0-9a-f]{16}$",
+      "description": "Deterministic, content addressed. blake3 of kind, source, primary_ref and detector.rule_id. Carries no line number."
+    },
+
+    "kind": {
+      "enum": [
+        "declared_egress_point",
+        "observed_egress_call",
+        "observed_network_flow",
+        "unclassified_egress",
+        "unmatched_wire_traffic",
+        "dormant_egress_point",
+        "target_drift",
+        "volume_anomaly"
+      ],
+      "description": "Type of the finding. The last four are produced only by reconciliation."
+    },
+    "source": {
+      "enum": ["declared", "observed-app", "observed-wire", "reconciled"],
+      "description": "Detection source. The only kebab-case enum in the contract set, fixed by ADR-006."
+    },
+    "confidence": {
+      "enum": ["confirmed", "suspect"],
+      "description": "Heuristic matches may only be suspect, never confirmed."
+    },
+    "provider_ref": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "description": "Provider identity. The value unknown is valid and must not be hidden."
+    },
+    "detector_severity": {
+      "enum": ["info", "low", "medium", "high", "critical"],
+      "description": "Detector opinion. Not a verdict; PASS/WARN/FAIL belongs to policy."
+    },
+    "egress_kind": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "Functional class of the egress, sourced from rule files. Deliberately not a closed enum in v1."
+    },
+
+    "refs": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Observation entities this finding is attached to. The first element, after ref_type ordering, feeds the identity.",
+      "items": {
+        "type": "object",
+        "required": ["ref_type", "ref_id"],
+        "additionalProperties": false,
+        "properties": {
+          "ref_type": { "enum": ["egress_point", "egress_event", "flow"] },
+          "ref_id": { "type": "string", "pattern": "^(ep|ee|fl)_[0-9a-f]{16}$" }
+        }
+      }
+    },
+
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Raw evidence references. A finding without evidence is invalid at schema level.",
+      "items": {
+        "type": "object",
+        "required": ["evidence_type", "ref"],
+        "additionalProperties": false,
+        "properties": {
+          "evidence_type": {
+            "enum": [
+              "ast_node",
+              "sdk_call_trace",
+              "http_header",
+              "sni",
+              "dns_query",
+              "pcap_flow",
+              "reconciliation_join"
+            ]
+          },
+          "ref": { "type": "string", "minLength": 1 },
+          "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      }
+    },
+
+    "detector": {
+      "type": "object",
+      "required": ["component", "rule_id", "rule_version", "rule_hash"],
+      "additionalProperties": false,
+      "properties": {
+        "component": {
+          "enum": ["static-scanner", "runtime-hooks", "network-sensor", "reconciliation"]
+        },
+        "rule_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Format: language.source.rule-name"
+        },
+        "rule_version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+        "rule_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+
+    "location": {
+      "type": "object",
+      "description": "Display only. No field here enters the finding_id computation.",
+      "required": ["component"],
+      "additionalProperties": false,
+      "properties": {
+        "component": {
+          "enum": ["static-scanner", "runtime-hooks", "network-sensor", "reconciliation"]
+        },
+        "path": {
+          "type": "string",
+          "description": "Relative to the repository root. Absolute paths are rejected."
+        },
+        "span": {
+          "type": "object",
+          "required": ["start_line", "start_col", "end_line", "end_col"],
+          "additionalProperties": false,
+          "properties": {
+            "start_line": { "type": "integer", "minimum": 1 },
+            "start_col": { "type": "integer", "minimum": 1 },
+            "end_line": { "type": "integer", "minimum": 1 },
+            "end_col": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "symbol": { "type": "string" },
+        "process": { "type": "string" },
+        "host": { "type": "string" },
+        "port": { "type": "integer", "minimum": 0, "maximum": 65535 }
+      }
+    },
+
+    "coverage_impact": {
+      "enum": [
+        "unresolved_target",
+        "unlinked_event",
+        "unhooked_process",
+        "degraded_attribution",
+        "none"
+      ]
+    },
+
+    "related_finding_ids": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^fnd_[0-9a-f]{16}$" },
+      "description": "Ascending order. Grouping is expressed here, not by a parent entity."
+    },
+
+    "data_sources": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Who saw this. Carries no timestamp: a wall clock value in the body would break byte identical reruns.",
+      "items": {
+        "type": "object",
+        "required": ["source", "detector_id"],
+        "additionalProperties": false,
+        "properties": {
+          "source": { "enum": ["declared", "observed-app", "observed-wire", "reconciled"] },
+          "detector_id": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  },
+
+  "allOf": [
+    {
+      "if": {
+        "properties": { "kind": { "const": "declared_egress_point" } },
+        "required": ["kind"]
+      },
+      "then": { "properties": { "source": { "const": "declared" } } }
+    },
+    {
+      "if": {
+        "properties": { "kind": { "const": "observed_egress_call" } },
+        "required": ["kind"]
+      },
+      "then": { "properties": { "source": { "const": "observed-app" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": { "enum": ["observed_network_flow", "unclassified_egress"] }
+        },
+        "required": ["kind"]
+      },
+      "then": { "properties": { "source": { "const": "observed-wire" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "enum": [
+              "unmatched_wire_traffic",
+              "dormant_egress_point",
+              "target_drift",
+              "volume_anomaly"
+            ]
+          }
+        },
+        "required": ["kind"]
+      },
+      "then": { "properties": { "source": { "const": "reconciled" } } }
+    }
+  ]
+}

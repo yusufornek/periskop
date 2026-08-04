@@ -1,0 +1,23 @@
+# Internal specifications and development coordination.
+# These are working documents, not part of the published project.
+docs/
+hub/
+CLAUDE.md
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Test corpus checkouts (defined by pinned commits in corpus.toml, never vendored)
+test-corpus/checkouts/
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,9 @@
+{
+  "schema_version": "1.0",
+  "report_id": "rpt_a04f27c9b1e35d8a",
+  "body_hash": "c17f4b0e93a2d685741ecb30f8925a6d0b3e47c1958fa2036d84b7e5109c3fa2",
+  "algorithm": "ed25519",
+  "key_id": "local-dev-2026",
+  "value": "MEUCIQDf3xk2Qm7pVc8YtR1bLwNhKzA9sJdX0aGvHnE4uToPmQIgB2cRlYwKjNfSpQ8vDzXoM1eUaHrT7ykL0bNcWi5AdgE",
+  "signed_at": "2026-08-04T09:00:03Z"
+}

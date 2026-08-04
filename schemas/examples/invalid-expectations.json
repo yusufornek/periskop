@@ -1,0 +1,19 @@
+{
+  "description": "Negative examples and the failure each one must produce. A negative example that fails for the wrong reason is as much a bug as one that passes, so CI matches the reported error rather than only the exit code.",
+  "cases": [
+    {
+      "file": "finding.invalid.json",
+      "schema": "finding.schema.json",
+      "violates": "kind and source pairing",
+      "expected_error_contains": "/source",
+      "rationale": "kind is declared_egress_point, which forces source to be declared. This exercises the conditional block, not just field presence."
+    },
+    {
+      "file": "report.no-coverage.invalid.json",
+      "schema": "report.schema.json",
+      "violates": "coverage statement is mandatory",
+      "expected_error_contains": "coverage",
+      "rationale": "A report without a coverage statement must be rejected at schema level. This is the honest coverage principle made unbreakable rather than merely documented."
+    }
+  ]
+}

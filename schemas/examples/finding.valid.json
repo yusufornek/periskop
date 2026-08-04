@@ -1,0 +1,36 @@
+{
+  "schema_version": "1.0",
+  "finding_id": "fnd_7c1e4a90b3d25f61",
+  "kind": "declared_egress_point",
+  "source": "declared",
+  "confidence": "confirmed",
+  "provider_ref": "openai",
+  "egress_kind": "llm_chat",
+  "detector_severity": "medium",
+  "refs": [
+    { "ref_type": "egress_point", "ref_id": "ep_3f0a91c7d4e28b56" }
+  ],
+  "evidence": [
+    {
+      "evidence_type": "ast_node",
+      "ref": "call_expression@services/customer.py",
+      "hash": "9f2c4a17be0d5386ca71fd90e4b2385c6710dd42fa9b0c3e75184d6a2fb03c9e"
+    }
+  ],
+  "detector": {
+    "component": "static-scanner",
+    "rule_id": "python.static.openai-chat-completions",
+    "rule_version": "1.0.0",
+    "rule_hash": "3b7d1e5f8a06c249de3f1b04a7c95d6e2f8013b4ca67d95e08f31a2b7c4d6e50"
+  },
+  "location": {
+    "component": "static-scanner",
+    "path": "services/customer.py",
+    "span": { "start_line": 14, "start_col": 12, "end_line": 17, "end_col": 6 },
+    "symbol": "summarize_customer"
+  },
+  "coverage_impact": "none",
+  "data_sources": [
+    { "source": "declared", "detector_id": "static-scanner/python" }
+  ]
+}

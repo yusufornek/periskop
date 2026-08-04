@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/periskop-core",
+    "crates/periskop-static-scanner",
+    "crates/periskop-report",
+    "crates/periskop-cli",
+]
+
+# Crates designed but not yet implemented. They join the workspace in their own
+# phase rather than sitting here empty:
+#   periskop-runtime-collector, periskop-network-sensor,
+#   periskop-reconcile, periskop-proxy
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/yusufornek/periskop"
+authors = ["periskop contributors"]
+
+[workspace.dependencies]
+periskop-core = { path = "crates/periskop-core" }
+periskop-static-scanner = { path = "crates/periskop-static-scanner" }
+periskop-report = { path = "crates/periskop-report" }
+
+blake3 = "1.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Silent failure is the defect class this product exists to expose. Treating these
+# as errors keeps the codebase honest about its own error paths.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

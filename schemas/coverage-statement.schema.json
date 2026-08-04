@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://periskop.dev/schemas/coverage-statement.schema.json",
+  "title": "CoverageStatement",
+  "type": "object",
+  "description": "Normative field list for the coverage statement. All 17 fields are required even when empty, because the gap between an absent field and a zero is the easiest way to break the honest coverage principle without anyone noticing. Engine, rule and schema errors do not belong here; they go to the report diagnostics block.",
+  "required": [
+    "parsed_files",
+    "unparsed_files",
+    "unresolved_targets",
+    "undetected_libraries",
+    "runtime_coverage",
+    "unrecognized_clients",
+    "unhooked_processes",
+    "dropped_events",
+    "unlinked_events",
+    "unattributed_flows",
+    "unclassified_flows",
+    "out_of_scope_flows",
+    "known_benign_flows",
+    "sensor_platform_class",
+    "dns_observation",
+    "observation_window_ms",
+    "reconciliation_mode"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "parsed_files": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Successfully parsed file count. Denominator of the unparsed ratio."
+    },
+    "unparsed_files": {
+      "type": "array",
+      "description": "Sorted by path ascending, at build time rather than at serialization time.",
+      "items": {
+        "type": "object",
+        "required": ["path", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "path": { "type": "string" },
+          "reason": {
+            "enum": [
+              "skipped_binary",
+              "skipped_too_large",
+              "unknown_language",
+              "no_grammar",
+              "parse_error",
+              "partial_parse",
+              "parse_timeout",
+              "io_error"
+            ]
+          }
+        }
+      }
+    },
+    "unresolved_targets": {
+      "type": "array",
+      "description": "Sorted by egress_point_id ascending.",
+      "items": {
+        "type": "object",
+        "required": ["egress_point_id", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "egress_point_id": { "type": "string", "pattern": "^ep_[0-9a-f]{16}$" },
+          "reason": {
+            "enum": [
+              "dynamic_expression",
+              "env_var",
+              "config_indirection",
+              "unsupported_pattern"
+            ]
+          }
+        }
+      }
+    },
+    "undetected_libraries": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Known libraries with no detector. Sorted lexicographically."
+    },
+
+    "runtime_coverage": {
+      "type": "array",
+      "description": "Hook status per language. A language without a hook is never silently counted as covered. Sorted by language ascending.",
+      "items": {
+        "type": "object",
+        "required": ["language", "status"],
+        "additionalProperties": false,
+        "properties": {
+          "language": {
+            "enum": [
+              "python",
+              "typescript",
+              "javascript",
+              "java",
+              "csharp",
+              "go",
+              "rust",
+              "kotlin",
+              "ruby",
+              "php"
+            ]
+          },
+          "status": {
+            "enum": ["instrumented", "not_instrumented", "degraded", "unsupported"],
+            "description": "not_instrumented means a mechanism exists but was not opted into. unsupported means no mechanism is defined. The two must not be merged: the first is a user choice, the second is a gap in the product."
+          },
+          "hook_mechanism": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$",
+            "description": "Which path was used. Fragile mechanisms stay visible in the report."
+          }
+        }
+      }
+    },
+    "unrecognized_clients": { "type": "integer", "minimum": 0 },
+    "unhooked_processes": { "type": "integer", "minimum": 0 },
+    "dropped_events": { "type": "integer", "minimum": 0 },
+    "unlinked_events": { "type": "integer", "minimum": 0 },
+
+    "unattributed_flows": { "type": "integer", "minimum": 0 },
+    "unclassified_flows": { "type": "integer", "minimum": 0 },
+    "out_of_scope_flows": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Attributed, but the process is not part of the scanned codebase. Excluded from false positive accounting, never hidden from the report."
+    },
+    "known_benign_flows": { "type": "integer", "minimum": 0 },
+
+    "sensor_platform_class": {
+      "enum": ["linux_ebpf", "macos_pcap", "windows_pcap_etw", "none"],
+      "description": "none means there was no network observation at all."
+    },
+    "dns_observation": { "enum": ["available", "unavailable_encrypted_dns"] },
+
+    "observation_window_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Duration only. Carries no wall clock stamp. Zero means no runtime or network observation."
+    },
+    "reconciliation_mode": {
+      "enum": ["full", "static_only", "static_plus_runtime", "static_plus_wire"],
+      "description": "Which sources fed reconciliation. The value partial does not exist."
+    }
+  }
+}

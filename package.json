@@ -1,0 +1,16 @@
+{
+  "name": "periskop-dev-tools",
+  "private": true,
+  "description": "Development and CI tooling for the periskop repository. Not a published package and not a dependency of the product binary.",
+  "type": "module",
+  "scripts": {
+    "validate:schemas": "node scripts/validate-schemas.mjs"
+  },
+  "devDependencies": {
+    "ajv-cli": "5.0.0",
+    "ajv-formats": "2.1.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,81 @@
+{
+  "schema_version": "1.0",
+  "report_id": "rpt_a04f27c9b1e35d8a",
+  "scan_run_id": "scan_51d8b3fa0c67e294",
+  "envelope": {
+    "generated_at": "2026-08-04T09:00:00Z",
+    "tool_version": "0.1.0"
+  },
+  "verdict": "PASS",
+  "findings": [
+    {
+      "schema_version": "1.0",
+      "finding_id": "fnd_7c1e4a90b3d25f61",
+      "kind": "declared_egress_point",
+      "source": "declared",
+      "confidence": "confirmed",
+      "provider_ref": "openai",
+      "egress_kind": "llm_chat",
+      "refs": [{ "ref_type": "egress_point", "ref_id": "ep_3f0a91c7d4e28b56" }],
+      "evidence": [
+        {
+          "evidence_type": "ast_node",
+          "ref": "call_expression@services/customer.py"
+        }
+      ],
+      "detector": {
+        "component": "static-scanner",
+        "rule_id": "python.static.openai-chat-completions",
+        "rule_version": "1.0.0",
+        "rule_hash": "3b7d1e5f8a06c249de3f1b04a7c95d6e2f8013b4ca67d95e08f31a2b7c4d6e50"
+      },
+      "location": {
+        "component": "static-scanner",
+        "path": "services/customer.py",
+        "span": { "start_line": 14, "start_col": 12, "end_line": 17, "end_col": 6 }
+      },
+      "coverage_impact": "none"
+    }
+  ],
+  "suspect_findings": [],
+  "coverage": {
+    "parsed_files": 412,
+    "unparsed_files": [
+      { "path": "assets/logo.png", "reason": "skipped_binary" },
+      { "path": "vendor/legacy.rb", "reason": "no_grammar" }
+    ],
+    "unresolved_targets": [
+      { "egress_point_id": "ep_9b2d47e1c0a85f36", "reason": "env_var" }
+    ],
+    "undetected_libraries": ["internal-ai-sdk"],
+    "runtime_coverage": [
+      { "language": "python", "status": "not_instrumented" },
+      { "language": "typescript", "status": "not_instrumented" }
+    ],
+    "unrecognized_clients": 0,
+    "unhooked_processes": 0,
+    "dropped_events": 0,
+    "unlinked_events": 0,
+    "unattributed_flows": 0,
+    "unclassified_flows": 0,
+    "out_of_scope_flows": 0,
+    "known_benign_flows": 0,
+    "sensor_platform_class": "none",
+    "dns_observation": "available",
+    "observation_window_ms": 0,
+    "reconciliation_mode": "static_only"
+  },
+  "policy_ref": {
+    "policy_id": "default",
+    "policy_version": "1.0.0",
+    "policy_hash": "5e9a1c73f80b2d46ea15c9037bf2e84d6a01c53b97e2fd40816a3c5d29b7e0f4",
+    "rule_hits": [
+      {
+        "rule_id": "coverage.unparsed-ratio",
+        "verdict": "PASS",
+        "coverage_condition": "coverage_unparsed_ratio <= 500"
+      }
+    ]
+  },
+  "diagnostics": []
+}

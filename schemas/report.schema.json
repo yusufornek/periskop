@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://periskop.dev/schemas/report.schema.json",
+  "title": "ScanReport",
+  "type": "object",
+  "description": "Final, signable and diffable output of a scan run. The same input produces byte identical output.",
+  "$comment": "The signature is NOT inside this object. It lives in a detached envelope, so a signed and an unsigned report are byte identical.",
+  "required": [
+    "schema_version",
+    "report_id",
+    "scan_run_id",
+    "envelope",
+    "verdict",
+    "findings",
+    "suspect_findings",
+    "coverage",
+    "policy_ref",
+    "diagnostics"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^\\d+\\.\\d+$" },
+    "report_id": { "type": "string", "pattern": "^rpt_[0-9a-f]{16}$" },
+    "scan_run_id": { "type": "string", "pattern": "^scan_[0-9a-f]{16}$" },
+
+    "envelope": {
+      "type": "object",
+      "description": "Time and environment. The single exception to the body hash scope, which is why two reports of the same tree at different times still hash identically.",
+      "required": ["generated_at", "tool_version"],
+      "additionalProperties": false,
+      "properties": {
+        "generated_at": { "type": "string", "format": "date-time" },
+        "tool_version": { "type": "string" },
+        "host": { "type": "string" }
+      }
+    },
+
+    "verdict": {
+      "enum": ["PASS", "WARN", "FAIL"],
+      "description": "Computed by policy, never written inside a finding. A coverage gap alone may not produce WARN; a declared threshold must be crossed and recorded in policy_ref.rule_hits."
+    },
+
+    "findings": {
+      "type": "array",
+      "description": "Confirmed findings only, sorted by finding_id ascending.",
+      "items": { "$ref": "finding.schema.json" }
+    },
+    "suspect_findings": {
+      "type": "array",
+      "description": "Heuristic findings, carried separately so they never blend into the confirmed list.",
+      "items": { "$ref": "finding.schema.json" }
+    },
+
+    "coverage": { "$ref": "coverage-statement.schema.json" },
+
+    "policy_ref": {
+      "type": "object",
+      "description": "Without this block a report cannot be reproduced or audited.",
+      "required": ["policy_id", "policy_version", "policy_hash", "rule_hits"],
+      "additionalProperties": false,
+      "properties": {
+        "policy_id": { "type": "string", "minLength": 1 },
+        "policy_version": { "type": "string", "minLength": 1 },
+        "policy_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "rule_hits": {
+          "type": "array",
+          "description": "Which rule carried which finding or condition to which verdict. Sorted by rule_id ascending.",
+          "items": {
+            "type": "object",
+            "required": ["rule_id", "verdict"],
+            "additionalProperties": false,
+            "properties": {
+              "rule_id": { "type": "string", "minLength": 1 },
+              "verdict": { "enum": ["PASS", "WARN", "FAIL"] },
+              "finding_ids": {
+                "type": "array",
+                "items": { "type": "string", "pattern": "^fnd_[0-9a-f]{16}$" }
+              },
+              "coverage_condition": {
+                "type": "string",
+                "description": "Present when the hit came from a coverage threshold rather than a finding. A PASS over a known coverage gap is only valid with such a record."
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "diagnostics": {
+      "type": "array",
+      "description": "Engine, rule and schema errors. Strictly separate from the coverage statement, because polluting coverage counters makes policy coverage thresholds meaningless. Required; an empty array is valid.",
+      "items": {
+        "type": "object",
+        "required": ["code", "component"],
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "enum": [
+              "UNSUPPORTED_SCHEMA_VERSION",
+              "CORE_UNAVAILABLE",
+              "RULE_LOAD_ERROR",
+              "POLICY_LOAD_ERROR",
+              "INTERNAL"
+            ]
+          },
+          "component": {
+            "enum": [
+              "static-scanner",
+              "runtime-hooks",
+              "network-sensor",
+              "reconciliation",
+              "reporting"
+            ]
+          },
+          "detail": { "type": "string" }
+        }
+      }
+    }
+  }
+}

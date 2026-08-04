@@ -1,0 +1,7 @@
+# Single source for the toolchain. The minimum supported version also appears as
+# rust-version in the workspace manifest, where Cargo enforces it; raising it counts
+# as a dependency decision rather than routine maintenance.
+[toolchain]
+channel = "1.91.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
