@@ -4,8 +4,10 @@
 //! syntax tree. Text matching is deliberately absent: a rule that fires on a string
 //! inside a comment produces a claim the evidence does not support.
 
+pub mod discovery;
 pub mod language;
 pub mod parser;
 
+pub use discovery::{discover, DiscoveredFile, Discovery, DiscoveryOptions, SkippedFile};
 pub use language::Language;
 pub use parser::{parse, parse_as, ParseFailure, ParsedFile};

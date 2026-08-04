@@ -13,6 +13,8 @@ workspace = true
 
 [dependencies]
 periskop-core = { workspace = true }
+blake3 = { workspace = true }
+ignore = { workspace = true }
 thiserror = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-python = { workspace = true }
