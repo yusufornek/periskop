@@ -1,0 +1,229 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://periskop.dev/schemas/proxy-event.schema.json",
+  "title": "ProxyEvent",
+  "description": "The deterministic measurement record the proxy produces for one request and response pair. Normative prose: docs/04-contracts/proxy-events.md. Absolute constraint: this record carries no value. Types, counts, ladder rungs and durations only. No raw text, no alias string, no prompt fragment, no vault content. additionalProperties is false at every level so that a field carrying a value is rejected by the validator rather than by review.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "session_scope",
+    "policy_version",
+    "policy_hash",
+    "ruleset_hash",
+    "masking_profile",
+    "alias_style",
+    "entities_masked",
+    "entities_allowed",
+    "unmasked_candidates",
+    "latency_ms",
+    "stream_stats",
+    "alias_stats",
+    "restore_stats",
+    "derived_dates_seen",
+    "vault_record_tamper",
+    "degraded_reasons"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+$",
+      "description": "MAJOR.MINOR. Three segment semver is not used."
+    },
+    "session_scope": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The same session identity the x-periskop-alias-scope header carries. Carries no alias to value mapping."
+    },
+    "policy_version": { "type": "string", "minLength": 1 },
+    "policy_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "blake3-256 of the canonical policy body, full hex. Not sha256."
+    },
+    "ruleset_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+
+    "masking_profile": {
+      "enum": ["pattern+dictionary", "pattern+dictionary+ner"],
+      "description": "Which detection layers actually ran. Derived from detection.ner.enabled, never written by policy. A latency or quality measurement without this label is invalid."
+    },
+    "alias_style": { "enum": ["type-preserving", "opaque"] },
+
+    "entities_masked": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["type", "count", "layer", "confidence_bucket"],
+        "additionalProperties": false,
+        "properties": {
+          "type": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+          "count": { "type": "integer", "minimum": 1 },
+          "layer": { "enum": ["pattern", "dictionary", "ner"] },
+          "confidence_bucket": {
+            "enum": ["deterministic", "high", "medium", "low"]
+          }
+        }
+      }
+    },
+
+    "entities_allowed": {
+      "type": "array",
+      "description": "Entities that crossed the boundary unmasked because policy said so. mode=allow is not silent: every one of them is counted here.",
+      "items": {
+        "type": "object",
+        "required": ["type", "count", "rule_scope"],
+        "additionalProperties": false,
+        "properties": {
+          "type": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+          "count": { "type": "integer", "minimum": 1 },
+          "rule_scope": {
+            "type": "string",
+            "description": "The scope expression of the rule that decided. The expression, never the matched content."
+          }
+        }
+      }
+    },
+
+    "unmasked_candidates": {
+      "type": "array",
+      "description": "NER candidates below the threshold. Type and confidence bucket only, no value. Empty in the F4 default profile because the layer does not run.",
+      "items": {
+        "type": "object",
+        "required": ["type", "count", "confidence_bucket"],
+        "additionalProperties": false,
+        "properties": {
+          "type": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+          "count": { "type": "integer", "minimum": 1 },
+          "confidence_bucket": { "enum": ["high", "medium", "low"] }
+        }
+      }
+    },
+
+    "latency_ms": {
+      "type": "object",
+      "required": ["detect", "alias", "stream_hold_total", "total"],
+      "additionalProperties": false,
+      "properties": {
+        "detect": { "type": "integer", "minimum": 0 },
+        "alias": { "type": "integer", "minimum": 0 },
+        "stream_hold_total": { "type": "integer", "minimum": 0 },
+        "derived_date_scan": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Populated only under date_policy = shift, which F4 does not implement. Optional so that an F4 build never has to write a zero that would read as a scan that ran and found nothing."
+        },
+        "total": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "stream_stats": {
+      "type": "object",
+      "required": [
+        "chunks",
+        "hold_events",
+        "hold_timeout_flush",
+        "hold_timeout_flush_depth_max",
+        "partial_alias_flushed",
+        "max_buffer_bytes",
+        "l_max_static",
+        "l_max_session"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "chunks": { "type": "integer", "minimum": 0 },
+        "hold_events": { "type": "integer", "minimum": 0 },
+        "hold_timeout_flush": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "F2 timeout fired. Expected consequence of on_hold_timeout = flush, not an error on its own."
+        },
+        "hold_timeout_flush_depth_max": { "type": "integer", "minimum": 0 },
+        "partial_alias_flushed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The timeout fired while the automaton was off the root node, so an unmasked alias fragment may have reached the client. Greater than zero is a WARN and is a different fact from hold_timeout_flush."
+        },
+        "max_buffer_bytes": { "type": "integer", "minimum": 0 },
+        "l_max_static": {
+          "enum": [32, 128],
+          "description": "Compile time constant chosen by alias_style: opaque is 32, type-preserving is 128 (ADR-010 section 2)."
+        },
+        "l_max_session": { "type": "integer", "minimum": 1, "maximum": 128 }
+      }
+    },
+
+    "alias_stats": {
+      "type": "object",
+      "required": [
+        "by_type",
+        "alias_pool_exhausted",
+        "alias_length_class_capped"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "by_type": {
+          "type": "object",
+          "propertyNames": { "pattern": "^[A-Z][A-Z0-9_]*$" },
+          "additionalProperties": {
+            "type": "object",
+            "required": ["count", "ladder_rung"],
+            "additionalProperties": false,
+            "properties": {
+              "count": { "type": "integer", "minimum": 1 },
+              "ladder_rung": {
+                "enum": ["R", "I", "O", "L"],
+                "description": "Which rung of the ADR-010 section 5.1 generation ladder produced this type. This is the runtime proof of P-0."
+              }
+            }
+          }
+        },
+        "alias_pool_exhausted": { "type": "integer", "minimum": 0 },
+        "alias_length_class_capped": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "restore_stats": {
+      "type": "object",
+      "required": [
+        "aliases_seen_in_response",
+        "aliases_restored",
+        "aliases_leaked"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "aliases_seen_in_response": { "type": "integer", "minimum": 0 },
+        "aliases_restored": { "type": "integer", "minimum": 0 },
+        "aliases_leaked": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Seen in the response but not restored. Greater than zero is an error and produces a WARN."
+        }
+      }
+    },
+
+    "derived_dates_seen": { "type": "integer", "minimum": 0 },
+    "vault_record_tamper": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Vault record AAD or tag verification failed. Every non zero value is a security event and ended in a 503."
+    },
+
+    "degraded_reasons": {
+      "type": "array",
+      "description": "Closed dictionary. The value of the x-periskop-degraded response header is taken from this list verbatim, so the spelling here is the spelling on the wire: snake_case. The kebab exception is Finding.source alone.",
+      "items": {
+        "enum": [
+          "ner_disabled",
+          "ner_skipped",
+          "ner_model_unavailable",
+          "dictionary_unavailable",
+          "language_unsupported",
+          "code_block_skipped",
+          "vault_memory_restart",
+          "tool_arguments_unmasked",
+          "endpoint_unsupported_passthrough"
+        ]
+      }
+    }
+  }
+}

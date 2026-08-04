@@ -1,0 +1,34 @@
+{
+  "policy_id": "acme-default",
+  "policy_version": "2026.08.1",
+  "default": { "mode": "mask" },
+  "rule": [
+    { "scope": "messages[*].content", "entity": "TCKN", "mode": "block" },
+    { "scope": "messages[0].content", "mode": "allow" },
+    { "entity": "DATE", "mode": "allow" }
+  ],
+  "alias_style": "type-preserving",
+  "date_policy": "allow",
+  "on_hold_timeout": "flush",
+  "code_block_policy": "pattern-only",
+  "tool_call_policy": "pass-through",
+  "detection": {
+    "ner": {
+      "enabled": false,
+      "threshold": 0.85,
+      "languages": ["tr", "en"],
+      "on_model_error": "strict"
+    }
+  },
+  "stream": {
+    "hold_timeout_ms": 40,
+    "l_max_session": 42
+  },
+  "dictionary": {
+    "source": "org-dictionary.toml",
+    "required": true
+  },
+  "affix_rules": {
+    "languages": ["tr"]
+  }
+}

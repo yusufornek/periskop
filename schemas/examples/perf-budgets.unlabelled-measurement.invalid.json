@@ -1,0 +1,36 @@
+{
+  "schema_version": "1.0",
+  "reference_environments": [
+    {
+      "environment_id": "ci-linux-4vcpu",
+      "cpu_model": "AMD EPYC 7763",
+      "cpu_cores": 4,
+      "memory_mib": 16384,
+      "os": "ubuntu-24.04",
+      "vault_profile": "ci"
+    }
+  ],
+  "budgets": [
+    {
+      "budget_id": "proxy.added_latency_p95_ms",
+      "component": "proxy",
+      "metric": "added latency p95 against the proxy free baseline",
+      "unit": "ms",
+      "comparison": "at_most",
+      "limit": 150,
+      "masking_profile": "pattern+dictionary",
+      "status": "binding",
+      "source": "vision.md success criterion 4, performance-budgets.md core profile"
+    }
+  ],
+  "measurements": [
+    {
+      "budget_id": "proxy.added_latency_p95_ms",
+      "component": "proxy",
+      "environment_id": "ci-linux-4vcpu",
+      "samples": [128, 131, 134],
+      "value": 131,
+      "verdict": "pass"
+    }
+  ]
+}

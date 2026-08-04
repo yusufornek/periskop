@@ -1,0 +1,36 @@
+{
+  "schema_version": "1.2",
+  "finding_id": "fnd_2b8d05a71fc36e94",
+  "kind": "unmasked_passthrough",
+  "source": "observed-app",
+  "confidence": "confirmed",
+  "provider_ref": "anthropic",
+  "egress_kind": "llm_chat",
+  "detector_severity": "high",
+  "declared_target": { "host": "api.anthropic.com" },
+  "operation": "messages.create",
+  "refs": [
+    { "ref_type": "proxy_exchange", "ref_id": "px_5c19e3a70bd4f826" }
+  ],
+  "evidence": [
+    {
+      "evidence_type": "proxy_exchange",
+      "ref": "px_5c19e3a70bd4f826#messages[2].content[0].input"
+    }
+  ],
+  "detector": {
+    "component": "proxy",
+    "rule_id": "proxy.tool-call.unmasked-arguments",
+    "rule_version": "1.0.0",
+    "rule_hash": "c41f8b90d27e6a35b01c9d84e5f27306a8b4c1d095e63f27a1b8054d3e9c6f72"
+  },
+  "location": {
+    "component": "proxy",
+    "host": "api.anthropic.com",
+    "port": 443
+  },
+  "coverage_impact": "none",
+  "data_sources": [
+    { "source": "observed-app", "detector_id": "proxy/anthropic-messages" }
+  ]
+}

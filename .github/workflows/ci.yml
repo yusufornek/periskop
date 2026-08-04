@@ -232,3 +232,19 @@ jobs:
       - name: Tests
         working-directory: packages/mcp-server
         run: node --test dist/*.test.js
+
+      # Every contract under schemas/ has had an ajv gate from the start except
+      # the MCP tool surface, which had only prose. Four deviations between
+      # docs/04-contracts/mcp-tools.md and this package survived for months
+      # because nothing compared them: a rule with no gate stays silent when it
+      # is broken, which is the defect this product exists to report.
+      #
+      # The gate derives the surface from the real registerTool list and the real
+      # handlers, then validates it against schemas/mcp-tools.schema.json. It is
+      # its own step rather than one more file behind the test glob because a
+      # gate has to say whether it ran. No --if-present and no || true: a missing
+      # schema, an empty registry or an argument type the describer cannot state
+      # all exit non zero rather than reporting green (CLAUDE.md O6b).
+      - name: Tool surface matches the contract
+        working-directory: packages/mcp-server
+        run: npm run gate:contract

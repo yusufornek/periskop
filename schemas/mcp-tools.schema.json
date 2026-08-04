@@ -1,0 +1,568 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://periskop.dev/schemas/mcp-tools.schema.json",
+  "title": "McpToolSurface",
+  "type": "object",
+  "description": "The MCP tool surface, as a document a machine can check. It names every tool the server registers, every argument each one accepts, the contractual core of every answer, and the error codes the surface can produce. docs/04-contracts/mcp-tools.md is the prose form of this file and must not disagree with it.",
+  "$comment": "Written because the prose form alone did not hold. Four deviations between mcp-tools.md and packages/mcp-server survived for months (a flat confidence argument, an integer per provider, summary.confirmed against by_confidence, an integer cursor against an opaque one) and every one was found by a person reading two files side by side. Every other contract in this directory has an ajv gate; this one had none, so the rule with no gate stayed silent when it was broken, which is the very failure mode this product exists to report. The document validated here is derived from packages/mcp-server/src/registry.ts and produced by running the real handlers, never written by hand: a hand written copy would be a fifth place to drift.",
+  "required": ["schema_version", "tools", "error_codes", "value_domains"],
+  "additionalProperties": false,
+
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+$",
+      "description": "MAJOR.MINOR, as ADR-006 fixes it for every schema here. Three segment semver is not used."
+    },
+
+    "tools": {
+      "type": "object",
+      "description": "Every registered tool, keyed by the name a caller invokes. The property list is closed and every name below is required: a tool the server serves and the contract does not name fails here, and so does a named tool the server stopped serving. Three further tools are defined in mcp-tools.md and marked NOT WRITTEN; they are absent here because this document describes what is served, and listing an unbuilt tool would make the gate assert something that is not true.",
+      "required": [
+        "scan_project",
+        "get_finding_detail",
+        "get_coverage_report",
+        "trace_reconciliation"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "scan_project": {
+          "type": "object",
+          "required": ["input", "response", "error_responses"],
+          "additionalProperties": false,
+          "properties": {
+            "input": {
+              "type": "object",
+              "description": "Arguments as zod declares them. The property list is closed, so a new argument has to be written here before it can be accepted.",
+              "required": ["path", "filter", "limit", "cursor"],
+              "additionalProperties": false,
+              "properties": {
+                "path": { "$ref": "#/$defs/requiredString" },
+                "filter": {
+                  "$comment": "Nested rather than flat. The contract names three filters on this tool and one is built; a flat argument would be renamed the day the second arrives, an object takes a new key instead.",
+                  "type": "object",
+                  "required": ["type", "required", "properties"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "type": { "const": "object" },
+                    "required": { "const": false },
+                    "properties": {
+                      "type": "object",
+                      "required": ["confidence"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "confidence": {
+                          "type": "object",
+                          "required": ["type", "required", "enum"],
+                          "additionalProperties": false,
+                          "properties": {
+                            "type": { "const": "string" },
+                            "required": { "const": false },
+                            "enum": { "const": ["confirmed", "suspect"] }
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "limit": {
+                  "type": "object",
+                  "required": ["type", "required", "minimum", "maximum"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "type": { "const": "integer" },
+                    "required": { "const": false },
+                    "minimum": { "const": 1 },
+                    "maximum": { "const": 100 }
+                  }
+                },
+                "cursor": {
+                  "$comment": "An integer offset, not an opaque token. The contract carried an opaque cursor with a has_more flag for a surface that never had a stored scan behind it; see mcp-tools.md, pagination.",
+                  "type": "object",
+                  "required": ["type", "required", "minimum"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "type": { "const": "integer" },
+                    "required": { "const": false },
+                    "minimum": { "const": 0 }
+                  }
+                }
+              }
+            },
+            "response": { "$ref": "#/$defs/scanResponse" },
+            "error_responses": { "$ref": "#/$defs/errorResponses" }
+          }
+        },
+
+        "get_finding_detail": {
+          "type": "object",
+          "required": ["input", "response", "error_responses"],
+          "additionalProperties": false,
+          "properties": {
+            "input": {
+              "type": "object",
+              "required": ["path", "finding_id"],
+              "additionalProperties": false,
+              "properties": {
+                "path": { "$ref": "#/$defs/requiredString" },
+                "finding_id": { "$ref": "#/$defs/requiredString" }
+              }
+            },
+            "response": { "$ref": "#/$defs/detailResponse" },
+            "error_responses": { "$ref": "#/$defs/errorResponses" }
+          }
+        },
+
+        "get_coverage_report": {
+          "type": "object",
+          "required": ["input", "response", "error_responses"],
+          "additionalProperties": false,
+          "properties": {
+            "input": {
+              "type": "object",
+              "required": ["path"],
+              "additionalProperties": false,
+              "properties": { "path": { "$ref": "#/$defs/requiredString" } }
+            },
+            "response": { "$ref": "#/$defs/coverageResponse" },
+            "error_responses": { "$ref": "#/$defs/errorResponses" }
+          }
+        },
+
+        "trace_reconciliation": {
+          "type": "object",
+          "required": ["input", "response", "error_responses"],
+          "additionalProperties": false,
+          "properties": {
+            "input": {
+              "type": "object",
+              "required": ["path", "finding_id", "max_depth"],
+              "additionalProperties": false,
+              "properties": {
+                "path": { "$ref": "#/$defs/requiredString" },
+                "finding_id": { "$ref": "#/$defs/requiredString" },
+                "max_depth": {
+                  "$comment": "Carries no minimum or maximum on purpose, and the absence is part of the contract rather than an oversight. The 1 to 25 range is checked in the handler so that an out of range value comes back as the shared INVALID_ARGUMENT envelope; enforced in the input schema it would throw before the tool ran and the caller would get a validation exception instead of the error shape the contract defines.",
+                  "type": "object",
+                  "required": ["type", "required"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "type": { "const": "integer" },
+                    "required": { "const": false }
+                  }
+                }
+              }
+            },
+            "response": { "$ref": "#/$defs/traceResponse" },
+            "error_responses": { "$ref": "#/$defs/errorResponses" }
+          }
+        }
+      }
+    },
+
+    "error_codes": {
+      "type": "array",
+      "description": "Every code the served surface actually produces, sorted. Items are drawn from the contract's closed table, so a code invented in the code and absent from mcp-tools.md fails here. The four in allOf are the ones produced today; one of them disappearing is also a change to the contract, because a tool that stops refusing has stopped telling the caller something.",
+      "minItems": 4,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/errorCode" },
+      "allOf": [
+        { "contains": { "const": "CORE_UNAVAILABLE" } },
+        { "contains": { "const": "FINDING_NOT_FOUND" } },
+        { "contains": { "const": "INVALID_ARGUMENT" } },
+        { "contains": { "const": "TRACE_UNSUPPORTED" } }
+      ]
+    },
+
+    "value_domains": {
+      "type": "object",
+      "description": "Fields whose accepted values this contract closes, with every value the server can actually produce. The responses above are sampled: one reference report runs through the real handlers and the shape it produces is what gets checked, which is the only way a shape can be produced at all. A value set cannot be sampled the same way. One report drives each producing function down one branch, so the enums below were being checked against the single value that report happened to carry, and a contract that says 'the values of this field are these three' was in practice saying 'one of the values of this field is this one'. Each entry here is derived by running the producing function into every state it has and comparing the result with the exported constants it returns; the two must agree in both directions, so a value nothing produces and a value nothing declares are both failures.",
+      "$comment": "Written after the gate that introduced this document was found to be narrower than it read. Breaking SENSOR_NOT_RUNNING into a spelling with a space in it left the gate green, because reconciliation_mode was 'full' in the one reference report and network_sensor therefore only ever answered 'running'; only breaking SENSOR_RUNNING turned it red. Three of the sensor's states and three of the hook reduction's four were named by the contract and guarded by nothing. The property list is closed and both entries are required: a domain that stops being derived is a set that stopped being proven, and it has to fail here rather than disappear quietly.",
+      "required": ["network_sensor", "runtime_hooks"],
+      "additionalProperties": false,
+      "properties": {
+        "network_sensor": {
+          "type": "object",
+          "required": ["values", "fields"],
+          "additionalProperties": false,
+          "properties": {
+            "values": {
+              "$comment": "Pinned as a whole rather than as membership. An enum keyword would accept any subset, which is the check that let three of these values go unguarded; const accepts this list and nothing else, in this order, so a value dropped from the producer fails here as loudly as a value misspelled in it.",
+              "const": ["running", "not_running", "unknown"]
+            },
+            "fields": {
+              "description": "The answers this set governs. Both tools answer the sensor question with the same word, and pinning the list means a third answer field cannot start carrying the value without being written into the contract, nor an existing one stop carrying it in silence.",
+              "const": [
+                "get_coverage_report.response.network_sensor",
+                "scan_project.response.coverage.network_sensor"
+              ]
+            }
+          }
+        },
+        "runtime_hooks": {
+          "type": "object",
+          "required": ["values", "fields"],
+          "additionalProperties": false,
+          "properties": {
+            "values": { "const": ["instrumented", "degraded", "not_instrumented", "unknown"] },
+            "fields": { "const": ["scan_project.response.coverage.runtime_hooks"] }
+          }
+        }
+      }
+    }
+  },
+
+  "$defs": {
+    "requiredString": {
+      "type": "object",
+      "required": ["type", "required"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "string" },
+        "required": { "const": true }
+      }
+    },
+
+    "errorCode": {
+      "description": "The contract's closed code table. Codes with no producer today are listed because the distinctions they draw are real and the table is where a new producer looks first; a code outside the table is a second vocabulary for the caller to learn.",
+      "enum": [
+        "PATH_NOT_FOUND",
+        "UNSUPPORTED_ROOT",
+        "CORE_UNAVAILABLE",
+        "SCAN_IN_PROGRESS",
+        "FINDING_NOT_FOUND",
+        "SCAN_NOT_FOUND",
+        "TRACE_UNSUPPORTED",
+        "INVALID_ARGUMENT",
+        "RATE_LIMITED",
+        "UNSUPPORTED_SCHEMA_VERSION"
+      ]
+    },
+
+    "errorResponses": {
+      "type": "array",
+      "description": "How this tool refuses. At least one, because a tool whose refusal is never produced has an error shape nothing checks.",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/errorEnvelope" }
+    },
+
+    "errorEnvelope": {
+      "type": "object",
+      "description": "The one shape every tool answers a failure with. A handler that invents a second shape gives the caller a second thing to learn, and a caller who has not learned it reads a failure as a result.",
+      "required": ["error"],
+      "additionalProperties": false,
+      "properties": {
+        "error": {
+          "type": "object",
+          "required": ["code", "message", "retryable"],
+          "additionalProperties": false,
+          "properties": {
+            "code": { "$ref": "#/$defs/errorCode" },
+            "message": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Human readable. Not pinned by this schema: the wording is allowed to improve, the code is not allowed to move."
+            },
+            "retryable": {
+              "type": "boolean",
+              "description": "Whether the same request can succeed later. False for every code produced today; a pool that has drained is the case this exists for."
+            }
+          }
+        }
+      }
+    },
+
+    "confidence": { "enum": ["confirmed", "suspect"] },
+
+    "findingId": { "type": "string", "pattern": "^fnd_[0-9a-f]{16}$" },
+
+    "count": { "type": "integer", "minimum": 0 },
+
+    "nullableCount": { "type": ["integer", "null"], "minimum": 0 },
+
+    "coverageNote": {
+      "type": ["string", "null"],
+      "description": "What this answer cannot be read at face value for. Null when nothing is wrong and never null when something is: a note that appears on every answer stops being read, and one that never appears hides the reason the answer is short (README principle 4)."
+    },
+
+    "scanResponse": {
+      "type": "object",
+      "description": "The summary first answer. Closed, so a field added to the response has to be written into the contract before it can ship.",
+      "required": ["verdict", "summary", "coverage", "findings", "page", "coverage_note"],
+      "additionalProperties": false,
+      "properties": {
+        "verdict": {
+          "type": "string",
+          "description": "The policy decision the engine produced. Published rather than computed here: the verdict belongs to reporting (ADR-006) and this tool passes it through."
+        },
+        "summary": {
+          "type": "object",
+          "required": [
+            "confirmed",
+            "suspected",
+            "unmatched_wire_traffic",
+            "reconciliation_mode",
+            "by_provider"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "confirmed": { "$ref": "#/$defs/count" },
+            "suspected": { "$ref": "#/$defs/count" },
+            "unmatched_wire_traffic": {
+              "allOf": [{ "$ref": "#/$defs/nullableCount" }],
+              "description": "Findings where data left the machine and no code explains it. Null, never zero, when any finding does not state its kind: zero would answer none to a question nothing was asked."
+            },
+            "reconciliation_mode": {
+              "type": "string",
+              "description": "Which sources fed the run. Free string rather than the four value enum of coverage-statement.schema.json because an unrecognised mode is passed through rather than flattened to unknown; it is what the report said, and a reader can look it up."
+            },
+            "by_provider": {
+              "type": "object",
+              "description": "Findings per provider, counted over both lists so a provider seen only among suspected findings is still named. The value is a split counter and not one integer: a single number merges what the engine proved with what it could not rule out, which is the separation the two lists exist to keep (CLAUDE.md forbids reporting heuristic matches anywhere but a separate list, and that rule sits above this contract).",
+              "additionalProperties": {
+                "type": "object",
+                "required": ["confirmed", "suspect"],
+                "additionalProperties": false,
+                "properties": {
+                  "confirmed": { "$ref": "#/$defs/count" },
+                  "suspect": { "$ref": "#/$defs/count" }
+                }
+              }
+            }
+          }
+        },
+        "coverage": {
+          "type": "object",
+          "description": "Travels with the summary rather than waiting to be asked for. A caller who sees only counts would read zero findings as nothing to find, which is a different claim (ADR-005).",
+          "required": [
+            "files_read",
+            "files_unread",
+            "libraries_without_rules",
+            "runtime_hooks",
+            "network_sensor"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "files_read": { "$ref": "#/$defs/count" },
+            "files_unread": { "$ref": "#/$defs/count" },
+            "libraries_without_rules": { "type": "array", "items": { "type": "string" } },
+            "runtime_hooks": {
+              "enum": ["instrumented", "degraded", "not_instrumented", "unknown"],
+              "description": "A one line reduction of the per language list, four valued and never a boolean. Unknown is the answer when the report named no language or named a status this server has not been taught: false there was published as the hooks were not attached, a claim about the user's machine built from a list the server never received. Degraded keeps its own word, because folding it into instrumented claims coverage the report did not and folding it into not_instrumented drops observations that exist. Spelled snake_case under ADR-006 K-09, which allows two documented exceptions and no third; not_instrumented also matches the sibling status this value is reduced from."
+            },
+            "network_sensor": {
+              "enum": ["running", "not_running", "unknown"],
+              "description": "Three states for the same reason. Not seeing a sensor is not the same as there not being one. Spelled snake_case under ADR-006 K-09."
+            }
+          }
+        },
+        "findings": {
+          "type": "array",
+          "description": "One line per finding, enough to decide whether to ask for more. Never the whole record: that is get_finding_detail.",
+          "items": {
+            "type": "object",
+            "required": ["finding_id", "provider", "confidence", "rule_id", "location"],
+            "additionalProperties": false,
+            "properties": {
+              "finding_id": { "$ref": "#/$defs/findingId" },
+              "provider": { "type": "string" },
+              "confidence": { "$ref": "#/$defs/confidence" },
+              "rule_id": { "type": "string" },
+              "location": {
+                "type": ["string", "null"],
+                "description": "One string, path or path:line, and null when the finding names no path. A line is written only when the report carries a span: a defaulted line 1 is a location rather than the absence of one, and it sent readers to the import block to look for a call that is not there. The contract's earlier file and line pair is superseded by this single field; see mcp-tools.md."
+              }
+            }
+          }
+        },
+        "page": {
+          "type": "object",
+          "required": ["confidence", "cursor", "limit", "next_cursor", "total", "other"],
+          "additionalProperties": false,
+          "properties": {
+            "confidence": { "$ref": "#/$defs/confidence" },
+            "cursor": { "$ref": "#/$defs/count" },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+            "next_cursor": {
+              "allOf": [{ "$ref": "#/$defs/nullableCount" }],
+              "description": "The offset of the next page, null on the last one. An integer offset rather than an opaque token and there is no has_more flag: null already carries that, and a second field saying the same thing is a second field to keep in step."
+            },
+            "total": { "$ref": "#/$defs/count" },
+            "other": {
+              "type": "object",
+              "description": "The list this answer is not showing, with the argument that pages it. Structured rather than described, so that reaching the rest of the findings does not depend on the caller having read the tool description.",
+              "required": ["confidence", "total", "fetch_with"],
+              "additionalProperties": false,
+              "properties": {
+                "confidence": { "$ref": "#/$defs/confidence" },
+                "total": { "$ref": "#/$defs/count" },
+                "fetch_with": {
+                  "type": "object",
+                  "required": ["filter"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "filter": {
+                      "type": "object",
+                      "required": ["confidence"],
+                      "additionalProperties": false,
+                      "properties": { "confidence": { "$ref": "#/$defs/confidence" } }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "coverage_note": { "$ref": "#/$defs/coverageNote" }
+      }
+    },
+
+    "detailResponse": {
+      "type": "object",
+      "description": "One finding, as the engine wrote it.",
+      "required": ["finding"],
+      "additionalProperties": false,
+      "properties": {
+        "finding": {
+          "$comment": "Referenced rather than restated. findings-schema.md owns the Finding record and this contract only projects it; a second definition here would be the drift this file exists to catch, one directory further along.",
+          "$ref": "finding.schema.json"
+        }
+      }
+    },
+
+    "coverageResponse": {
+      "type": "object",
+      "description": "What the scan could not see. Answers whether a clean scan means clean or means unread.",
+      "required": [
+        "files_read",
+        "unread",
+        "unread_total",
+        "libraries_without_rules",
+        "runtime_coverage",
+        "reconciliation_mode",
+        "network_sensor",
+        "flow_buckets"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "files_read": { "$ref": "#/$defs/count" },
+        "unread": {
+          "type": "array",
+          "description": "Capped at 100 entries. The cap is not pagination and does not pretend to be: unread_total carries the real count, so a truncated list says it was truncated. Section and cursor arguments are defined in mcp-tools.md and NOT WRITTEN, so entries past the hundredth are not reachable through this tool.",
+          "items": {
+            "type": "object",
+            "required": ["path", "reason"],
+            "additionalProperties": true,
+            "properties": {
+              "path": { "type": "string" },
+              "reason": { "type": "string" }
+            }
+          }
+        },
+        "unread_total": { "$ref": "#/$defs/count" },
+        "libraries_without_rules": { "type": "array", "items": { "type": "string" } },
+        "runtime_coverage": {
+          "type": ["array", "null"],
+          "description": "Per language hook status, as the engine wrote it. Null and not an empty array when the report carried no list: an empty array reads as every language was checked and none was hooked, which is a claim nobody made.",
+          "items": {
+            "type": "object",
+            "required": ["language", "status"],
+            "additionalProperties": true,
+            "properties": {
+              "language": { "type": "string" },
+              "status": {
+                "enum": ["instrumented", "not_instrumented", "degraded", "unsupported"],
+                "description": "The four values of coverage-statement.schema.json. not_instrumented and unsupported may not be merged: the first is an option the user can turn on, the second is a gap in the product."
+              },
+              "hook_mechanism": { "type": "string" }
+            }
+          }
+        },
+        "reconciliation_mode": { "type": "string" },
+        "network_sensor": { "enum": ["running", "not_running", "unknown"] },
+        "flow_buckets": {
+          "type": "object",
+          "description": "Counts, never lists, and never left out. Four of them hold flows that produced no finding; a bucket that keeps traffic out of the count and then vanishes from the answer is a silent drop (K-15). in_scope_flows is the denominator they are read against, not a fifth bucket: 412 flows out of scope is a rounding error against 40000 and most of the traffic against 450.",
+          "required": [
+            "in_scope_flows",
+            "out_of_scope_flows",
+            "known_benign_flows",
+            "unattributed_flows",
+            "unclassified_flows"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "in_scope_flows": { "$ref": "#/$defs/nullableCount" },
+            "out_of_scope_flows": { "$ref": "#/$defs/nullableCount" },
+            "known_benign_flows": { "$ref": "#/$defs/nullableCount" },
+            "unattributed_flows": { "$ref": "#/$defs/nullableCount" },
+            "unclassified_flows": { "$ref": "#/$defs/nullableCount" }
+          }
+        }
+      }
+    },
+
+    "traceResponse": {
+      "type": "object",
+      "description": "Why a derived finding exists: the join rungs that were tried, the sources that contributed and the difference itself.",
+      "required": [
+        "finding_id",
+        "kind",
+        "source",
+        "join_path",
+        "contributing_sources",
+        "discrepancy",
+        "truncated",
+        "coverage_note"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "finding_id": { "$ref": "#/$defs/findingId" },
+        "kind": { "type": ["string", "null"] },
+        "source": { "type": ["string", "null"] },
+        "join_path": {
+          "type": ["array", "null"],
+          "description": "Nullable, and null is not an empty array. A reconciled finding is the join of at least two records, so zero rungs cannot be a fact about the finding; an empty array there stated that the join was walked and had no steps, when what happened is that the evidence could not be read. coverage_note says which.",
+          "items": {
+            "type": "object",
+            "required": ["join", "from_ref", "to_ref", "key_fields", "outcome"],
+            "additionalProperties": false,
+            "properties": {
+              "join": { "type": "string" },
+              "from_ref": { "type": ["string", "null"] },
+              "to_ref": { "type": ["string", "null"] },
+              "key_fields": { "type": "array", "items": { "type": "string" } },
+              "outcome": { "type": "string" }
+            }
+          }
+        },
+        "contributing_sources": {
+          "type": ["array", "null"],
+          "description": "Nullable for the same reason. Zero contributing sources is not a state a reconciled finding can be in, so an empty list would report this projection's own failure in the words of a fact. Projected from Finding.data_sources when the finding carries that block, and derived from refs when it does not, in which case the per source detector is null and coverage_note says so.",
+          "items": {
+            "type": "object",
+            "required": ["source", "detector_id"],
+            "additionalProperties": false,
+            "properties": {
+              "source": { "enum": ["declared", "observed-app", "observed-wire", "reconciled"] },
+              "detector_id": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "discrepancy": {
+          "type": ["object", "null"],
+          "description": "The difference itself. Null is the correct answer for a kind such as a dormant code point, where nothing was observed; a rung naming one side and not the other is therefore never dropped in silence, because that produced the same null and it read as the dormant answer.",
+          "required": ["kind", "expected", "observed"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "type": "string" },
+            "expected": { "type": "string" },
+            "observed": { "type": "string" }
+          }
+        },
+        "truncated": { "type": "boolean" },
+        "coverage_note": { "$ref": "#/$defs/coverageNote" }
+      }
+    }
+  }
+}

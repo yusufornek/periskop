@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://periskop.dev/schemas/perf-budgets.schema.json",
+  "title": "PerfBudgets",
+  "description": "The threshold file performance-budgets.md refers to as perf-budgets.json, plus the measurements CI compares against it. Format notes and the reference environment declaration live in docs/06-delivery/perf-budgets.md. Two rules are enforced here rather than by review, because both have already been broken once in prose: an unmeasured budget may not carry a number, and a proxy measurement may not omit the masking profile it was taken under.",
+  "type": "object",
+  "required": ["schema_version", "reference_environments", "budgets"],
+  "additionalProperties": false,
+  "$defs": {
+    "component": {
+      "enum": [
+        "static-scanner",
+        "mcp-server",
+        "proxy",
+        "network-sensor",
+        "runtime-hooks"
+      ]
+    },
+    "masking_profile": {
+      "enum": ["pattern+dictionary", "pattern+dictionary+ner"],
+      "description": "Taken verbatim from ProxyEvent.masking_profile. The two profiles have different budgets and their numbers may never share a time series."
+    }
+  },
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^\\d+\\.\\d+$" },
+
+    "reference_environments": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Every budget number assumes one of these. A measurement taken anywhere else is not comparable and is not written into the same series.",
+      "items": {
+        "type": "object",
+        "required": [
+          "environment_id",
+          "cpu_model",
+          "cpu_cores",
+          "memory_mib",
+          "os"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "environment_id": { "type": "string", "minLength": 1 },
+          "cpu_model": { "type": "string", "minLength": 1 },
+          "cpu_cores": { "type": "integer", "minimum": 1 },
+          "memory_mib": { "type": "integer", "minimum": 1 },
+          "os": { "type": "string", "minLength": 1 },
+          "vault_profile": {
+            "enum": ["default", "ci"],
+            "description": "Argon2id profile in force. The default profile costs 256 MiB and every measurement that opens the vault carries that floor, so a number taken under the ci profile is not comparable with one taken under the default."
+          }
+        }
+      }
+    },
+
+    "budgets": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["budget_id", "component", "metric", "unit", "status"],
+        "additionalProperties": false,
+        "properties": {
+          "budget_id": { "type": "string", "pattern": "^[a-z][a-z0-9_.]*$" },
+          "component": { "$ref": "#/$defs/component" },
+          "metric": { "type": "string", "minLength": 1 },
+          "unit": { "enum": ["ms", "mib", "percent", "lines_per_second"] },
+          "comparison": {
+            "enum": ["at_most", "at_least"],
+            "description": "Which direction violates. Required for a binding budget."
+          },
+          "limit": { "type": "number" },
+          "masking_profile": { "$ref": "#/$defs/masking_profile" },
+          "status": {
+            "enum": ["binding", "unmeasured"],
+            "description": "unmeasured means the number does not exist yet. It is a first class state, not a placeholder to be filled with a guess: an invented threshold produces design decisions that rest on it."
+          },
+          "source": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Where the number comes from, so that relaxing it is traceable to a document rather than to a commit."
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": { "status": { "const": "binding" } },
+              "required": ["status"]
+            },
+            "then": { "required": ["limit", "comparison"] }
+          },
+          {
+            "if": {
+              "properties": { "status": { "const": "unmeasured" } },
+              "required": ["status"]
+            },
+            "then": { "not": { "required": ["limit"] } }
+          },
+          {
+            "if": {
+              "properties": { "component": { "const": "proxy" } },
+              "required": ["component"]
+            },
+            "then": { "required": ["masking_profile"] }
+          }
+        ]
+      }
+    },
+
+    "measurements": {
+      "type": "array",
+      "description": "Optional. CI appends here; the file is still valid before the first run.",
+      "items": {
+        "type": "object",
+        "required": [
+          "budget_id",
+          "component",
+          "environment_id",
+          "samples",
+          "value",
+          "verdict"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "budget_id": { "type": "string", "pattern": "^[a-z][a-z0-9_.]*$" },
+          "component": { "$ref": "#/$defs/component" },
+          "environment_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Must name a declared reference environment. A measurement with no environment is not comparable with anything, which is why the field has no default."
+          },
+          "masking_profile": { "$ref": "#/$defs/masking_profile" },
+          "samples": {
+            "type": "array",
+            "minItems": 3,
+            "items": { "type": "number" },
+            "description": "Budget verdicts are read off the median of three runs; a single run does not decide."
+          },
+          "value": {
+            "type": "number",
+            "description": "The median of samples. Stored rather than recomputed so the series is readable without the runner."
+          },
+          "verdict": { "enum": ["pass", "fail"] }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": { "component": { "const": "proxy" } },
+              "required": ["component"]
+            },
+            "then": { "required": ["masking_profile"] }
+          }
+        ]
+      }
+    }
+  }
+}

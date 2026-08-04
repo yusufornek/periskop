@@ -56,6 +56,38 @@ function schemaForExample(name) {
   return existsSync(join(schemaDir, candidate)) ? candidate : null;
 }
 
+// Two schemas in this directory are both called a policy and mean unrelated things:
+// policy.schema.json is the PASS/WARN/FAIL verdict policy of the report pipeline,
+// proxy-policy.schema.json is the masking policy of the proxy. A copied $id would
+// make ajv resolve one when the other was asked for, and the mistake would surface
+// as a policy file that validates against rules nobody wrote for it. Identity is
+// checked here rather than trusted.
+function checkSchemaIdentities() {
+  const schemas = readdirSync(schemaDir).filter((f) => f.endsWith(".schema.json"));
+  const seen = new Map();
+  let problems = 0;
+
+  for (const file of schemas) {
+    const id = JSON.parse(readFileSync(join(schemaDir, file), "utf8"))["$id"];
+    if (!id) {
+      console.error(`FAIL ${file}: schema has no $id`);
+      problems++;
+      continue;
+    }
+    if (seen.has(id)) {
+      console.error(`FAIL ${file}: $id ${id} is already used by ${seen.get(id)}`);
+      problems++;
+      continue;
+    }
+    seen.set(id, file);
+    if (!id.endsWith(`/${file}`)) {
+      console.error(`FAIL ${file}: $id ${id} does not end in the file's own name`);
+      problems++;
+    }
+  }
+  return problems;
+}
+
 const expectationsPath = join(exampleDir, "invalid-expectations.json");
 const expectations = JSON.parse(readFileSync(expectationsPath, "utf8"));
 const expectedByFile = new Map(expectations.cases.map((c) => [c.file, c]));
@@ -64,7 +96,7 @@ const examples = readdirSync(exampleDir)
   .filter((f) => f.endsWith(".json") && f !== "invalid-expectations.json")
   .sort();
 
-let failures = 0;
+let failures = checkSchemaIdentities();
 let checked = 0;
 
 for (const file of examples) {

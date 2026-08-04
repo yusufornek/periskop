@@ -1,0 +1,8 @@
+{
+  "policy_id": "acme-default",
+  "policy_version": "2026.08.1",
+  "default": { "mode": "mask" },
+  "rule": [
+    { "scope": "messages[*].content", "entity": "SGK_NO", "mode": "block" }
+  ]
+}

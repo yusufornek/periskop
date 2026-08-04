@@ -8,17 +8,25 @@
 // per tool.
 //
 // One rule shapes every function here. A field the report does not carry is
-// unknown, and unknown is not the same answer as no. A server that says "not
-// running" when nothing told it either way is making a claim about the machine
-// on the strength of its own ignorance, which is the substitution this product
-// exists to refuse: not seeing something is not the same as it not being there.
+// unknown, and unknown is not the same answer as no. A server that says
+// `not_running` when nothing told it either way is making a claim about the
+// machine on the strength of its own ignorance, which is the substitution this
+// product exists to refuse: not seeing something is not the same as it not
+// being there.
+//
+// The values below are snake_case because ADR-006 (K-09) writes every schema
+// enum that way and documents exactly two exceptions, neither of which is this
+// one. They were spelled with spaces until the contract gate froze them, which
+// would have made a third spelling; `runtime_coverage[].status` in
+// coverage-statement.schema.json already carries the sibling `not_instrumented`,
+// so a client comparing against the spelling it read there would never match.
 
 import type { Coverage, Finding } from "./report.js";
 
 /** A source that was there. */
 export const SENSOR_RUNNING = "running";
 /** A source that was not, on the report's own word. */
-export const SENSOR_NOT_RUNNING = "not running";
+export const SENSOR_NOT_RUNNING = "not_running";
 /**
  * Neither of the above, and deliberately a third word.
  *
@@ -33,7 +41,7 @@ export const HOOKS_INSTRUMENTED = "instrumented";
 /** Hooks were attached but partially, and no language is fully covered. */
 export const HOOKS_DEGRADED = "degraded";
 /** Every language the report named says no hook ran. */
-export const HOOKS_NOT_INSTRUMENTED = "not instrumented";
+export const HOOKS_NOT_INSTRUMENTED = "not_instrumented";
 
 /** Modes whose source list includes the wire (coverage-statement.schema.json). */
 const MODES_WITH_WIRE: ReadonlySet<string> = new Set(["full", "static_plus_wire"]);

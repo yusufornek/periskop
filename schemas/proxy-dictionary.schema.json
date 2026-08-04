@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://periskop.dev/schemas/proxy-dictionary.schema.json",
+  "title": "ProxyDictionary",
+  "description": "The organization word list that detection layer B scans for. The operator authors it; the proxy imports it into the encrypted vault at startup and keeps no plaintext copy of its own (proxy/spec.md section 3.2). The file itself holds the very names this component exists to keep from leaving, so it is the operator's secret at rest and periskop never copies it, echoes an entry back over /admin/*, or writes one into a ProxyEvent. Every entry must name its entity type: an entry with no type has no alias generator, and an untyped entry that loaded anyway would be scanned for and then fail at alias time, mid request.",
+  "type": "object",
+  "required": ["schema_version", "dictionary_id", "entries"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+$",
+      "description": "MAJOR.MINOR, same discipline as every other contract here."
+    },
+    "dictionary_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable identity of this list. It feeds ruleset_hash so a report can say which list was in force without saying what was in it."
+    },
+    "entries": {
+      "type": "array",
+      "description": "May be empty. An empty list is a working configuration: layer B runs and matches nothing, which is a different state from the layer being unavailable (degraded_reasons = dictionary_unavailable).",
+      "items": {
+        "type": "object",
+        "required": ["value", "type"],
+        "additionalProperties": false,
+        "properties": {
+          "value": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The literal to match. Matching is word boundary aware and, for languages listed in affix_rules, affix aware."
+          },
+          "type": {
+            "enum": ["PERSON", "ORG", "LOC", "ADDRESS", "HOST", "API_KEY", "SECRET"],
+            "description": "Which alias generator claims this entry. Restricted to the types a word list can legitimately carry: the checksum bearing types (TCKN, IBAN, VKN, CREDIT_CARD) are detected by layer A, whose validation is self proving, and listing one of them here would move a decision that verifies itself onto a list that cannot."
+          }
+        }
+      }
+    }
+  }
+}

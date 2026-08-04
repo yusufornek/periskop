@@ -44,6 +44,55 @@
       "rationale": "The sensor observes destinations, not contents. A field for payload bytes would turn the component deployed to find leaks into one, so the schema refuses it rather than relying on every implementation to leave it out."
     },
     {
+      "file": "finding.proxy-component.invalid.json",
+      "schema": "finding.schema.json",
+      "violates": "detector.component is a closed enum",
+      "expected_error_contains": "/detector/component",
+      "rationale": "Until schema version 1.2 the value proxy failed here exactly as proxy-admin does now: the enum listed four components and the proxy was not one of them, so the component that intercepts the traffic could not emit a contract shaped finding at all. Adding proxy to the enum is what closed that gap, and this example is the proof that the enum is still a gate rather than a comment: a component name nobody registered is rejected, not carried through into a report as if some detector had produced it."
+    },
+    {
+      "file": "proxy-event.invalid.json",
+      "schema": "proxy-event.schema.json",
+      "violates": "the measurement record may not carry a value",
+      "expected_error_contains": "alias_samples",
+      "rationale": "The absolute constraint of this contract is that the record carries types, counts, rungs and durations, never a value. A field holding alias strings or raw entity text would turn the component built to keep data inside into the thing that writes it to disk on every request, so additionalProperties refuses the field outright instead of trusting each producer to leave it out."
+    },
+    {
+      "file": "proxy-policy.unknown-entity.invalid.json",
+      "schema": "proxy-policy.schema.json",
+      "violates": "entity type identifiers are a closed set",
+      "expected_error_contains": "/rule/0/entity",
+      "rationale": "A rule naming a type no detector produces cannot mask anything. Accepting it silently is the worst outcome available: the operator reads the policy, believes identity numbers are blocked, and the data leaves unmasked. Fail closed at load is the only honest answer, and the three load errors in proxy-policy.md section 7 are kept distinguishable so the message tells the operator which mistake they made."
+    },
+    {
+      "file": "proxy-policy.unknown-key.invalid.json",
+      "schema": "proxy-policy.schema.json",
+      "violates": "unknown keys are rejected, and P-0 may not be relaxed by one",
+      "expected_error_contains": "allow_realistic_identifiers",
+      "rationale": "Two rules meet in this example. Unknown keys stop the load because a silently ignored key is a setting the operator believes is in force. This particular key is also the one ADR-010 named and refused: no key may relax P-0 into generating an identifier that could belong to a real person. A closed property set is what keeps that refusal from depending on review."
+    },
+    {
+      "file": "proxy-policy.unknown-mode.invalid.json",
+      "schema": "proxy-policy.schema.json",
+      "violates": "mode values are a closed set",
+      "expected_error_contains": "/default/mode",
+      "rationale": "redact is not a mode. A loader that shrugged and fell back to the default would answer a request to remove data by masking it under a different rule than the operator asked for. The error points at the offending path so this failure is distinguishable from the unknown type and unknown key cases, which is what proxy-policy.md section 7 requires of the three."
+    },
+    {
+      "file": "proxy-dictionary.untyped-entry.invalid.json",
+      "schema": "proxy-dictionary.schema.json",
+      "violates": "every dictionary entry must map to an entity type",
+      "expected_error_contains": "missingProperty: 'type'",
+      "rationale": "An entry with no type has no alias generator behind it. Loading it would produce a match at scan time and a failure at alias time, in the middle of a request that has already been accepted; the same value would then be either dropped or passed through depending on error handling. Requiring the mapping at load turns a mid request failure into a startup failure."
+    },
+    {
+      "file": "perf-budgets.unlabelled-measurement.invalid.json",
+      "schema": "perf-budgets.schema.json",
+      "violates": "a proxy measurement must declare the masking profile it was taken under",
+      "expected_error_contains": "missingProperty: 'masking_profile'",
+      "rationale": "performance-budgets.md states that a proxy latency measurement with no profile declared is invalid, because the two profiles answer to different budgets and their numbers may not share a series. Without the field a NER profile number lands next to core profile numbers and the trend line reads as a regression that never happened, or a real one hides behind it. The schema enforces what the prose asserted."
+    },
+    {
       "file": "flow.sni-without-handshake.invalid.json",
       "schema": "flow.schema.json",
       "violates": "a server name may only exist where the handshake showed one",

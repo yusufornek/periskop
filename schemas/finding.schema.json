@@ -34,12 +34,13 @@
         "observed_egress_call",
         "observed_network_flow",
         "unclassified_egress",
+        "unmasked_passthrough",
         "unmatched_wire_traffic",
         "dormant_egress_point",
         "target_drift",
         "volume_anomaly"
       ],
-      "description": "Type of the finding. The last four are produced only by reconciliation."
+      "description": "Type of the finding. The last four are produced only by reconciliation. unmasked_passthrough is produced only by the proxy: content crossed the boundary without masking and the proxy is saying so out loud."
     },
     "source": {
       "enum": ["declared", "observed-app", "observed-wire", "reconciled"],
@@ -98,8 +99,13 @@
         "required": ["ref_type", "ref_id"],
         "additionalProperties": false,
         "properties": {
-          "ref_type": { "enum": ["egress_point", "egress_event", "flow"] },
-          "ref_id": { "type": "string", "pattern": "^(ep|ee|fl)_[0-9a-f]{16}$" }
+          "ref_type": {
+            "enum": ["egress_point", "egress_event", "flow", "proxy_exchange"]
+          },
+          "ref_id": {
+            "type": "string",
+            "pattern": "^(ep|ee|fl|px)_[0-9a-f]{16}$"
+          }
         }
       }
     },
@@ -121,7 +127,8 @@
               "sni",
               "dns_query",
               "pcap_flow",
-              "reconciliation_join"
+              "reconciliation_join",
+              "proxy_exchange"
             ]
           },
           "ref": { "type": "string", "minLength": 1 },
@@ -136,7 +143,13 @@
       "additionalProperties": false,
       "properties": {
         "component": {
-          "enum": ["static-scanner", "runtime-hooks", "network-sensor", "reconciliation"]
+          "enum": [
+            "static-scanner",
+            "runtime-hooks",
+            "network-sensor",
+            "reconciliation",
+            "proxy"
+          ]
         },
         "rule_id": {
           "type": "string",
@@ -155,7 +168,13 @@
       "additionalProperties": false,
       "properties": {
         "component": {
-          "enum": ["static-scanner", "runtime-hooks", "network-sensor", "reconciliation"]
+          "enum": [
+            "static-scanner",
+            "runtime-hooks",
+            "network-sensor",
+            "reconciliation",
+            "proxy"
+          ]
         },
         "path": {
           "type": "string",
@@ -228,12 +247,28 @@
     },
     {
       "if": {
-        "properties": {
-          "kind": { "enum": ["observed_network_flow", "unclassified_egress"] }
-        },
+        "properties": { "kind": { "const": "observed_network_flow" } },
         "required": ["kind"]
       },
       "then": { "properties": { "source": { "const": "observed-wire" } } }
+    },
+    {
+      "if": {
+        "properties": { "kind": { "const": "unclassified_egress" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "properties": {
+          "source": { "enum": ["observed-wire", "observed-app"] }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "kind": { "const": "unmasked_passthrough" } },
+        "required": ["kind"]
+      },
+      "then": { "properties": { "source": { "const": "observed-app" } } }
     },
     {
       "if": {

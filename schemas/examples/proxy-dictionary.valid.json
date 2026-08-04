@@ -1,0 +1,9 @@
+{
+  "schema_version": "1.0",
+  "dictionary_id": "acme-people-and-projects",
+  "entries": [
+    { "value": "Ornek Kullanici", "type": "PERSON" },
+    { "value": "Kestane", "type": "ORG" },
+    { "value": "build-01.corp.example", "type": "HOST" }
+  ]
+}

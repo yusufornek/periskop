@@ -1,0 +1,56 @@
+{
+  "schema_version": "1.0",
+  "reference_environments": [
+    {
+      "environment_id": "ci-linux-4vcpu",
+      "cpu_model": "AMD EPYC 7763",
+      "cpu_cores": 4,
+      "memory_mib": 16384,
+      "os": "ubuntu-24.04",
+      "vault_profile": "ci"
+    }
+  ],
+  "budgets": [
+    {
+      "budget_id": "proxy.added_latency_p95_ms",
+      "component": "proxy",
+      "metric": "added latency p95 against the proxy free baseline",
+      "unit": "ms",
+      "comparison": "at_most",
+      "limit": 150,
+      "masking_profile": "pattern+dictionary",
+      "status": "binding",
+      "source": "vision.md success criterion 4, performance-budgets.md core profile"
+    },
+    {
+      "budget_id": "proxy.rss_peak_mib",
+      "component": "proxy",
+      "metric": "peak resident set size under load",
+      "unit": "mib",
+      "masking_profile": "pattern+dictionary",
+      "status": "unmeasured",
+      "source": "performance-budgets.md, proxy RSS ceiling is still to be measured"
+    },
+    {
+      "budget_id": "static_scanner.lines_per_second",
+      "component": "static-scanner",
+      "metric": "single core scan throughput",
+      "unit": "lines_per_second",
+      "comparison": "at_least",
+      "limit": 100000,
+      "status": "binding",
+      "source": "performance-budgets.md component table"
+    }
+  ],
+  "measurements": [
+    {
+      "budget_id": "proxy.added_latency_p95_ms",
+      "component": "proxy",
+      "environment_id": "ci-linux-4vcpu",
+      "masking_profile": "pattern+dictionary",
+      "samples": [128, 131, 134],
+      "value": 131,
+      "verdict": "pass"
+    }
+  ]
+}

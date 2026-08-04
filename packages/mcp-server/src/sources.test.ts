@@ -60,6 +60,25 @@ test("not running and unknown are different words", () => {
   assert.notEqual(SENSOR_RUNNING, UNKNOWN);
 });
 
+test("every source state is spelled snake_case, as ADR-006 requires of an enum", () => {
+  // These were spelled with spaces, which made a third spelling beside the two
+  // exceptions ADR-006 K-09 documents and allows. The concrete failure: a client
+  // compares runtime_hooks against "not_instrumented", the spelling it read off
+  // runtime_coverage[].status in coverage-statement.schema.json, from which this
+  // value is reduced. The comparison never holds, and a run with no hooks behind
+  // it is read as a hooked one, which is the reading this field exists to deny.
+  for (const state of [
+    SENSOR_RUNNING,
+    SENSOR_NOT_RUNNING,
+    UNKNOWN,
+    HOOKS_INSTRUMENTED,
+    HOOKS_DEGRADED,
+    HOOKS_NOT_INSTRUMENTED,
+  ]) {
+    assert.match(state, /^[a-z]+(?:_[a-z]+)*$/, `${state} is not snake_case`);
+  }
+});
+
 test("a report that does not state its mode is unknown, not static_only", () => {
   // Filling in the commonest mode would be the same lie in a quieter form: the
   // reader would be told one source spoke when nothing said how many did.

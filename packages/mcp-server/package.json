@@ -5,12 +5,13 @@
   "license": "Apache-2.0",
   "type": "module",
   "bin": { "periskop-mcp": "dist/index.js" },
-  "files": ["dist"],
+  "files": ["dist", "!dist/contract/**", "!dist/*.test.*"],
   "scripts": {
     "build": "tsc",
     "lint": "tsc --noEmit",
     "test": "node --test dist/*.test.js",
-    "check": "npm run lint && npm run build && npm run test"
+    "gate:contract": "node dist/contract/contract-gate.js",
+    "check": "npm run lint && npm run build && npm run test && npm run gate:contract"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.21.1",
@@ -18,6 +19,7 @@
   },
   "devDependencies": {
     "@types/node": "22.10.2",
+    "ajv": "8.20.0",
     "typescript": "5.7.2"
   },
   "engines": { "node": ">=20" }

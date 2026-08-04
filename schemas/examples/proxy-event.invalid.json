@@ -1,0 +1,51 @@
+{
+  "schema_version": "1.0",
+  "session_scope": "sess_9f2c1ab7",
+  "policy_version": "2026.08.1",
+  "policy_hash": "3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b",
+  "ruleset_hash": "b3d4f0c1a9e8776552e1c0b4a37d9f6e2c8b5a41d0f9e7c6b5a4938271605f4e",
+  "masking_profile": "pattern+dictionary",
+  "alias_style": "type-preserving",
+  "entities_masked": [
+    {
+      "type": "IBAN",
+      "count": 1,
+      "layer": "pattern",
+      "confidence_bucket": "deterministic"
+    }
+  ],
+  "entities_allowed": [],
+  "unmasked_candidates": [],
+  "alias_samples": ["TR330006100519786457841326", "PERSON_1"],
+  "latency_ms": {
+    "detect": 6,
+    "alias": 12,
+    "stream_hold_total": 31,
+    "total": 88
+  },
+  "stream_stats": {
+    "chunks": 12,
+    "hold_events": 0,
+    "hold_timeout_flush": 0,
+    "hold_timeout_flush_depth_max": 0,
+    "partial_alias_flushed": 0,
+    "max_buffer_bytes": 0,
+    "l_max_static": 128,
+    "l_max_session": 26
+  },
+  "alias_stats": {
+    "by_type": {
+      "IBAN": { "count": 1, "ladder_rung": "I" }
+    },
+    "alias_pool_exhausted": 0,
+    "alias_length_class_capped": 0
+  },
+  "restore_stats": {
+    "aliases_seen_in_response": 1,
+    "aliases_restored": 1,
+    "aliases_leaked": 0
+  },
+  "derived_dates_seen": 0,
+  "vault_record_tamper": 0,
+  "degraded_reasons": ["ner_disabled"]
+}

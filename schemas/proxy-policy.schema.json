@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://periskop.dev/schemas/proxy-policy.schema.json",
+  "title": "ProxyPolicy",
+  "description": "Machine checkable form of the proxy masking policy, docs/04-contracts/proxy-policy.md. The file an operator edits is policy.toml; this schema describes its canonical JSON projection, which is what the loader validates after parsing and what CI validates in schemas/examples. THIS IS NOT policy.schema.json. That file is the PASS/WARN/FAIL verdict policy of the report pipeline (docs/04-contracts/policy-schema.md) and shares nothing with this one but the word policy: different $id, different fields, different owner, different failure mode. Neither file supersedes the other and neither may be extended to cover the other's concept.",
+  "type": "object",
+  "required": ["policy_id", "policy_version", "default"],
+  "additionalProperties": false,
+  "$defs": {
+    "entity_type": {
+      "description": "Closed set. An unrecognized type identifier stops the load rather than being ignored: a silently dropped rule sends data the operator believes is masked. Spelling is UPPER_SNAKE, which is the one documented exception to the snake_case enum rule, because the identifier also appears inside the alias itself (PSK_TCKN_..., PERSON_1) and ADR-010 section 5.2 fixes that table.",
+      "enum": [
+        "IBAN",
+        "TCKN",
+        "VKN",
+        "CREDIT_CARD",
+        "EMAIL",
+        "PHONE",
+        "IPV4",
+        "IPV6",
+        "API_KEY",
+        "SECRET",
+        "URL",
+        "HOST",
+        "DATE",
+        "PERSON",
+        "ORG",
+        "LOC",
+        "ADDRESS"
+      ]
+    },
+    "mode": {
+      "enum": ["mask", "block", "allow"],
+      "description": "allow means no masking. It does not mean no record: every entity that crosses under allow is counted in entities_allowed of the ProxyEvent."
+    }
+  },
+  "properties": {
+    "policy_id": { "type": "string", "minLength": 1 },
+    "policy_version": { "type": "string", "minLength": 1 },
+
+    "default": {
+      "type": "object",
+      "required": ["mode"],
+      "additionalProperties": false,
+      "properties": { "mode": { "$ref": "#/$defs/mode" } }
+    },
+
+    "rule": {
+      "type": "array",
+      "description": "Field scoped rules. Narrowest scope wins; at equal narrowness block beats mask beats allow. The ordering is conservative and cannot be relaxed by a new key.",
+      "items": {
+        "type": "object",
+        "required": ["mode"],
+        "additionalProperties": false,
+        "properties": {
+          "scope": {
+            "type": "string",
+            "minLength": 1,
+            "description": "JSON path into the request body. Absent means every scanned field."
+          },
+          "entity": { "$ref": "#/$defs/entity_type" },
+          "mode": { "$ref": "#/$defs/mode" }
+        }
+      }
+    },
+
+    "alias_style": {
+      "enum": ["type-preserving", "opaque"],
+      "description": "Default type-preserving. opaque drops every type to rung O of the ADR-010 ladder. P-0 holds in both styles."
+    },
+    "date_policy": {
+      "enum": ["allow", "block", "shift"],
+      "description": "Default allow. shift is a valid value of this contract and is NOT implemented in the F4 build: a policy that asks for it fails the load with a distinguishable message rather than falling back to allow. See proxy-policy.md section 7."
+    },
+    "derived_date_action": {
+      "enum": ["annotate", "fail"],
+      "description": "Meaningful only under date_policy = shift. There is no ignore value and none may be added: a derived date silently off by delta is wrong data delivered to the user."
+    },
+    "on_hold_timeout": {
+      "enum": ["flush", "wait"],
+      "description": "Default flush, which trades a possible unmasked alias fragment for latency and counts it in partial_alias_flushed. wait trades latency for the masking guarantee. There is no third option that flushes without counting."
+    },
+    "code_block_policy": {
+      "enum": ["pattern-only", "full", "skip"],
+      "description": "Default pattern-only: inside fenced code blocks only the deterministic pattern layer runs."
+    },
+    "tool_call_policy": {
+      "enum": ["pass-through", "reject"],
+      "description": "What happens to structured tool call and tool result arguments, which F4 does not mask. Default pass-through: the arguments cross unmasked and the gap is declared loudly (x-periskop-degraded header, degraded_reasons entry, unmasked_passthrough finding). reject refuses the request instead. Silent pass-through is not one of the values."
+    },
+
+    "detection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ner": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Default false. true is a valid value of this contract and is NOT implemented in the F4 build; the loader stops with a distinguishable message. masking_profile is derived from this key and is never written directly."
+            },
+            "threshold": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+            "languages": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "enum": ["tr", "en"] }
+            },
+            "on_model_error": { "enum": ["strict", "degraded"] }
+          }
+        }
+      }
+    },
+
+    "stream": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hold_timeout_ms": { "type": "integer", "minimum": 0 },
+        "l_max_session": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 128,
+          "description": "Never above L_MAX_STATIC. A configuration that exceeds it is rejected: the lookahead window is a correctness bound, not a tuning knob."
+        }
+      }
+    },
+
+    "dictionary": {
+      "type": "object",
+      "description": "Where layer B loads the organization word list from. The list itself is not inlined here: policy files get copied, reviewed and committed, and an inline list would put the very names this component exists to protect into a plaintext file that travels.",
+      "required": ["source"],
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path to the dictionary file, resolved relative to the policy file. Contract: proxy-dictionary.schema.json."
+        },
+        "required": {
+          "type": "boolean",
+          "description": "Default true. When true a missing or unreadable dictionary stops startup. When false the proxy starts with layer B empty and declares degraded_reasons = dictionary_unavailable on every request; it never starts silently without the list."
+        }
+      }
+    },
+
+    "affix_rules": {
+      "type": "object",
+      "description": "Language specific affix aware matching for layer B, which is what lets Ahmet in the dictionary match Ahmet'in. Directory contract: rules/masking/<lang>/, deliberately not rules/<lang>/, which holds static scanner detector rules in a different rule language.",
+      "additionalProperties": false,
+      "properties": {
+        "languages": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["tr"] },
+          "description": "Closed set. A language listed here must have a rules/masking/<lang>/ directory; a listed language with no rule directory stops the load rather than matching without affix handling, because the difference is silent under-masking."
+        }
+      }
+    }
+  }
+}

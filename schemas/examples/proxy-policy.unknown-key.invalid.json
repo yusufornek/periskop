@@ -1,0 +1,6 @@
+{
+  "policy_id": "acme-default",
+  "policy_version": "2026.08.1",
+  "default": { "mode": "mask" },
+  "allow_realistic_identifiers": true
+}
