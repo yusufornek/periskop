@@ -11,7 +11,7 @@ use clap::{Args, Parser, Subcommand};
 
 use periskop_cli::clock::now_rfc3339;
 use periskop_cli::hook::{self, Ambient, HookError, HookRequest, Language};
-use periskop_cli::{policy, render, rpc, scan, sensor};
+use periskop_cli::{policy, proxy, render, rpc, scan, sensor};
 
 // The two halves of report signing. Modules of the binary rather than of the
 // library, because they are command surfaces: argument parsing, file paths and
@@ -105,6 +105,14 @@ enum Command {
     /// rather than failing or pretending the machine was quiet.
     Sensor(SensorArgs),
 
+    /// Mask what leaves for a model provider, and put it back in the answer.
+    ///
+    /// Today it opens the encrypted vault and stops, because the request path is
+    /// not built yet. It ends non zero and says so rather than listening and
+    /// passing traffic through unmasked, which is the one thing a proxy with this
+    /// job may never do. The passphrase is read from standard input.
+    Proxy(ProxyArgs),
+
     /// Serve the engine over JSON-RPC on stdin and stdout.
     ///
     /// Used by the MCP server, which stays a thin client so that detection lives
@@ -169,6 +177,17 @@ struct SensorArgs {
     /// Machine identity to stamp records with. Hashed before it is written.
     #[arg(long, value_name = "ID")]
     host_id: Option<String>,
+}
+
+#[derive(Args)]
+struct ProxyArgs {
+    /// Argon2id profile the vault key is derived under.
+    ///
+    /// `default` is the shipped strength (256 MiB). `ci` lowers it to 64 MiB for
+    /// machines that cannot spare the memory, and saying so is not free: the run
+    /// prints a note that the vault is cheaper to attack offline.
+    #[arg(long, value_name = "default|ci")]
+    vault_profile: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -239,6 +258,7 @@ fn main() -> ExitCode {
             max_unparsed_ratio,
         }),
         Command::Sensor(args) => run_sensor(&args),
+        Command::Proxy(args) => run_proxy(&args),
         Command::ServeRpc { rules } => run_serve_rpc(rules),
         Command::Hook {
             command: HookCommand::Install(args),
@@ -301,6 +321,36 @@ fn run_hook_install(args: &HookInstallArgs) -> ExitCode {
         }
         Err(e) => report_hook_error(&e),
     }
+}
+
+/// Opens the masking vault, and ends without serving anything.
+///
+/// Both outcomes exit non zero, which is the honest report of this build: the
+/// vault works and the request path does not exist. A command that exited zero
+/// here would tell a deployment that a masking proxy was running.
+fn run_proxy(args: &ProxyArgs) -> ExitCode {
+    let stdin = std::io::stdin();
+    let outcome = proxy::run(
+        &proxy::ProxyRequest {
+            vault_profile: args.vault_profile.as_deref(),
+        },
+        &mut stdin.lock(),
+    );
+
+    match outcome {
+        proxy::ProxyOutcome::VaultOpened { notes } => {
+            for note in &notes {
+                eprintln!("periskop: {note}");
+            }
+            eprintln!("periskop: the vault opened in memory mode; nothing was written to disk.");
+            eprintln!(
+                "periskop: the request path is not built yet, so nothing is listening. No traffic \
+                 is passed through unmasked."
+            );
+        }
+        proxy::ProxyOutcome::Refused { reason } => eprintln!("periskop: {reason}"),
+    }
+    ExitCode::from(exit::ERROR)
 }
 
 fn report_hook_error(error: &HookError) -> ExitCode {

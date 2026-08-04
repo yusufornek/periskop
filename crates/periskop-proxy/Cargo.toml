@@ -1,0 +1,29 @@
+[package]
+name = "periskop-proxy"
+description = "The masking forward proxy: its vault today, its request path in later waves. A library crate; the only binary target in this workspace is periskop-cli (ADR-001)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Vault key derivation and record encryption. Both are decided in ADR-007 and
+# neither is written by hand (CLAUDE.md: crypto is not hand written).
+argon2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+# Nonces and session identifiers come from the operating system's entropy source
+# and from nowhere else. There is no counter and no seed of our own to roll back.
+getrandom = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+# Key material and decrypted values live in buffers that clear themselves. This
+# is half of the memory discipline in proxy/spec.md section 9; the other half
+# (mlock, core dump) needs an operating system call and is quarantined in its own
+# crate by ADR-016 section 5, which no wave has built yet.
+zeroize = { workspace = true }

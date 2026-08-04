@@ -24,6 +24,10 @@ clap = { workspace = true }
 # read back through the component that owns that half of the contract rather
 # than through a second copy of the shape.
 periskop-network-sensor = { workspace = true }
+# The masking proxy. A library dependency and not a second executable: ADR-001
+# fixes one `[[bin]]` for the whole workspace, and `periskop proxy` is a
+# subcommand of it. `tests/command_surface.rs` fails if that ever stops being true.
+periskop-proxy = { workspace = true }
 periskop-reconcile = { workspace = true }
 periskop-report = { workspace = true }
 # The reading half of the hook contract. A binary dependency since F2-L: the

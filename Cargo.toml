@@ -16,11 +16,10 @@ members = [
     # a feature that nothing builds as a negative consequence, "the exception
     # crate quietly rots"; this line is what prevents it.
     "crates/periskop-ebpf-loader",
+    "crates/periskop-proxy",
 ]
 
-# Crates designed but not yet implemented. They join the workspace in their own
-# phase rather than sitting here empty:
-#   periskop-proxy
+# Every crate ADR-001 lists is now a member. The list above is the whole of it.
 
 [workspace.package]
 version = "0.1.0"
@@ -38,8 +37,26 @@ periskop-runtime-collector = { path = "crates/periskop-runtime-collector" }
 periskop-reconcile = { path = "crates/periskop-reconcile" }
 periskop-network-sensor = { path = "crates/periskop-network-sensor" }
 periskop-ebpf-loader = { path = "crates/periskop-ebpf-loader" }
+periskop-proxy = { path = "crates/periskop-proxy" }
 
+# The masking vault's key derivation (ADR-007 "Anahtar türetme"). Argon2id is the
+# decision, not a preference: a memory hard function is what keeps a stolen vault
+# file out of reach of GPU and ASIC guessing. Default features are off because the
+# only thing this workspace needs is the raw derivation; `password-hash` brings a
+# PHC string encoder nothing here writes, and `rand` a salt generator that would
+# be a second entropy path beside `getrandom`.
+argon2 = { version = "0.5", default-features = false, features = [
+    "alloc",
+    "zeroize",
+] }
 blake3 = "1.5"
+# The vault's record cipher (ADR-007 D-14 revision, K-17). XChaCha20-Poly1305 and
+# not AES-GCM: the 192 bit nonce is what lets every record draw a fresh random
+# nonce with no counter to roll back, and the cipher is constant time in software
+# on machines with no AES instructions.
+chacha20poly1305 = { version = "0.10", default-features = false, features = [
+    "alloc",
+] }
 clap = { version = "4.5", features = ["derive"] }
 # Report signing (ADR-015). Default features are switched off deliberately:
 # `fast` pulls in precomputed tables that only buy signing throughput, and this
@@ -51,6 +68,11 @@ ed25519-dalek = { version = "2.2", default-features = false, features = [
 # The operating system's entropy source. Signing key generation is the only
 # caller; nothing else in this workspace is allowed to be non-deterministic.
 getrandom = "0.3"
+# Key separation inside the vault (ADR-007, ADR-016 section 2). One passphrase
+# derives one master key; every key used for a purpose is expanded from it with a
+# purpose label, so a key that leaks leaks one purpose. Written by hand it would
+# be hand written crypto, which CLAUDE.md forbids.
+hkdf = "0.12"
 ignore = "0.4"
 tree-sitter = "0.25"
 tree-sitter-python = "0.25"
@@ -60,6 +82,11 @@ tree-sitter-go = "0.25"
 tree-sitter-java = "0.23"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# The hash HKDF runs over (ADR-016 section 2). Named rather than swapped for the
+# `blake3` already in this list: ADR-007 fixes HKDF-SHA256 by name, and changing a
+# decided primitive for the sake of one fewer dependency would supersede an ADR
+# with no measurement behind it.
+sha2 = "0.10"
 thiserror = "2.0"
 toml = "0.9"
 streaming-iterator = "0.1"
