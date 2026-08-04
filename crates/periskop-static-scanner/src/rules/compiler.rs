@@ -69,42 +69,75 @@ pub enum CompileError {
     },
 }
 
-/// Compiles every rule for one language into a single query.
-pub fn compile(language: Language, rules: &[RuleFile]) -> Result<CompiledRules, CompileError> {
+/// Rule id used when the failure belongs to the joined query rather than a rule.
+const COMBINED: &str = "<combined>";
+
+/// The result of compiling a rule family without stopping at the first defect.
+///
+/// Both halves matter. The patterns that did compile are what the scan can still
+/// run; the errors are what the report has to declare. Returning only one of them
+/// is how a broken rule turns into a clean looking result.
+#[derive(Debug)]
+pub struct PartialCompile {
+    /// The patterns that compiled, or `None` when the joined query itself failed.
+    /// `None` always arrives with at least one error.
+    pub compiled: Option<CompiledRules>,
+    /// Every rule that did not compile, in rule order.
+    pub errors: Vec<CompileError>,
+}
+
+/// Compiles every rule for one language, keeping going past a broken rule.
+///
+/// One malformed query used to disable the whole family, because compilation
+/// stopped at the first error. A family of five rules where one no longer
+/// compiles is still four working detectors, and running four declared detectors
+/// is better than running none silently. The caller is expected to report the
+/// errors; the scan must not present a partial rule set as a complete one.
+pub fn compile_partial(language: Language, rules: &[RuleFile]) -> PartialCompile {
     let grammar = language.grammar();
     let mut sources = Vec::new();
     let mut origins = Vec::new();
+    let mut errors = Vec::new();
 
     for rule in rules {
         for (match_index, spec) in rule.matches.iter().enumerate() {
             // Compiling each pattern on its own first means the error points at
             // one rule. A combined query would only report an offset into a blob
             // of concatenated text, which no contributor can act on.
-            let single = tree_sitter::Query::new(&grammar, &spec.query).map_err(|e| {
-                CompileError::Query {
-                    rule_id: rule.rule_id.clone(),
-                    match_index,
-                    detail: e.to_string(),
+            let single = match tree_sitter::Query::new(&grammar, &spec.query) {
+                Ok(single) => single,
+                Err(e) => {
+                    errors.push(CompileError::Query {
+                        rule_id: rule.rule_id.clone(),
+                        match_index,
+                        detail: e.to_string(),
+                    });
+                    continue;
                 }
-            })?;
+            };
 
             let capture_names = single.capture_names();
-            let require_capture = |name: &str| -> Result<(), CompileError> {
+            let missing = |name: &str| -> Option<CompileError> {
                 if capture_names.contains(&name) {
-                    Ok(())
+                    None
                 } else {
-                    Err(CompileError::MissingCapture {
+                    Some(CompileError::MissingCapture {
                         rule_id: rule.rule_id.clone(),
                         match_index,
                         capture: name.to_owned(),
                     })
                 }
             };
+            let mut absent = Vec::new();
             if let Some(binding) = &spec.binding {
-                require_capture(&binding.capture)?;
+                absent.extend(missing(&binding.capture));
             }
             if let Some(method) = &spec.method {
-                require_capture(&method.capture)?;
+                absent.extend(missing(&method.capture));
+            }
+            if !absent.is_empty() {
+                errors.append(&mut absent);
+                continue;
             }
 
             sources.push(spec.query.clone());
@@ -118,17 +151,47 @@ pub fn compile(language: Language, rules: &[RuleFile]) -> Result<CompiledRules, 
     }
 
     let combined = sources.join("\n");
-    let query = tree_sitter::Query::new(&grammar, &combined).map_err(|e| CompileError::Query {
-        rule_id: "<combined>".to_owned(),
-        match_index: 0,
-        detail: e.to_string(),
-    })?;
+    match tree_sitter::Query::new(&grammar, &combined) {
+        Ok(query) => PartialCompile {
+            compiled: Some(CompiledRules {
+                language,
+                query,
+                origins,
+            }),
+            errors,
+        },
+        Err(e) => {
+            errors.push(CompileError::Query {
+                rule_id: COMBINED.to_owned(),
+                match_index: 0,
+                detail: e.to_string(),
+            });
+            PartialCompile {
+                compiled: None,
+                errors,
+            }
+        }
+    }
+}
 
-    Ok(CompiledRules {
-        language,
-        query,
-        origins,
-    })
+/// Compiles every rule for one language into a single query, all or nothing.
+///
+/// Kept for callers that want a rule set only when it is whole, such as the rule
+/// lint, where any defect has to fail the build. A scan uses [`compile_partial`]
+/// instead, because dropping four working detectors over one broken rule is a
+/// loss of coverage nobody asked for.
+pub fn compile(language: Language, rules: &[RuleFile]) -> Result<CompiledRules, CompileError> {
+    let outcome = compile_partial(language, rules);
+    match outcome.errors.into_iter().next() {
+        // The first error is the one to fix first. Callers that need the whole
+        // list call compile_partial.
+        Some(first) => Err(first),
+        None => outcome.compiled.ok_or(CompileError::Query {
+            rule_id: COMBINED.to_owned(),
+            match_index: 0,
+            detail: "the rule set produced no query".to_owned(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -201,6 +264,43 @@ default_confidence = "confirmed"
     fn empty_rule_set_compiles_to_an_empty_query() {
         let compiled = compile(Language::Python, &[]).unwrap();
         assert_eq!(compiled.pattern_count(), 0);
+    }
+
+    #[test]
+    fn one_broken_rule_does_not_disable_the_rest_of_the_family() {
+        // The error class this test catches: a single unusable query silently
+        // taking every other detector for that language with it, so the scan runs
+        // with no rules and reports nothing rather than reporting less.
+        let rules = vec![
+            rule("good", "(call) @call", ""),
+            rule("broken", "(this_node_does_not_exist) @x", ""),
+            rule("also-good", "(import_statement) @import", ""),
+        ];
+        let outcome = compile_partial(Language::Python, &rules);
+
+        let compiled = outcome.compiled.unwrap();
+        assert_eq!(compiled.pattern_count(), 2);
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(
+            outcome.errors[0]
+                .to_string()
+                .contains("python.static.broken"),
+            "{}",
+            outcome.errors[0]
+        );
+    }
+
+    #[test]
+    fn every_broken_rule_is_reported_not_only_the_first() {
+        // Stopping at the first error hides the rest until the contributor fixes
+        // one and runs again, which turns one round of feedback into several.
+        let rules = vec![
+            rule("first-broken", "(no_such_node) @x", ""),
+            rule("second-broken", "(also_no_such_node) @y", ""),
+        ];
+        let outcome = compile_partial(Language::Python, &rules);
+        assert_eq!(outcome.errors.len(), 2, "{:?}", outcome.errors);
+        assert_eq!(outcome.compiled.unwrap().pattern_count(), 0);
     }
 
     #[test]

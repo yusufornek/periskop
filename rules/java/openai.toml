@@ -1,0 +1,61 @@
+# OpenAI Java SDK (com.openai:openai-java).
+#
+# The call is reached through a fixed accessor chain, `client.chat()
+# .completions().create(params)`. The receiver is still left open in the pattern
+# and constrained by the binding instead: what identifies the call is the package
+# the chain starts from, not how many accessors sit in between, and pinning the
+# chain would break on ordinary style that keeps an intermediate handle.
+#
+# There is no payload_ref here, unlike the Python and TypeScript rules for the
+# same SDK. Java has no keyword arguments; the messages are assembled into a
+# params object somewhere else and the call site only names that object. Claiming
+# to extract a payload from it would be claiming to read a variable this engine
+# does not follow.
+
+schema_version = "1.0"
+language = "java"
+provider = "openai"
+rule_id = "java.static.openai-client-call"
+rule_version = "1.0.0"
+
+[[match]]
+kind = "call"
+query = '''
+(method_invocation
+  object: (_) @recv
+  name: (identifier) @method
+  arguments: (argument_list) @args
+  (#match? @method "^(create|createStreaming)$")) @call
+'''
+
+# Both the synchronous and the async client are listed, and so are the okhttp
+# entry points: `var client = OpenAIOkHttpClient.fromEnv()` resolves to the
+# builder class rather than to the interface it hands back.
+[match.binding]
+capture = "recv"
+resolves_to = { module = "com.openai", symbol_path = [
+  "OpenAIClient",
+  "OpenAIClientAsync",
+  "OpenAIOkHttpClient",
+  "OpenAIOkHttpClientAsync",
+] }
+
+[match.method]
+capture = "method"
+one_of = ["create", "createStreaming"]
+
+[extract]
+model = { from = "args", keyword = "model" }
+base_url = { from = "recv", constructor_keyword = "baseUrl" }
+
+[classify]
+egress_kind = "llm_chat"
+default_confidence = "confirmed"
+
+# A client pointed at a baseUrl the scanner cannot read may not be talking to
+# OpenAI at all. The call is still reported; the claim about where it goes is
+# what weakens.
+[[classify.downgrade]]
+when = "base_url.unresolved"
+to = "suspect"
+coverage_note = "target_host_unresolved"

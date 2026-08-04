@@ -333,6 +333,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "periskop-runtime-collector"
+version = "0.1.0"
+dependencies = [
+ "periskop-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "periskop-static-scanner"
 version = "0.1.0"
 dependencies = [

@@ -153,6 +153,90 @@ fn adding_a_line_above_the_call_does_not_change_the_identity() {
     assert_eq!(ids(base), ids(&shifted));
 }
 
+/// Two calls to the same method, one in each of two functions.
+const TWO_SCOPES: &str = "from openai import OpenAI\n\
+                          client = OpenAI()\n\
+                          def send_profile():\n\
+                          \x20   client.chat.completions.create(model='x')\n\
+                          def send_payment():\n\
+                          \x20   client.chat.completions.create(model='x')\n";
+
+/// Two calls to the same method inside one function.
+const ONE_SCOPE: &str = "from openai import OpenAI\n\
+                         client = OpenAI()\n\
+                         def send_both():\n\
+                         \x20   client.chat.completions.create(model='x')\n\
+                         \x20   client.chat.completions.create(model='x')\n";
+
+fn identities(source: &str) -> Vec<String> {
+    let (compiled, rules) = python_rules();
+    let parsed = match parse_as("svc.py", source, Language::Python) {
+        Ok(p) => p,
+        Err(e) => panic!("svc.py did not parse: {e}"),
+    };
+    let mut ids: Vec<String> = detect(&parsed, &compiled, &rules)
+        .findings
+        .into_iter()
+        .map(|f| f.finding_id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn two_call_sites_in_one_file_get_two_identities() {
+    // The first half of the identity contract. The README promises every call
+    // site is reported. Before this, both calls hashed to the same egress point,
+    // deduplication dropped the second, and the dropped call reached no list and
+    // no counter: a file sending payment data on line 200 was invisible because
+    // line 10 sent profile data through the same method.
+    let ids = identities(TWO_SCOPES);
+    assert_eq!(
+        ids.len(),
+        2,
+        "expected one finding per call site, got {ids:?}"
+    );
+    assert_ne!(ids[0], ids[1]);
+}
+
+#[test]
+fn two_call_sites_in_one_scope_get_two_identities() {
+    // The harder half of the same case: the enclosing symbol cannot separate
+    // these, so the occurrence number has to.
+    let ids = identities(ONE_SCOPE);
+    assert_eq!(
+        ids.len(),
+        2,
+        "expected one finding per call site, got {ids:?}"
+    );
+    assert_ne!(ids[0], ids[1]);
+}
+
+#[test]
+fn adding_a_line_above_two_call_sites_changes_no_identity() {
+    // The second half of the identity contract, and the reason the discriminator
+    // is a scope and an occurrence rather than a line number. Both invariants have
+    // to hold together: separating call sites is worthless if it costs the diff.
+    for source in [TWO_SCOPES, ONE_SCOPE] {
+        let shifted = format!("# a new comment\n{source}");
+        assert_eq!(identities(source), identities(&shifted));
+    }
+}
+
+#[test]
+fn renaming_the_enclosing_function_is_the_only_thing_that_moves_its_call() {
+    // The cost of scoping identities, stated rather than discovered later. A call
+    // moved into a renamed function is a different call site by this rule, while
+    // every call in every other scope keeps its identity.
+    let renamed = TWO_SCOPES.replace("send_profile", "send_profile_v2");
+    let before = identities(TWO_SCOPES);
+    let after = identities(&renamed);
+
+    assert_eq!(before.len(), after.len());
+    let unchanged = before.iter().filter(|id| after.contains(id)).count();
+    assert_eq!(unchanged, 1, "only the renamed scope should move");
+}
+
 #[test]
 fn scanning_the_same_source_twice_gives_the_same_result() {
     let source = "from anthropic import Anthropic\nc = Anthropic()\nc.messages.create(model='m')\n";

@@ -1,0 +1,15 @@
+# periskop python hook, primary installation path (ADR-009).
+#
+# Copy this file into a site-packages directory. site.py executes every line of
+# a .pth file that begins with "import" before any application code runs, which
+# is what makes this the primary path: no PYTHONPATH, no wrapper script, no
+# cooperation from the application being observed.
+#
+# sitecustomize.py is the fallback, for environments where a .pth cannot be
+# dropped in. It is a fallback rather than an equal, because a site-packages
+# directory can hold any number of .pth files but only one sitecustomize.
+#
+# The statement below has to start with "import" for site.py to execute it at
+# all, and the rest is wrapped so that a half removed or broken installation
+# cannot even print a traceback into somebody else's interpreter startup.
+import sys; exec("try:\n    import periskop_hook\n    periskop_hook.install()\nexcept Exception:\n    pass\n")

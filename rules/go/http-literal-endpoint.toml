@@ -1,0 +1,119 @@
+# Raw net/http calls addressed straight at a provider endpoint.
+#
+# This layer matters more in Go than elsewhere. Official SDKs arrived late, the
+# standard library client is good enough that third party ones stay a minority,
+# and a hand built request with an Authorization header is ordinary style rather
+# than a workaround. An SDK aware scanner that only knew client objects would
+# walk past a large share of real Go egress.
+#
+# The rule keys on the destination, and the URL predicate is what keeps it from
+# firing on every HTTP call in a codebase: a report that lists every internal
+# service call teaches the reader to skim past the ones that matter.
+#
+# The URL sits at a different argument position in each constructor, so each one
+# gets its own pattern. A single anchored pattern cannot cover all three, and an
+# unanchored one would accept a provider URL appearing anywhere in the call.
+#
+# A URL assembled at runtime does not match here at all. That is a known gap
+# rather than a silent one: it belongs to the catalogue, not to a looser rule.
+
+schema_version = "1.0"
+language = "go"
+provider = "unknown"
+rule_id = "go.static.http-provider-endpoint"
+rule_version = "1.0.0"
+
+# The client library this rule accounts for, stated where a reader looks for the
+# coverage claim rather than left to be inferred from the binding blocks below.
+covers_modules = ["net/http"]
+
+# http.Post(url, contentType, body) and http.Get(url): the URL leads.
+[[match]]
+kind = "http_request"
+query = '''
+(call_expression
+  function: (selector_expression
+    operand: (identifier) @pkg
+    field: (field_identifier) @fn)
+  arguments: (argument_list
+    .
+    (interpreted_string_literal) @url)
+  (#match? @fn "^(Post|PostForm|Get|Head)$")
+  (#match? @url "(api\\.openai\\.com|api\\.anthropic\\.com|generativelanguage\\.googleapis\\.com|openai\\.azure\\.com|bedrock-runtime\\.[a-z0-9-]+\\.amazonaws\\.com)")) @call
+'''
+
+# The receiver is resolved rather than compared to the literal name `http`. An
+# import can be aliased, and a local variable can be called `http`, so the name
+# on its own decides nothing.
+[match.binding]
+capture = "pkg"
+resolves_to = { module = "net/http" }
+
+[match.method]
+capture = "fn"
+one_of = ["Post", "PostForm", "Get", "Head"]
+
+# http.NewRequest(method, url, body): the URL follows the verb.
+[[match]]
+kind = "http_request"
+query = '''
+(call_expression
+  function: (selector_expression
+    operand: (identifier) @pkg
+    field: (field_identifier) @fn)
+  arguments: (argument_list
+    .
+    (_)
+    .
+    (interpreted_string_literal) @url)
+  (#eq? @fn "NewRequest")
+  (#match? @url "(api\\.openai\\.com|api\\.anthropic\\.com|generativelanguage\\.googleapis\\.com|openai\\.azure\\.com|bedrock-runtime\\.[a-z0-9-]+\\.amazonaws\\.com)")) @call
+'''
+
+[match.binding]
+capture = "pkg"
+resolves_to = { module = "net/http" }
+
+[match.method]
+capture = "fn"
+one_of = ["NewRequest"]
+
+# http.NewRequestWithContext(ctx, method, url, body): the context pushes the URL
+# one place further along. This is the form most current Go code is written in.
+[[match]]
+kind = "http_request"
+query = '''
+(call_expression
+  function: (selector_expression
+    operand: (identifier) @pkg
+    field: (field_identifier) @fn)
+  arguments: (argument_list
+    .
+    (_)
+    .
+    (_)
+    .
+    (interpreted_string_literal) @url)
+  (#eq? @fn "NewRequestWithContext")
+  (#match? @url "(api\\.openai\\.com|api\\.anthropic\\.com|generativelanguage\\.googleapis\\.com|openai\\.azure\\.com|bedrock-runtime\\.[a-z0-9-]+\\.amazonaws\\.com)")) @call
+'''
+
+[match.binding]
+capture = "pkg"
+resolves_to = { module = "net/http" }
+
+[match.method]
+capture = "fn"
+one_of = ["NewRequestWithContext"]
+
+[extract]
+target_url = { from = "url" }
+
+[classify]
+egress_kind = "llm_chat"
+default_confidence = "confirmed"
+
+[[classify.downgrade]]
+when = "target_url.unresolved"
+to = "suspect"
+coverage_note = "target_host_unresolved"

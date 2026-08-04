@@ -1,0 +1,84 @@
+# OpenAI official Go SDK.
+#
+# The receiver chain is written out rather than left open. Go's selector chain
+# resolves through an `operand` field that the shared receiver walk does not
+# follow, so the pattern has to reach the identifier at the root of the chain
+# itself; that identifier is what the binding then ties back to an import.
+#
+# The cost is that the depth is fixed per pattern, and the two service paths this
+# SDK exposes for chat sit at different depths. They are written as two patterns
+# instead of one loose one, because a pattern loose enough to cover both would
+# fire on any three part method call in the file.
+
+schema_version = "1.0"
+language = "go"
+provider = "openai"
+rule_id = "go.static.openai-go-client-call"
+rule_version = "1.0.0"
+
+# client.Chat.Completions.New(ctx, params)
+[[match]]
+kind = "call"
+query = '''
+(call_expression
+  function: (selector_expression
+    operand: (selector_expression
+      operand: (selector_expression
+        operand: (identifier) @recv
+        field: (field_identifier) @service)
+      field: (field_identifier) @resource)
+    field: (field_identifier) @method)
+  arguments: (argument_list) @args
+  (#eq? @service "Chat")
+  (#eq? @resource "Completions")
+  (#match? @method "^(New|NewStreaming)$")) @call
+'''
+
+[match.binding]
+capture = "recv"
+resolves_to = { module = "github.com/openai/openai-go", symbol_path = ["NewClient"] }
+
+[match.method]
+capture = "method"
+one_of = ["New", "NewStreaming"]
+
+# client.Responses.New(ctx, params), the newer surface for the same traffic.
+[[match]]
+kind = "call"
+query = '''
+(call_expression
+  function: (selector_expression
+    operand: (selector_expression
+      operand: (identifier) @recv
+      field: (field_identifier) @resource)
+    field: (field_identifier) @method)
+  arguments: (argument_list) @args
+  (#eq? @resource "Responses")
+  (#match? @method "^(New|NewStreaming)$")) @call
+'''
+
+[match.binding]
+capture = "recv"
+resolves_to = { module = "github.com/openai/openai-go", symbol_path = ["NewClient"] }
+
+[match.method]
+capture = "method"
+one_of = ["New", "NewStreaming"]
+
+# Go passes request fields as struct keys, so the names are capitalised.
+[extract]
+model = { from = "args", keyword = "Model" }
+payload_ref = { from = "args", keyword = "Messages" }
+base_url = { from = "recv", constructor_keyword = "WithBaseURL" }
+
+[classify]
+egress_kind = "llm_chat"
+default_confidence = "confirmed"
+
+# A client pointed at a base URL the scanner cannot read may not be talking to
+# OpenAI at all. The call is still reported; the claim about where it goes is
+# what weakens.
+[[classify.downgrade]]
+when = "base_url.unresolved"
+to = "suspect"
+coverage_note = "target_host_unresolved"

@@ -38,6 +38,41 @@ impl RuleLoadError {
             }
         }
     }
+
+    /// The same error with its file named relative to the rule root.
+    ///
+    /// The rule root arrives on the command line and is usually absolute. These
+    /// messages reach the report as diagnostics, and an absolute path there would
+    /// tie the output to one machine, which breaks the promise that two runs over
+    /// the same tree compare equal. The root itself renders as `.` rather than as
+    /// an empty string, so a failure to read the root is still legible.
+    fn relative_to(self, root: &Path) -> Self {
+        let shorten = |path: PathBuf| {
+            let stripped = path.strip_prefix(root).map(|p| {
+                if p.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    p.to_path_buf()
+                }
+            });
+            stripped.unwrap_or(path)
+        };
+        match self {
+            Self::Read { path, source } => Self::Read {
+                path: shorten(path),
+                source,
+            },
+            Self::Syntax { path, line, detail } => Self::Syntax {
+                path: shorten(path),
+                line,
+                detail,
+            },
+            Self::Invalid { path, detail } => Self::Invalid {
+                path: shorten(path),
+                detail,
+            },
+        }
+    }
 }
 
 /// Schema version this build understands.
@@ -159,12 +194,16 @@ fn validate_rule_id(rule_id: &str) -> Result<(), String> {
 /// Errors do not stop the load. A broken file must not hide the other rules, and
 /// the caller needs the full list to report every problem in one pass rather than
 /// one per run.
+///
+/// A directory that cannot be walked is an error too, not an empty result. An
+/// unreadable rule tree and a rule tree with nothing in it produce the same empty
+/// rule list, and the caller has no way to tell them apart unless the walk says so.
 pub fn load_directory(dir: &Path) -> (Vec<RuleFile>, Vec<RuleLoadError>) {
     let mut rules = Vec::new();
     let mut errors = Vec::new();
 
     let mut paths: Vec<PathBuf> = Vec::new();
-    collect_toml_files(dir, &mut paths);
+    collect_toml_files(dir, &mut paths, &mut errors);
     paths.sort();
 
     for path in paths {
@@ -175,17 +214,44 @@ pub fn load_directory(dir: &Path) -> (Vec<RuleFile>, Vec<RuleLoadError>) {
     }
 
     rules.sort_by(|a, b| a.rule_id.cmp(&b.rule_id));
+    // Directory entries arrive in filesystem order, so errors are ordered here
+    // rather than left as the walk found them. These strings reach a report that
+    // has to be byte identical across runs.
+    let mut errors: Vec<RuleLoadError> = errors.into_iter().map(|e| e.relative_to(dir)).collect();
+    errors.sort_by_key(|e| e.to_string());
     (rules, errors)
 }
 
-fn collect_toml_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+fn collect_toml_files(dir: &Path, out: &mut Vec<PathBuf>, errors: &mut Vec<RuleLoadError>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(source) => {
+            // The quietest way to run with no rules at all: the directory is
+            // unreadable, the rule list comes back empty, the scan matches
+            // nothing and every counter says the run was clean.
+            errors.push(RuleLoadError::Read {
+                path: dir.to_path_buf(),
+                source,
+            });
+            return;
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(source) => {
+                // The entry has no name to report, so the directory holding it is
+                // the most specific location available.
+                errors.push(RuleLoadError::Read {
+                    path: dir.to_path_buf(),
+                    source,
+                });
+                continue;
+            }
+        };
         let path = entry.path();
         if path.is_dir() {
-            collect_toml_files(&path, out);
+            collect_toml_files(&path, out, errors);
         } else if path.extension().is_some_and(|e| e == "toml") {
             out.push(path);
         }
@@ -297,5 +363,20 @@ default_confidence = "confirmed"
     fn rule_version_must_be_three_segments() {
         let text = MINIMAL.replace("rule_version = \"1.0.0\"", "rule_version = \"1.0\"");
         assert!(parse(&text).is_err());
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_walked_is_an_error_not_an_empty_rule_set() {
+        // The error class this test catches: a rule tree that is missing, renamed
+        // or unreadable used to return no rules and no errors, so the scan ran
+        // with nothing loaded and reported a clean result to prove it.
+        let (rules, errors) = load_directory(Path::new("rules/this-directory-does-not-exist"));
+        assert!(rules.is_empty());
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].to_string().contains("cannot be read"),
+            "{}",
+            errors[0]
+        );
     }
 }

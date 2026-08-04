@@ -10,6 +10,17 @@
 //! candidate outright, while a failed field extraction means "this is that library
 //! but I cannot see one detail" and only lowers confidence. Collapsing those two
 //! into one behaviour would either hide real egress or fabricate it.
+//!
+//! Identity is decided here too, and it is decided last on purpose. Two calls to
+//! the same method in one file are two call sites and owe the reader two findings,
+//! so the identity has to separate them; but no identity may contain a line
+//! number, or inserting a line at the top of a file would rewrite every identifier
+//! in the report. What separates them instead is the scope the call sits in and,
+//! within one scope, the order the calls appear in. Both survive an edit
+//! elsewhere in the file, and neither can be read off a single match, which is
+//! why matches are collected first and turned into findings afterwards.
+
+use std::collections::BTreeMap;
 
 use periskop_core::finding::{
     Component, Confidence, Detector, EntityRef, Evidence, EvidenceType, Finding, Kind, Location,
@@ -18,7 +29,7 @@ use periskop_core::finding::{
 use periskop_core::ids::short_hash;
 use streaming_iterator::StreamingIterator;
 
-use crate::engine::{bindings, bindings_ts, BindingTable};
+use crate::engine::{bindings, bindings_go, bindings_java, bindings_ts, BindingTable};
 use crate::language::Language;
 use crate::parser::ParsedFile;
 use crate::rules::model::{Confidence as RuleConfidence, MatchSpec, RuleFile};
@@ -40,12 +51,25 @@ fn collect_bindings(parsed: &ParsedFile) -> BindingTable {
         Language::TypeScript | Language::Tsx | Language::JavaScript => {
             bindings_ts::collect(parsed.root_node(), parsed.source())
         }
-        // Grammars are linked ahead of their resolvers so that a file in these
-        // languages is parsed and counted rather than reported as unreadable.
-        // An empty table means every bound rule declines, which is the correct
-        // answer while the resolver is missing: no claim is better than a guess.
-        Language::Go | Language::Java => BindingTable::default(),
+        Language::Go => bindings_go::collect(parsed.root_node(), parsed.source()),
+        Language::Java => bindings_java::collect(parsed.root_node(), parsed.source()),
     }
+}
+
+/// A match that survived every constraint, held until it can be given an identity.
+///
+/// Nothing here is a tree-sitter node. Everything a finding needs is copied out
+/// while the match is still in hand, which keeps this collection free of the
+/// borrow the query cursor holds and lets the call sites be reordered afterwards.
+struct CallSite<'a> {
+    /// Byte range of the anchor node. It orders the call sites and locates the
+    /// evidence; it deliberately never reaches an identity.
+    range: std::ops::Range<usize>,
+    anchor_kind: &'static str,
+    span: Span,
+    enclosing_symbol: String,
+    shape: String,
+    rule: &'a RuleFile,
 }
 
 /// Runs the compiled rule set over one parsed file.
@@ -53,7 +77,7 @@ pub fn detect(parsed: &ParsedFile, compiled: &CompiledRules, rules: &[RuleFile])
     let source = parsed.source();
     let table = collect_bindings(parsed);
 
-    let mut out = FileFindings::default();
+    let mut sites: Vec<CallSite<'_>> = Vec::new();
     let mut cursor = tree_sitter::QueryCursor::new();
     let mut matches = cursor.matches(compiled.query(), parsed.root_node(), source.as_bytes());
 
@@ -68,28 +92,74 @@ pub fn detect(parsed: &ParsedFile, compiled: &CompiledRules, rules: &[RuleFile])
             continue;
         };
 
-        if let Some(finding) = evaluate(parsed, compiled, m, rule, spec, &table) {
-            out.findings.push(finding);
+        if let Some(site) = evaluate(parsed, compiled, m, rule, spec, &table) {
+            sites.push(site);
         }
     }
 
-    // Identical calls in one file collapse to one finding. The contract treats a
-    // repeated identity as the same claim seen twice, not as two claims.
-    out.findings.sort_by(|a, b| a.finding_id.cmp(&b.finding_id));
-    out.findings.dedup_by(|a, b| a.finding_id == b.finding_id);
+    let mut out = FileFindings {
+        findings: findings_from(parsed, sites),
+        unclaimed_imports: unclaimed_imports(&table, rules),
+    };
 
-    out.unclaimed_imports = unclaimed_imports(&table, rules);
+    // Sorted, not deduplicated. Uniqueness is established by the numbering in
+    // `findings_from`, where a repeated match is recognised as one call site seen
+    // twice. Dropping by identity here is what used to swallow the second call in
+    // a file, and there is no longer a case it would catch.
+    out.findings.sort_by(|a, b| a.finding_id.cmp(&b.finding_id));
     out
 }
 
-fn evaluate(
+/// Turns surviving call sites into findings, giving each one an identity.
+///
+/// The numbering is what stops a second call from disappearing. Before it, the
+/// egress point was hashed from the file path and the call shape alone, so two
+/// `client.chat.completions.create(...)` calls in one file produced one identity,
+/// deduplication dropped the second, and the dropped call reached no list and no
+/// counter. The occurrence number is scoped to the enclosing symbol so that
+/// editing one function does not renumber the calls in another.
+fn findings_from(parsed: &ParsedFile, mut sites: Vec<CallSite<'_>>) -> Vec<Finding> {
+    // Source order, not the order the query engine happened to yield matches in.
+    // That order is not part of any contract, and occurrence numbers taken from it
+    // would make identities depend on it.
+    sites.sort_by(|a, b| {
+        a.range
+            .start
+            .cmp(&b.range.start)
+            .then_with(|| a.range.end.cmp(&b.range.end))
+            .then_with(|| a.rule.rule_id.cmp(&b.rule.rule_id))
+            .then_with(|| a.shape.cmp(&b.shape))
+    });
+    // One node matched twice by one rule in one shape is one call site seen twice.
+    // Numbering those as two would inflate the report with a call the file does
+    // not contain, which is the opposite of the loss this function fixes.
+    sites.dedup_by(|a, b| {
+        a.range == b.range && a.rule.rule_id == b.rule.rule_id && a.shape == b.shape
+    });
+
+    let mut occurrences: BTreeMap<(String, String), u32> = BTreeMap::new();
+    let mut findings = Vec::new();
+    for site in sites {
+        let counter = occurrences
+            .entry((site.enclosing_symbol.clone(), site.shape.clone()))
+            .or_default();
+        let occurrence = *counter;
+        *counter += 1;
+        if let Some(finding) = build_finding(parsed, site, occurrence) {
+            findings.push(finding);
+        }
+    }
+    findings
+}
+
+fn evaluate<'a>(
     parsed: &ParsedFile,
     compiled: &CompiledRules,
     m: &tree_sitter::QueryMatch<'_, '_>,
-    rule: &RuleFile,
+    rule: &'a RuleFile,
     spec: &MatchSpec,
     table: &BindingTable,
-) -> Option<Finding> {
+) -> Option<CallSite<'a>> {
     let source = parsed.source();
     let capture = |name: &str| capture_node(compiled, m, name);
 
@@ -120,60 +190,139 @@ fn evaluate(
         .or_else(|| capture("import"))
         .unwrap_or_else(|| parsed.root_node());
 
-    let shape = call_shape(source, spec, m, compiled);
-    let path = parsed.path().to_string_lossy().replace('\\', "/");
-    let egress_point_id = format!("ep_{}", short_hash("ep/v1", &[&path, &shape]));
+    let start = anchor.start_position();
+    let end = anchor.end_position();
 
-    let confidence = match rule.classify.default_confidence {
+    Some(CallSite {
+        range: anchor.byte_range(),
+        anchor_kind: anchor.kind(),
+        span: Span {
+            // tree-sitter counts from zero; the contract counts from one.
+            start_line: start.row as u32 + 1,
+            start_col: start.column as u32 + 1,
+            end_line: end.row as u32 + 1,
+            end_col: end.column as u32 + 1,
+        },
+        enclosing_symbol: enclosing_symbol(anchor, source),
+        shape: call_shape(source, spec, m, compiled),
+        rule,
+    })
+}
+
+fn build_finding(parsed: &ParsedFile, site: CallSite<'_>, occurrence: u32) -> Option<Finding> {
+    let source = parsed.source();
+    let path = parsed.path().to_string_lossy().replace('\\', "/");
+
+    // The contract derives an egress point from the path, the enclosing symbol and
+    // the shape of the call. The occurrence number is the tie breaker the contract
+    // leaves open: without it, a scope that makes the same call twice would still
+    // collapse to one identity.
+    let occurrence = occurrence.to_string();
+    let egress_point_id = format!(
+        "ep_{}",
+        short_hash(
+            "ep/v1",
+            &[&path, &site.enclosing_symbol, &site.shape, &occurrence],
+        )
+    );
+
+    let confidence = match site.rule.classify.default_confidence {
         RuleConfidence::Confirmed => Confidence::Confirmed,
         RuleConfidence::Suspect => Confidence::Suspect,
     };
 
-    let start = anchor.start_position();
-    let end = anchor.end_position();
-
     let finding = Finding::new(
         Kind::DeclaredEgressPoint,
         confidence,
-        rule.provider.clone(),
+        site.rule.provider.clone(),
         EntityRef {
             ref_type: RefType::EgressPoint,
             ref_id: egress_point_id,
         },
         Evidence {
             evidence_type: EvidenceType::AstNode,
-            r#ref: format!("{}@{}", anchor.kind(), path),
+            r#ref: format!("{}@{}", site.anchor_kind, path),
             hash: Some(
-                blake3::hash(source[anchor.byte_range()].as_bytes())
+                blake3::hash(source[site.range].as_bytes())
                     .to_hex()
                     .to_string(),
             ),
         },
         Detector {
             component: Component::StaticScanner,
-            rule_id: rule.rule_id.clone(),
-            rule_version: rule.rule_version.clone(),
-            rule_hash: rule.rule_hash.clone(),
+            rule_id: site.rule.rule_id.clone(),
+            rule_version: site.rule.rule_version.clone(),
+            rule_hash: site.rule.rule_hash.clone(),
         },
     )
     .ok()?;
 
     Some(
         finding
-            .with_egress_kind(rule.classify.egress_kind.clone())
+            .with_egress_kind(site.rule.classify.egress_kind.clone())
             .with_location(Location {
                 component: Component::StaticScanner,
                 path: Some(path),
-                span: Some(Span {
-                    // tree-sitter counts from zero; the contract counts from one.
-                    start_line: start.row as u32 + 1,
-                    start_col: start.column as u32 + 1,
-                    end_line: end.row as u32 + 1,
-                    end_col: end.column as u32 + 1,
-                }),
+                span: Some(site.span),
                 symbol: None,
             }),
     )
+}
+
+/// The dotted path of named definitions a node sits inside.
+///
+/// This is what tells two call sites in one file apart without putting a line
+/// number into an identity. A function keeps its name when lines are inserted
+/// above it, so the value survives an edit made elsewhere in the file; a line
+/// number would not. An empty string means file scope, which is a scope like any
+/// other rather than a missing value.
+fn enclosing_symbol(node: tree_sitter::Node<'_>, source: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if names_a_scope(ancestor.kind()) {
+            if let Some(name) = ancestor.child_by_field_name("name") {
+                if let Some(text) = source.get(name.byte_range()) {
+                    parts.push(text);
+                }
+            }
+        }
+        current = ancestor.parent();
+    }
+    parts.reverse();
+    parts.join(".")
+}
+
+/// Whether a node kind names a scope a call can sit inside.
+///
+/// Only functions and types. A variable or a field also carries a name, and
+/// including those would put an identifier back into an identity: renaming a
+/// local would move every call in its initializer, which is the invariant the
+/// call shape exists to protect.
+///
+/// The list is per grammar and deliberately short. A kind that is missing costs
+/// an empty scope, and the occurrence number still separates the calls; a kind
+/// that should not be here costs a broken diff. The bias is toward leaving things
+/// out.
+fn names_a_scope(kind: &str) -> bool {
+    const SCOPES: &[&str] = &[
+        // Python
+        "function_definition",
+        "class_definition",
+        // TypeScript and JavaScript
+        "function_declaration",
+        "generator_function_declaration",
+        "method_definition",
+        "class_declaration",
+        "abstract_class_declaration",
+        // Go and Java share the two spellings below with the list above
+        "method_declaration",
+        "constructor_declaration",
+        "interface_declaration",
+        "enum_declaration",
+        "record_declaration",
+    ];
+    SCOPES.contains(&kind)
 }
 
 /// A rename stable description of the call.
@@ -321,8 +470,30 @@ fn is_standard_library(module: &str) -> bool {
         "util",
         "zlib",
     ];
+    // Go and Java import their standard libraries by path rather than by a bare
+    // name, so these are matched against the path root rather than the whole
+    // module string.
+    const GO: &[&str] = &[
+        "bufio", "bytes", "context", "crypto", "encoding", "errors", "flag", "fmt", "io", "log",
+        "math", "net", "os", "path", "regexp", "sort", "strconv", "strings", "sync", "time",
+    ];
+    const JAVA_PREFIXES: &[&str] = &["java", "javax", "jdk", "sun"];
 
-    let root = module.split('.').next().unwrap_or(module);
-    let bare = root.strip_prefix("node:").unwrap_or(root);
-    PYTHON.contains(&bare) || NODE.contains(&bare)
+    let dotted_root = module.split('.').next().unwrap_or(module);
+    let bare = dotted_root.strip_prefix("node:").unwrap_or(dotted_root);
+    if PYTHON.contains(&bare) || NODE.contains(&bare) {
+        return true;
+    }
+
+    // A Go standard library path has no dot in its first segment. Anything with a
+    // dot there is a domain name, which means a third party module, and treating
+    // net/http and github.com/x/net alike would hide a real dependency.
+    let slashed_root = module.split('/').next().unwrap_or(module);
+    if !slashed_root.contains('.') && GO.contains(&slashed_root) {
+        return true;
+    }
+
+    JAVA_PREFIXES
+        .iter()
+        .any(|p| module == *p || module.starts_with(&format!("{p}.")))
 }

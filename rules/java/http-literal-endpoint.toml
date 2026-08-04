@@ -1,0 +1,101 @@
+# Raw HTTP calls to a provider endpoint, no SDK involved.
+#
+# Common in Java for a reason: teams under an existing vendor contract often talk
+# to a model endpoint with the client they already have rather than adding a
+# dependency. An SDK aware scanner that only knows client objects walks straight
+# past that code.
+#
+# Where the destination sits is what makes this rule different from its Python
+# and TypeScript siblings. `client.send(request, handler)` names a request
+# object, not a URL; the endpoint was written a few lines earlier, where the URI
+# was built. So the rule keys on the place the endpoint is actually named, and
+# the finding points there.
+#
+# The URL predicate is what keeps this from firing on every HTTP call in a
+# codebase. Matching any request with a literal argument would report every
+# internal service call as egress, and a report full of those teaches the reader
+# to skim past the real ones.
+#
+# A URL assembled at runtime does not match here at all. That is a known gap
+# rather than a silent one: it belongs to the catalogue, not to a looser rule.
+
+schema_version = "1.0"
+language = "java"
+provider = "unknown"
+rule_id = "java.static.http-provider-endpoint"
+rule_version = "1.0.0"
+
+# Libraries this rule accounts for. It keys on the destination rather than on a
+# client object, so without this the HTTP clients it covers would be reported as
+# having no detector.
+covers_modules = [
+  "java.net",
+  "java.net.http",
+  "okhttp3",
+  "org.apache.hc.client5",
+  "org.apache.http",
+]
+
+# `URI.create("https://api.openai.com/v1/chat/completions")`, the stdlib route.
+[[match]]
+kind = "http_request"
+query = '''
+(method_invocation
+  object: (identifier) @client
+  name: (identifier) @method
+  arguments: (argument_list
+    .
+    (string_literal) @url)
+  (#eq? @client "URI")
+  (#eq? @method "create")
+  (#match? @url "(api\\.openai\\.com|api\\.anthropic\\.com|generativelanguage\\.googleapis\\.com|openai\\.azure\\.com|bedrock-runtime\\.[a-z0-9-]+\\.amazonaws\\.com)")) @call
+'''
+
+[match.method]
+capture = "method"
+one_of = ["create"]
+
+# `new URI("https://api.anthropic.com/v1/messages")`, the same thing spelled with
+# a constructor. A separate node kind, so a separate pattern.
+[[match]]
+kind = "http_request"
+query = '''
+(object_creation_expression
+  type: (type_identifier) @type
+  arguments: (argument_list
+    .
+    (string_literal) @url)
+  (#eq? @type "URI")
+  (#match? @url "(api\\.openai\\.com|api\\.anthropic\\.com|generativelanguage\\.googleapis\\.com|openai\\.azure\\.com|bedrock-runtime\\.[a-z0-9-]+\\.amazonaws\\.com)")) @call
+'''
+
+# `new Request.Builder().url("https://api.openai.com/...")`, the OkHttp route.
+# The receiver is left unconstrained because the builder is reached through a
+# chain of varying length; the URL predicate is what narrows the match.
+[[match]]
+kind = "http_request"
+query = '''
+(method_invocation
+  name: (identifier) @method
+  arguments: (argument_list
+    .
+    (string_literal) @url)
+  (#eq? @method "url")
+  (#match? @url "(api\\.openai\\.com|api\\.anthropic\\.com|generativelanguage\\.googleapis\\.com|openai\\.azure\\.com|bedrock-runtime\\.[a-z0-9-]+\\.amazonaws\\.com)")) @call
+'''
+
+[match.method]
+capture = "method"
+one_of = ["url"]
+
+[extract]
+target_url = { from = "url" }
+
+[classify]
+egress_kind = "llm_chat"
+default_confidence = "confirmed"
+
+[[classify.downgrade]]
+when = "target_url.unresolved"
+to = "suspect"
+coverage_note = "target_host_unresolved"

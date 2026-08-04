@@ -65,6 +65,71 @@ pub struct PolicyRef {
     pub rule_hits: Vec<RuleHit>,
 }
 
+/// The thresholds a verdict is allowed to come from.
+///
+/// Held as data rather than buried in a branch, because the report has to name
+/// the threshold that fired and the value it fired on. A verdict a reader cannot
+/// trace back to a declared rule is not auditable, and an unauditable gate is one
+/// nobody can argue with when it is wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Policy {
+    /// How many confirmed findings before the scan fails. `None` by default.
+    ///
+    /// Finding a confirmed egress point is what this tool is for, not evidence
+    /// that something is wrong. A repository that calls a model provider on
+    /// purpose would fail every build, and a gate that fires on the intended case
+    /// gets switched off, taking the real signal with it. What the default does
+    /// instead is record the confirmed findings it saw and pass on them
+    /// deliberately, so the pass is a decision in the report rather than an
+    /// absence of one. An operator who wants the gate sets a number here.
+    pub confirmed_findings_fail: Option<u64>,
+    /// How many suspect findings before the scan warns.
+    ///
+    /// One is enough. A suspect finding is the scanner saying it saw something it
+    /// could not prove structurally, which is precisely the case that needs a
+    /// human. This is a finding threshold, not a coverage gap, so K-20 does not
+    /// speak to it; report-schema.md lists it as a warning source directly.
+    pub suspect_findings_warn: Option<u64>,
+    /// Unreadable share of the code surface, in basis points, before the scan
+    /// warns. `None` by default.
+    ///
+    /// K-20: a coverage gap never warns on its own. A default low enough to be
+    /// useful would fire nearly everywhere, because the ratio counts every file
+    /// the scanner has no grammar for, and a run that is always yellow teaches
+    /// the reader to stop reading yellow. The gap stays fully visible in the
+    /// coverage block regardless, the rule hit below records the ratio that was
+    /// observed, and the CLI already offers `--max-unparsed-ratio` for an operator
+    /// who wants a hard gate with its own exit code.
+    pub unparsed_ratio_warn: Option<u64>,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            confirmed_findings_fail: None,
+            suspect_findings_warn: Some(1),
+            unparsed_ratio_warn: None,
+        }
+    }
+}
+
+/// What the run was pointed at.
+///
+/// `scan_run_id` is derived from the canonical form of the scan inputs
+/// (`data-model.md` §2). A caller that knows which tree it walked and which rule
+/// set it loaded declares them here. A caller that does not leaves them empty,
+/// and the identity rests on the digest of what the run produced, which is a
+/// function of the same inputs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanInputs {
+    /// Stable identity of the scanned tree. Never an absolute path: that would
+    /// put the build machine into an identity that has to compare equal across
+    /// machines.
+    pub scan_root_id: String,
+    /// Digest of the rule set that was loaded.
+    pub rule_set_hash: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum DiagnosticCode {
     #[serde(rename = "UNSUPPORTED_SCHEMA_VERSION")]
@@ -124,11 +189,25 @@ pub struct ReportBuilder {
     findings: Vec<Finding>,
     coverage: Option<CoverageStatement>,
     diagnostics: Vec<Diagnostic>,
+    policy: Policy,
+    inputs: ScanInputs,
 }
 
 impl ReportBuilder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Replaces the thresholds the verdict may come from.
+    pub fn policy(&mut self, policy: Policy) -> &mut Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Declares what the run was pointed at, so the run identity can rest on it.
+    pub fn scan_inputs(&mut self, inputs: ScanInputs) -> &mut Self {
+        self.inputs = inputs;
+        self
     }
 
     pub fn add_findings(&mut self, findings: impl IntoIterator<Item = Finding>) -> &mut Self {
@@ -166,22 +245,40 @@ impl ReportBuilder {
         let mut coverage = self.coverage.unwrap_or_else(CoverageStatement::static_only);
         coverage.normalize();
 
+        let coverage_digest = match coverage_digest(&coverage) {
+            Ok(digest) => digest,
+            Err(e) => {
+                // A missing digest weakens the run identity, so it is reported
+                // rather than absorbed. An identity that quietly lost one of its
+                // inputs looks exactly like one that did not.
+                self.diagnostics.push(Diagnostic {
+                    code: DiagnosticCode::Internal,
+                    component: DiagnosticComponent::Reporting,
+                    detail: Some(format!("coverage digest unavailable: {e}")),
+                });
+                String::new()
+            }
+        };
+
         self.diagnostics.sort();
         self.diagnostics.dedup();
 
         let mut policy_ref = policy_ref;
+        policy_ref.rule_hits.extend(evaluate_policy(
+            &self.policy,
+            &confirmed,
+            &suspect,
+            &coverage,
+        ));
         policy_ref.rule_hits.sort();
+        policy_ref.rule_hits.dedup();
 
-        let scan_run_id = format!(
-            "scan_{}",
-            periskop_core::ids::short_hash(
-                "sr/v1",
-                &[
-                    &confirmed.len().to_string(),
-                    &suspect.len().to_string(),
-                    &policy_ref.policy_hash,
-                ],
-            )
+        let scan_run_id = derive_scan_run_id(
+            &self.inputs,
+            &confirmed,
+            &suspect,
+            &coverage_digest,
+            &policy_ref.policy_hash,
         );
         let report_id = format!(
             "rpt_{}",
@@ -191,7 +288,7 @@ impl ReportBuilder {
             )
         );
 
-        let verdict = decide_verdict(&confirmed, &policy_ref);
+        let verdict = decide_verdict(&policy_ref);
 
         ScanReport {
             schema_version: SCHEMA_VERSION.to_owned(),
@@ -208,13 +305,90 @@ impl ReportBuilder {
     }
 }
 
-/// Decides the verdict from findings and the rules that fired.
+/// Evaluates the policy and records what it decided, rule by rule.
+///
+/// Every declared rule produces a hit, including the ones that pass. A report
+/// that records only violations cannot be audited: an empty `rule_hits` reads the
+/// same whether the policy passed everything or never ran at all, and the second
+/// is what F1 shipped, with every verdict PASS and the findings never consulted.
+/// `report-schema.md` makes the same point for coverage, where a PASS over a
+/// known gap is only valid if a hit acknowledges the gap.
+fn evaluate_policy(
+    policy: &Policy,
+    confirmed: &[Finding],
+    suspect: &[Finding],
+    coverage: &CoverageStatement,
+) -> Vec<RuleHit> {
+    let confirmed_ids: Vec<String> = confirmed.iter().map(|f| f.finding_id.clone()).collect();
+    let fails = policy
+        .confirmed_findings_fail
+        .is_some_and(|limit| confirmed.len() as u64 >= limit);
+
+    let suspect_ids: Vec<String> = suspect.iter().map(|f| f.finding_id.clone()).collect();
+    let warns = policy
+        .suspect_findings_warn
+        .is_some_and(|limit| suspect.len() as u64 >= limit);
+
+    // The coverage condition is written whether or not it fired. It is the only
+    // place a reader can see which ratio the policy weighed and against what, and
+    // a threshold that is invisible until it trips cannot be reviewed beforehand.
+    let ratio = coverage.unparsed_ratio_basis_points();
+    let (coverage_verdict, condition) = match policy.unparsed_ratio_warn {
+        Some(limit) if ratio > limit => (
+            VerdictOrder::Warn,
+            format!("coverage_unparsed_ratio {ratio} greater_than {limit}"),
+        ),
+        Some(limit) => (
+            VerdictOrder::Pass,
+            format!("coverage_unparsed_ratio {ratio} within declared limit {limit}"),
+        ),
+        None => (
+            VerdictOrder::Pass,
+            format!("coverage_unparsed_ratio {ratio}, policy declares no limit"),
+        ),
+    };
+
+    vec![
+        RuleHit {
+            rule_id: "policy.confirmed-egress".to_owned(),
+            verdict: if fails {
+                VerdictOrder::Fail
+            } else {
+                VerdictOrder::Pass
+            },
+            finding_ids: (!confirmed_ids.is_empty()).then_some(confirmed_ids),
+            coverage_condition: None,
+        },
+        RuleHit {
+            rule_id: "policy.suspect-egress".to_owned(),
+            verdict: if warns {
+                VerdictOrder::Warn
+            } else {
+                VerdictOrder::Pass
+            },
+            finding_ids: (!suspect_ids.is_empty()).then_some(suspect_ids),
+            coverage_condition: None,
+        },
+        RuleHit {
+            rule_id: "policy.coverage-unparsed-ratio".to_owned(),
+            verdict: coverage_verdict,
+            finding_ids: None,
+            coverage_condition: Some(condition),
+        },
+    ]
+}
+
+/// Decides the verdict from the rules that fired.
 ///
 /// A coverage gap on its own never produces a warning. Warnings come from a
 /// threshold the policy declared and a rule hit that records it. Wiring every gap
 /// straight to a warning would leave the reader looking at a yellow screen on
 /// every run, and a warning that is always on is a warning nobody reads.
-fn decide_verdict(confirmed: &[Finding], policy: &PolicyRef) -> Verdict {
+///
+/// Reading the hits rather than the findings is deliberate. Every input to this
+/// decision has already been written into the report by the time it runs, so the
+/// verdict can be recomputed from the report alone by anyone who doubts it.
+fn decide_verdict(policy: &PolicyRef) -> Verdict {
     if policy
         .rule_hits
         .iter()
@@ -229,8 +403,57 @@ fn decide_verdict(confirmed: &[Finding], policy: &PolicyRef) -> Verdict {
     {
         return Verdict::Warn;
     }
-    let _ = confirmed;
     Verdict::Pass
+}
+
+/// Digest of the coverage statement, as an input to the run identity.
+///
+/// Coverage is part of what makes one run different from another: the same
+/// findings over a tree the scanner read in full and over one it barely read are
+/// not the same run, and an identity that cannot tell them apart is worthless for
+/// storing or diffing reports.
+fn coverage_digest(coverage: &CoverageStatement) -> Result<String, serde_json::Error> {
+    let text = crate::serialize::to_canonical_json(coverage)?;
+    Ok(periskop_core::ids::short_hash("cv/v1", &[&text]))
+}
+
+/// Derives the run identity from what the run was pointed at and what it saw.
+///
+/// The contract derives this from the canonical form of the scan inputs. The two
+/// declared inputs are used when a caller supplies them, and the digest of the
+/// findings and the coverage statement is folded in either way, because the
+/// report body is a total function of the tree and the rule set: two different
+/// trees cannot reach the same digest.
+///
+/// What this replaces mattered. The identity used to be hashed from the *count*
+/// of findings, so two unrelated repositories that each produced three findings
+/// received the same `scan_run_id` and the same `report_id`, and a store keyed on
+/// either one would overwrite one report with the other. Changing a finding from
+/// one provider to another, or coverage from full to nearly none, left both
+/// identifiers untouched.
+fn derive_scan_run_id(
+    inputs: &ScanInputs,
+    confirmed: &[Finding],
+    suspect: &[Finding],
+    coverage_digest: &str,
+    policy_hash: &str,
+) -> String {
+    let mut ids: Vec<&str> = Vec::with_capacity(confirmed.len() + suspect.len());
+    ids.extend(confirmed.iter().map(|f| f.finding_id.as_str()));
+    ids.extend(suspect.iter().map(|f| f.finding_id.as_str()));
+    let findings_digest = periskop_core::ids::short_hash("sf/v1", &ids);
+
+    let canonical_inputs = periskop_core::ids::short_hash(
+        "si/v1",
+        &[&inputs.scan_root_id, &findings_digest, coverage_digest],
+    );
+    format!(
+        "scan_{}",
+        periskop_core::ids::short_hash(
+            "sr/v1",
+            &[&canonical_inputs, &inputs.rule_set_hash, policy_hash],
+        )
+    )
 }
 
 #[cfg(test)]
@@ -335,6 +558,86 @@ mod tests {
     }
 
     #[test]
+    fn a_gap_over_the_declared_limit_warns_and_says_which_limit() {
+        let mut b = ReportBuilder::new();
+        b.policy(Policy {
+            unparsed_ratio_warn: Some(500),
+            ..Policy::default()
+        });
+        let mut coverage = CoverageStatement::static_only();
+        coverage.parsed_files = 1;
+        coverage.unparsed_files = vec![crate::coverage::UnparsedFile {
+            path: "x.py".into(),
+            reason: periskop_core::coverage::UnparsedReason::ParseError,
+        }];
+        b.coverage(coverage);
+        let report = b.build(envelope(), policy(vec![]));
+
+        assert_eq!(report.verdict, Verdict::Warn);
+        // K-20's other half: the threshold that produced the warning is written
+        // into the report, so the warning can be argued with.
+        let hit = report
+            .policy_ref
+            .rule_hits
+            .iter()
+            .find(|h| h.rule_id == "policy.coverage-unparsed-ratio")
+            .unwrap();
+        assert_eq!(hit.verdict, VerdictOrder::Warn);
+        assert_eq!(
+            hit.coverage_condition.as_deref(),
+            Some("coverage_unparsed_ratio 5000 greater_than 500")
+        );
+    }
+
+    #[test]
+    fn the_policy_records_what_it_decided_even_when_it_passes() {
+        // The bug this pins: F1 left rule_hits empty on every run, so a pass could
+        // not be told apart from a policy that never ran, and the verdict was PASS
+        // whatever the findings said.
+        let mut b = ReportBuilder::new();
+        b.add_findings([finding(Confidence::Confirmed, "python.static.a")]);
+        let report = b.build(envelope(), policy(vec![]));
+
+        assert_eq!(report.verdict, Verdict::Pass);
+        let hit = report
+            .policy_ref
+            .rule_hits
+            .iter()
+            .find(|h| h.rule_id == "policy.confirmed-egress")
+            .unwrap();
+        assert_eq!(hit.verdict, VerdictOrder::Pass);
+        assert_eq!(
+            hit.finding_ids.as_deref(),
+            Some(&[report.findings[0].finding_id.clone()][..]),
+            "the pass has to name the findings it passed on"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_finding_fails_once_the_policy_declares_a_limit() {
+        let mut b = ReportBuilder::new();
+        b.policy(Policy {
+            confirmed_findings_fail: Some(1),
+            ..Policy::default()
+        });
+        b.add_findings([finding(Confidence::Confirmed, "python.static.a")]);
+        let report = b.build(envelope(), policy(vec![]));
+
+        assert_eq!(report.verdict, Verdict::Fail);
+    }
+
+    #[test]
+    fn a_suspect_finding_warns_by_default() {
+        // Not a coverage gap, so K-20 does not apply: the scanner saw something it
+        // could not prove, which is the case a human is meant to look at.
+        let mut b = ReportBuilder::new();
+        b.add_findings([finding(Confidence::Suspect, "python.static.b")]);
+        let report = b.build(envelope(), policy(vec![]));
+
+        assert_eq!(report.verdict, Verdict::Warn);
+    }
+
+    #[test]
     fn the_same_input_produces_the_same_identifiers() {
         let build = || {
             let mut b = ReportBuilder::new();
@@ -345,6 +648,54 @@ mod tests {
         let b = build();
         assert_eq!(a.report_id, b.report_id);
         assert_eq!(a.scan_run_id, b.scan_run_id);
+    }
+
+    #[test]
+    fn two_unrelated_scans_of_the_same_size_get_different_identities() {
+        // The bug this pins: identities were hashed from the *count* of findings,
+        // so two repositories with nothing in common collided as long as they
+        // produced the same number of findings, and a store keyed on report_id
+        // overwrote one with the other.
+        let build = |rule: &str| {
+            let mut b = ReportBuilder::new();
+            b.add_findings([finding(Confidence::Confirmed, rule)]);
+            b.build(envelope(), policy(vec![]))
+        };
+        let a = build("python.static.openai");
+        let b = build("typescript.static.anthropic");
+
+        assert_eq!(a.findings.len(), b.findings.len());
+        assert_ne!(a.scan_run_id, b.scan_run_id);
+        assert_ne!(a.report_id, b.report_id);
+    }
+
+    #[test]
+    fn the_same_findings_over_different_coverage_are_different_runs() {
+        // A tree the scanner read in full and one it barely read are not the same
+        // run even when they yield the same findings, and the identity has to say
+        // so or a diff of two stored reports shows nothing.
+        let build = |parsed_files: u64| {
+            let mut b = ReportBuilder::new();
+            b.add_findings([finding(Confidence::Confirmed, "python.static.a")]);
+            let mut coverage = CoverageStatement::static_only();
+            coverage.parsed_files = parsed_files;
+            b.coverage(coverage);
+            b.build(envelope(), policy(vec![]))
+        };
+        assert_ne!(build(400).scan_run_id, build(4).scan_run_id);
+    }
+
+    #[test]
+    fn declared_scan_inputs_reach_the_identity() {
+        let build = |root: &str| {
+            let mut b = ReportBuilder::new();
+            b.scan_inputs(ScanInputs {
+                scan_root_id: root.into(),
+                rule_set_hash: "c".repeat(64),
+            });
+            b.build(envelope(), policy(vec![]))
+        };
+        assert_ne!(build("repo-a").scan_run_id, build("repo-b").scan_run_id);
     }
 
     #[test]

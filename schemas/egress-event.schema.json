@@ -4,7 +4,7 @@
   "title": "EgressEvent",
   "type": "object",
   "description": "One call that actually happened, recorded by a runtime hook. Where a declared egress point says the code can reach a provider, an event says it did.",
-  "$comment": "The hook records the shape of a payload and never its content. A tool that exists to stop data leaving must not become the thing that copies it.",
+  "$comment": "The hook records the shape of a payload and never its content. A tool that exists to stop data leaving must not become the thing that copies it. Transport is fixed here as well: a hook appends one JSON object per line to a file ending in .jsonl inside the directory named by PERISKOP_EVENT_DIR, one file per process. Line delimited append is chosen because a partially written last line costs one event rather than corrupting the file, and because two processes appending never need a lock.",
   "required": [
     "schema_version",
     "egress_event_id",
@@ -20,7 +20,7 @@
     "egress_event_id": {
       "type": "string",
       "pattern": "^ee_[0-9a-f]{16}$",
-      "description": "Deterministic, derived from the call shape rather than from a counter, so the same call recorded twice carries one identity."
+      "description": "Deterministic, derived from the call shape rather than from a counter, so the same call recorded twice carries one identity. The derivation is normative and every hook must apply it identically: blake3 over the domain tag ee/v1 followed by library.module, operation, target.host_id and target.path_template, each separated by byte 0x1f, rendered as ee_ plus the first eight bytes in lowercase hex. Two hooks that derive it differently would give one call two identities and defeat deduplication, which is why this is fixed in the contract rather than left to each implementation."
     },
 
     "process": {

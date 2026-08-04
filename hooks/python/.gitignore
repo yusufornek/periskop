@@ -1,0 +1,4 @@
+# Interpreter artefacts from running the suite. The repository root has no
+# python section yet, so the hook keeps its own house clean.
+__pycache__/
+*.py[cod]

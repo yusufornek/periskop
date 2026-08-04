@@ -1,0 +1,46 @@
+# Anthropic Java SDK (com.anthropic:anthropic-java).
+#
+# Same shape as the OpenAI Java SDK, one accessor shorter:
+# `client.messages().create(params)`.
+
+schema_version = "1.0"
+language = "java"
+provider = "anthropic"
+rule_id = "java.static.anthropic-messages-call"
+rule_version = "1.0.0"
+
+[[match]]
+kind = "call"
+query = '''
+(method_invocation
+  object: (_) @recv
+  name: (identifier) @method
+  arguments: (argument_list) @args
+  (#match? @method "^(create|createStreaming|stream)$")) @call
+'''
+
+[match.binding]
+capture = "recv"
+resolves_to = { module = "com.anthropic", symbol_path = [
+  "AnthropicClient",
+  "AnthropicClientAsync",
+  "AnthropicOkHttpClient",
+  "AnthropicOkHttpClientAsync",
+] }
+
+[match.method]
+capture = "method"
+one_of = ["create", "createStreaming", "stream"]
+
+[extract]
+model = { from = "args", keyword = "model" }
+base_url = { from = "recv", constructor_keyword = "baseUrl" }
+
+[classify]
+egress_kind = "llm_chat"
+default_confidence = "confirmed"
+
+[[classify.downgrade]]
+when = "base_url.unresolved"
+to = "suspect"
+coverage_note = "target_host_unresolved"

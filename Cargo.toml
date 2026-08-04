@@ -5,12 +5,12 @@ members = [
     "crates/periskop-static-scanner",
     "crates/periskop-report",
     "crates/periskop-cli",
+    "crates/periskop-runtime-collector",
 ]
 
 # Crates designed but not yet implemented. They join the workspace in their own
 # phase rather than sitting here empty:
-#   periskop-runtime-collector, periskop-network-sensor,
-#   periskop-reconcile, periskop-proxy
+#   periskop-network-sensor, periskop-reconcile, periskop-proxy
 
 [workspace.package]
 version = "0.1.0"
@@ -24,6 +24,7 @@ authors = ["periskop contributors"]
 periskop-core = { path = "crates/periskop-core" }
 periskop-static-scanner = { path = "crates/periskop-static-scanner" }
 periskop-report = { path = "crates/periskop-report" }
+periskop-runtime-collector = { path = "crates/periskop-runtime-collector" }
 
 blake3 = "1.5"
 clap = { version = "4.5", features = ["derive"] }

@@ -1,0 +1,59 @@
+# langchain4j, the framework most enterprise Java projects reach for.
+#
+# The provider recorded here is the framework rather than the vendor behind it.
+# That is deliberate: `model.chat(...)` goes wherever the model object was built
+# to go, the model class is chosen at construction, and naming a vendor at the
+# call site would be asserting something this rule did not check. Reconciliation
+# is where a destination gets attached to a call.
+#
+# Both generations of the API are matched. langchain4j 1.x renamed
+# `ChatLanguageModel` to `ChatModel` and `generate` to `chat`; both spellings are
+# in production code today and a rule that knows only the new one would walk past
+# every project that has not migrated.
+
+schema_version = "1.0"
+language = "java"
+provider = "langchain4j"
+rule_id = "java.static.langchain4j-chat-call"
+rule_version = "1.0.0"
+
+[[match]]
+kind = "call"
+query = '''
+(method_invocation
+  object: (_) @recv
+  name: (identifier) @method
+  arguments: (argument_list) @args
+  (#match? @method "^(chat|generate)$")) @call
+'''
+
+[match.binding]
+capture = "recv"
+resolves_to = { module = "dev.langchain4j", symbol_path = [
+  "ChatModel",
+  "ChatLanguageModel",
+  "StreamingChatModel",
+  "StreamingChatLanguageModel",
+  "OpenAiChatModel",
+  "OpenAiStreamingChatModel",
+  "AnthropicChatModel",
+  "AzureOpenAiChatModel",
+  "BedrockChatModel",
+] }
+
+[match.method]
+capture = "method"
+one_of = ["chat", "generate"]
+
+[extract]
+model = { from = "recv", constructor_keyword = "modelName" }
+base_url = { from = "recv", constructor_keyword = "baseUrl" }
+
+[classify]
+egress_kind = "llm_chat"
+default_confidence = "confirmed"
+
+[[classify.downgrade]]
+when = "base_url.unresolved"
+to = "suspect"
+coverage_note = "target_host_unresolved"

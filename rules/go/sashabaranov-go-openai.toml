@@ -1,0 +1,49 @@
+# Community OpenAI client for Go.
+#
+# Kept alongside the official SDK rather than replaced by it. This package was
+# the only usable Go client for years, so it is what existing services are built
+# on, and a scanner that only knew the official SDK would report those services
+# as having no egress at all.
+
+schema_version = "1.0"
+language = "go"
+provider = "openai"
+rule_id = "go.static.sashabaranov-openai-call"
+rule_version = "1.0.0"
+
+# client.CreateChatCompletion(ctx, req)
+[[match]]
+kind = "call"
+query = '''
+(call_expression
+  function: (selector_expression
+    operand: (identifier) @recv
+    field: (field_identifier) @method)
+  arguments: (argument_list) @args
+  (#match? @method "^(CreateChatCompletion|CreateChatCompletionStream)$")) @call
+'''
+
+[match.binding]
+capture = "recv"
+resolves_to = { module = "github.com/sashabaranov/go-openai", symbol_path = [
+  "NewClient",
+  "NewClientWithConfig",
+] }
+
+[match.method]
+capture = "method"
+one_of = ["CreateChatCompletion", "CreateChatCompletionStream"]
+
+[extract]
+model = { from = "args", keyword = "Model" }
+payload_ref = { from = "args", keyword = "Messages" }
+base_url = { from = "recv", constructor_keyword = "BaseURL" }
+
+[classify]
+egress_kind = "llm_chat"
+default_confidence = "confirmed"
+
+[[classify.downgrade]]
+when = "base_url.unresolved"
+to = "suspect"
+coverage_note = "target_host_unresolved"

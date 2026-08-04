@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "egress_event_id": "ee_5b18c30af7924de6",
+  "egress_event_id": "ee_3dfe316616cd47b4",
   "process": {
     "language": "python",
     "runtime": "cpython/3.12",

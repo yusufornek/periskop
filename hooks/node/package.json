@@ -1,0 +1,18 @@
+{
+  "name": "@periskop/hook-node",
+  "version": "0.1.0",
+  "description": "Node.js runtime hook for periskop. Records the shape of calls that leave the process, never their content.",
+  "license": "Apache-2.0",
+  "main": "dist/preload.js",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "lint": "tsc --noEmit",
+    "test": "node --test dist/*.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "typescript": "5.7.2"
+  },
+  "engines": { "node": ">=20" }
+}
