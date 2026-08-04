@@ -87,6 +87,15 @@ pub struct PlatformKernel {
     /// causes, which is nine, so it cannot grow with traffic.
     #[cfg(feature = "ebpf-loader")]
     rejected_samples: BTreeMap<&'static str, u64>,
+    /// Whether a load has succeeded on this kernel.
+    ///
+    /// Held here rather than asked of the loader, because the question a poll
+    /// has to answer is "was anything attached when I read", and the only party
+    /// that saw the load return is this one. `false` until a load succeeds, so a
+    /// caller that ignored an attach failure reads a batch that says nothing was
+    /// attached instead of one that looks like a quiet machine.
+    #[cfg(feature = "ebpf-loader")]
+    attached: bool,
 }
 
 #[cfg(feature = "ebpf-loader")]
@@ -109,10 +118,12 @@ impl KernelEvents for PlatformKernel {
     }
 
     fn poll(&mut self) -> KernelBatch {
-        // Reachable only if a caller ignored the attach failure. An empty batch
-        // is correct here and nowhere else: nothing was attached, so nothing was
-        // seen, and the sensor states that through the attach error rather than
-        // by handing back a plausible looking empty result.
+        // Reachable only if a caller ignored the attach failure, and the batch
+        // says so rather than handing back a plausible looking empty result.
+        // `KernelBatch::default()` carries `PollState::NotAttached`, which is
+        // the difference between "nothing was attached, so nothing could have
+        // been seen" and "the machine was quiet". Before that state existed this
+        // return value was indistinguishable from a clean network.
         KernelBatch::default()
     }
 }
@@ -126,12 +137,21 @@ impl KernelEvents for PlatformKernel {
         // capabilities or been re-executed, and the check that decides whether a
         // syscall will succeed is the one immediately before it.
         let capabilities = capabilities_from(&Privileges::probe());
-        self.loader
+        let loaded = self
+            .loader
             .load(ebpf::HostPlatform::current(), &capabilities, &hooks)
-            .map_err(cause_from)
+            .map_err(cause_from);
+        // Recorded only on success. A failed load leaves the flag false, so a
+        // caller that dropped the error still reads batches that say nothing was
+        // attached.
+        self.attached = loaded.is_ok();
+        loaded
     }
 
     fn poll(&mut self) -> KernelBatch {
+        if !self.attached {
+            return KernelBatch::default();
+        }
         let batch = self.loader.poll();
         let mut events = Vec::with_capacity(batch.events.len());
         for raw in batch.events {
@@ -147,6 +167,7 @@ impl KernelEvents for PlatformKernel {
             }
         }
         KernelBatch {
+            state: super::event::PollState::Attached,
             events,
             dropped: batch.dropped,
         }
@@ -328,10 +349,19 @@ mod tests {
     }
 
     #[test]
-    fn a_kernel_that_never_attached_reports_no_events_and_no_losses() {
+    fn a_kernel_that_never_attached_says_so_rather_than_reporting_a_quiet_machine() {
+        // Critic round k3. The empty event list was the whole of what this read
+        // used to say, and it is the same empty list a fully attached sensor
+        // hands back on a machine that sent nothing. The state is what separates
+        // "no programs are loaded" from "the network was silent"; without it a
+        // caller that ignored the attach error would report the second.
         let batch = PlatformKernel::default().poll();
         assert!(batch.events.is_empty());
         assert_eq!(batch.dropped, 0);
+        assert!(
+            !batch.observed(),
+            "an unattached kernel handed back a batch that reads as a measurement"
+        );
     }
 }
 
@@ -614,13 +644,25 @@ mod loader_backed_tests {
     }
 
     #[test]
-    fn a_refused_load_hands_back_no_events_and_no_rejections() {
+    fn a_refused_load_is_a_refusal_and_not_an_empty_observation() {
+        // This test used to open with `let _ = kernel.attach(..)`, which counted
+        // the swallowed error as correct and then asserted the empty batch that
+        // follows it. Those assertions passed for a kernel that had loaded
+        // nothing and would have passed just as well for one that had, which is
+        // the defect the state exists to make impossible. The refusal is now
+        // asserted, and the batch is asserted to say it establishes nothing.
         let mut kernel = PlatformKernel::default();
-        let _ = kernel.attach(&attach::plan(&Grant {
+        let refusal = kernel.attach(&attach::plan(&Grant {
             tc_available: false,
             elevated_as_root: false,
         }));
+        assert!(
+            refusal.is_err(),
+            "this machine loaded eBPF programs inside a unit test"
+        );
+
         let batch = kernel.poll();
+        assert!(!batch.observed());
         assert!(batch.events.is_empty());
         assert_eq!(batch.dropped, 0);
         assert!(kernel.rejected_samples().is_empty());

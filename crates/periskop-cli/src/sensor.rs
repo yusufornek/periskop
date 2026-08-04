@@ -1,0 +1,433 @@
+//! The `sensor` command: one observation pass, written where a scan can read it.
+//!
+//! Until this module existed the network sensor had no path to disk at all. The
+//! crate could observe, and `periskop scan --flows <DIR>` could read records, and
+//! nothing in the product could put anything in that directory: every flow the
+//! reconciler had ever seen was written by a test. That is why F3's gate could
+//! not be built, and it is the concrete shape of "designed, not wired".
+//!
+//! Two properties are non negotiable here, and both are milestone 54's.
+//!
+//! **A sensor that may not run does not fail.** `observe` returns an outcome
+//! rather than an error, and so does this: on a machine with no eBPF, no
+//! capabilities or no loader compiled in, the command writes an empty record set,
+//! prints why, and exits non zero. It never panics and never takes a scan down
+//! with it. An observation tool that makes the product unusable when it cannot
+//! observe has failed at the only thing it was for.
+//!
+//! **What could not be done is declared in a structured form.** The status
+//! document below is the answer, and it is written whether or not anything was
+//! observed. A command that printed nothing on a denied run would be
+//! indistinguishable from one that watched a quiet machine, which is the exact
+//! confusion `SensorOutcome` was built to prevent.
+//!
+//! The status is printed rather than written into the record directory. Anything
+//! ending in `.json` inside that directory is read back as a flow record by
+//! `scan --flows`, so a status file dropped beside the records would be reported
+//! as an unparsable flow on every run.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use periskop_network_sensor::{
+    observe, EbpfFlowSource, Flow, FlowScope, Privileges, ScopePolicy, SensorOutcome, SensorState,
+};
+use serde::Serialize;
+
+/// Name of the record file one pass writes.
+///
+/// Fixed rather than stamped with a time. The directory is the unit a scan is
+/// pointed at, and a file name carrying a clock would make two passes over the
+/// same machine accumulate records nobody deletes, which is how a flow directory
+/// silently starts describing last week.
+const RECORD_FILE_NAME: &str = "flows.jsonl";
+
+/// What one `sensor` invocation was asked for.
+pub struct SensorRequest<'a> {
+    /// Directory the records are written into. Created if it is not there.
+    pub out_dir: &'a Path,
+    /// Machine identity to stamp records with, when the caller states one.
+    pub host_id: Option<&'a str>,
+    /// Processes that belong to the codebase under scan.
+    ///
+    /// Empty is a legitimate and declared state: nothing can then be attributed
+    /// to the codebase, every attributed flow lands in `out_of_scope_process`,
+    /// and no unmatched traffic finding can be derived from this pass. The status
+    /// says so rather than leaving the reader to work it out from four zeroes.
+    pub codebase_processes: &'a [String],
+    /// Destinations the operator declared benign.
+    pub benign_hosts: &'a [String],
+}
+
+/// Writing the records failed.
+///
+/// Separate from everything the sensor could not observe, and the separation is
+/// the point: a denied sensor is a stated outcome, while a directory that cannot
+/// be written is the caller's problem and has to be reported as one.
+#[derive(Debug, thiserror::Error)]
+pub enum SensorWriteError {
+    #[error("the record directory {0} could not be created: {1}")]
+    DirectoryNotCreated(PathBuf, std::io::Error),
+
+    #[error("the record file {0} could not be written: {1}")]
+    FileNotWritten(PathBuf, std::io::Error),
+
+    #[error("a record this build produced could not be serialized: {0}")]
+    RecordNotSerialized(serde_json::Error),
+}
+
+/// What one pass established, in the form the command prints.
+///
+/// Serialized with `serde` so the shape is one declaration rather than a format
+/// string somebody edits half of. Every field is present on every run, including
+/// the zeroes: a counter that disappears when it is empty takes its zero with it,
+/// and the zero is the answer to a question the reader asked.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct SensorStatus {
+    /// `observed` or `not_started`. The two are not spellings of one thing: the
+    /// first says the machine was watched, the second that it was not.
+    pub state: &'static str,
+    /// The fixed label for why nothing was observed, absent when something was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<&'static str>,
+    /// What this machine could have offered.
+    pub detected_platform: &'static str,
+    /// What a report may claim, which is `none` whenever nothing was observed.
+    pub coverage_platform_class: &'static str,
+    pub host_id: String,
+    /// Where the machine identity came from, so a reader can weigh it.
+    pub host_id_source: &'static str,
+    pub flows_written: u64,
+    /// All four buckets, including the empty ones.
+    pub flow_scope_counts: BTreeMap<&'static str, u64>,
+    /// Observations that could not become records, by fixed reason label.
+    pub rejected_observations: BTreeMap<&'static str, u64>,
+    pub dropped_events: u64,
+    pub unlinked_events: u64,
+    /// Absent on a pass that never started: the coverage contract closes this
+    /// field at two values and both are claims about a run that happened.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_observation: Option<&'static str>,
+    /// Everything this pass could not establish, in the sensor's own words.
+    ///
+    /// The structured half of "say what you could not do". A reader who sees an
+    /// empty record set has to be able to tell a quiet machine from a machine
+    /// nobody was allowed to look at, and from one where the scope policy made
+    /// attribution impossible before a single packet arrived.
+    pub not_measured: Vec<String>,
+}
+
+impl SensorStatus {
+    /// Whether this pass observed the machine at all.
+    ///
+    /// The command's exit code is derived from it: a pass that never started
+    /// must not exit zero, or a pipeline that runs the sensor and then scans
+    /// would treat "nobody watched" as "nothing happened".
+    pub fn observed(&self) -> bool {
+        self.state == OBSERVED
+    }
+}
+
+const OBSERVED: &str = "observed";
+const NOT_STARTED: &str = "not_started";
+
+/// What one pass produced.
+pub struct SensorRun {
+    pub status: SensorStatus,
+    /// Where the records went, whether or not there were any. A pass that
+    /// observed nothing still writes the file, because an absent file and an
+    /// empty one say different things to the scan that reads the directory next.
+    pub record_file: PathBuf,
+}
+
+/// Runs one observation pass and writes what it saw.
+///
+/// The `Result` is about the disk and nothing else. Everything the sensor could
+/// not do arrives inside [`SensorStatus`], which is why this function has no
+/// error variant for a denied sensor: there is no `?` a caller could write that
+/// would turn a missing capability into a failed command.
+pub fn run(request: &SensorRequest<'_>) -> Result<SensorRun, SensorWriteError> {
+    let (host_id, host_id_source) = host_identity(request.host_id);
+
+    let mut policy = ScopePolicy::for_codebase(request.codebase_processes.iter().cloned());
+    for host in request.benign_hosts {
+        policy = policy.with_declared_benign_host(host.clone());
+    }
+
+    let mut source = EbpfFlowSource::new(host_id.clone());
+    let outcome = observe(&mut source, &Privileges::probe(), &policy);
+
+    let record_file = write_records(request.out_dir, outcome.flows())?;
+    let status = status_of(&outcome, host_id, host_id_source, request);
+
+    Ok(SensorRun {
+        status,
+        record_file,
+    })
+}
+
+/// Writes the records as one JSON document per line.
+///
+/// The shape `scan --flows` reads first, and the shape a live sensor can append
+/// to without rewriting what it already wrote. The file is truncated rather than
+/// appended to: two passes over one machine describe two windows, and silently
+/// unioning them would let a report count a connection that closed yesterday.
+fn write_records(out_dir: &Path, flows: &[Flow]) -> Result<PathBuf, SensorWriteError> {
+    std::fs::create_dir_all(out_dir)
+        .map_err(|error| SensorWriteError::DirectoryNotCreated(out_dir.to_path_buf(), error))?;
+
+    let mut body = String::new();
+    for flow in flows {
+        let line = serde_json::to_string(flow).map_err(SensorWriteError::RecordNotSerialized)?;
+        body.push_str(&line);
+        body.push('\n');
+    }
+
+    let path = out_dir.join(RECORD_FILE_NAME);
+    std::fs::write(&path, body)
+        .map_err(|error| SensorWriteError::FileNotWritten(path.clone(), error))?;
+    Ok(path)
+}
+
+fn status_of(
+    outcome: &SensorOutcome,
+    host_id: String,
+    host_id_source: &'static str,
+    request: &SensorRequest<'_>,
+) -> SensorStatus {
+    let mut rejected: BTreeMap<&'static str, u64> = BTreeMap::new();
+    for reason in outcome.rejected() {
+        *rejected.entry(*reason).or_insert(0) += 1;
+    }
+
+    let mut flow_scope_counts: BTreeMap<&'static str, u64> = BTreeMap::new();
+    for (scope, count) in outcome.tally().counters() {
+        flow_scope_counts.insert(scope.as_str(), count);
+    }
+
+    SensorStatus {
+        state: match outcome.state() {
+            SensorState::Observed => OBSERVED,
+            SensorState::NotStarted(_) => NOT_STARTED,
+        },
+        unavailable_reason: outcome.unavailable_reason(),
+        detected_platform: outcome.detected_platform().as_str(),
+        coverage_platform_class: outcome.coverage_platform_class().as_str(),
+        host_id,
+        host_id_source,
+        flows_written: outcome.flows().len() as u64,
+        flow_scope_counts,
+        rejected_observations: rejected,
+        dropped_events: outcome.dropped_events(),
+        unlinked_events: outcome.unlinked_events(),
+        dns_observation: outcome.dns_observation().map(|dns| dns.as_str()),
+        not_measured: not_measured(outcome, host_id_source, request),
+    }
+}
+
+/// The list of things this pass is unable to state, each with its consequence.
+///
+/// Written out rather than left for a reader to infer from a field being zero.
+/// Each entry names what was not measured and what a report therefore cannot
+/// say, because a limitation nobody can act on is a limitation nobody reads.
+fn not_measured(
+    outcome: &SensorOutcome,
+    host_id_source: &'static str,
+    request: &SensorRequest<'_>,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+
+    if let Some(reason) = outcome.unavailable_reason() {
+        notes.push(format!(
+            "nothing was observed on this machine ({reason}), so the records are empty because \
+             nobody watched rather than because nothing was sent"
+        ));
+    }
+    if request.codebase_processes.is_empty() {
+        notes.push(
+            "no codebase process was declared, so no flow can reach the in_scope bucket and this \
+             pass cannot support an unmatched_wire_traffic finding"
+                .to_owned(),
+        );
+    }
+    if outcome.dns_observation().is_none() {
+        notes.push(
+            "plaintext DNS visibility was not measured, because measuring it needs a pass that \
+             started"
+                .to_owned(),
+        );
+    }
+    if host_id_source == HOST_ID_NOT_IDENTIFIED {
+        notes.push(
+            "this machine could not be identified, so the host id is a constant and two machines \
+             writing records into one directory would be indistinguishable"
+                .to_owned(),
+        );
+    }
+    if outcome.state() == SensorState::Observed
+        && outcome.tally().count(FlowScope::InScope) == 0
+        && outcome.tally().total() > 0
+    {
+        notes.push(
+            "every observed flow fell outside the declared codebase, so this pass counts traffic \
+             it cannot attribute to the project under scan"
+                .to_owned(),
+        );
+    }
+    notes
+}
+
+/// Where a machine identity came from.
+const HOST_ID_MACHINE_ID: &str = "machine_id";
+const HOST_ID_STATED: &str = "stated_by_caller";
+const HOST_ID_NOT_IDENTIFIED: &str = "not_identified";
+
+/// The identity records are stamped with, and how it was arrived at.
+///
+/// Never the hostname itself. `flow.schema.json` is explicit that this is a
+/// stable opaque id rather than a name, so a report does not carry infrastructure
+/// naming; every source below is hashed before it is used.
+///
+/// A machine that offers none of the sources is not given an invented one that
+/// looks unique. It gets a constant, and the status says so, because a fabricated
+/// per run identity would give the same connection a new flow id on every pass
+/// and quietly break the one property flow identity exists for.
+fn host_identity(stated: Option<&str>) -> (String, &'static str) {
+    if let Some(stated) = stated {
+        return (opaque_host_id(stated), HOST_ID_STATED);
+    }
+    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            let trimmed = contents.trim();
+            if !trimmed.is_empty() {
+                return (opaque_host_id(trimmed), HOST_ID_MACHINE_ID);
+            }
+        }
+    }
+    (opaque_host_id("unidentified-host"), HOST_ID_NOT_IDENTIFIED)
+}
+
+fn opaque_host_id(seed: &str) -> String {
+    format!("h_{}", periskop_core::ids::short_hash("host/v1", &[seed]))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("periskop-sensor-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn request<'a>(out: &'a Path, processes: &'a [String]) -> SensorRequest<'a> {
+        SensorRequest {
+            out_dir: out,
+            host_id: Some("test-machine"),
+            codebase_processes: processes,
+            benign_hosts: &[],
+        }
+    }
+
+    #[test]
+    fn a_pass_on_a_machine_that_cannot_observe_still_answers() {
+        // Milestone 54, through the command surface: whatever machine this is,
+        // the pass produces a status, writes a record file and does not panic.
+        // On a developer's macOS machine and on an unprivileged CI container the
+        // sensor cannot start, and that has to be an answer rather than a crash.
+        let out = TempDir::new("denied");
+        let processes = vec!["/usr/bin/python3".to_owned()];
+        let run = run(&request(&out.0, &processes)).unwrap();
+
+        assert!(run.record_file.is_file());
+        assert!(run.status.flow_scope_counts.len() == FlowScope::ALL.len());
+        if !run.status.observed() {
+            assert!(run.status.unavailable_reason.is_some());
+            assert_eq!(run.status.coverage_platform_class, "none");
+            assert!(
+                run.status
+                    .not_measured
+                    .iter()
+                    .any(|note| note.contains("nobody watched")),
+                "{:?}",
+                run.status.not_measured
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_pass_writes_an_empty_file_rather_than_no_file() {
+        // An absent file and an empty one say different things to the scan that
+        // reads the directory next: no sensor ran, against a sensor that ran and
+        // saw nothing.
+        let out = TempDir::new("empty-file");
+        let processes = vec!["/usr/bin/python3".to_owned()];
+        let run = run(&request(&out.0, &processes)).unwrap();
+        let body = std::fs::read_to_string(&run.record_file).unwrap();
+        assert!(body.lines().all(|line| !line.trim().is_empty()));
+    }
+
+    #[test]
+    fn a_pass_with_no_declared_codebase_says_what_that_costs() {
+        // An empty scope policy is legitimate and its consequence is severe: no
+        // flow can reach the only bucket that produces a finding.
+        let out = TempDir::new("no-codebase");
+        let run = run(&request(&out.0, &[])).unwrap();
+        assert!(
+            run.status
+                .not_measured
+                .iter()
+                .any(|note| note.contains("in_scope")),
+            "{:?}",
+            run.status.not_measured
+        );
+    }
+
+    #[test]
+    fn the_status_serializes_with_every_bucket_including_the_zeroes() {
+        let out = TempDir::new("status-shape");
+        let processes = vec!["/usr/bin/python3".to_owned()];
+        let run = run(&request(&out.0, &processes)).unwrap();
+        let json = serde_json::to_value(&run.status).unwrap();
+        for bucket in FlowScope::ALL {
+            assert!(
+                json["flow_scope_counts"].get(bucket.as_str()).is_some(),
+                "{json}"
+            );
+        }
+        assert!(json.get("state").is_some());
+        assert!(json.get("not_measured").is_some());
+    }
+
+    #[test]
+    fn a_stated_host_id_is_hashed_rather_than_carried() {
+        // The contract says a stable opaque id and not a name, so infrastructure
+        // naming must not reach a record even when the caller hands one over.
+        let (id, source) = host_identity(Some("build-box-07.corp.example"));
+        assert_eq!(source, HOST_ID_STATED);
+        assert!(!id.contains("corp.example"));
+        assert!(id.starts_with("h_"));
+        assert_eq!(id.len(), "h_".len() + 16);
+    }
+
+    #[test]
+    fn one_machine_gets_one_identity_across_passes() {
+        // A per run identity would give the same connection a new flow id every
+        // pass, which is the one property flow identity exists for.
+        assert_eq!(host_identity(Some("a")).0, host_identity(Some("a")).0);
+        assert_ne!(host_identity(Some("a")).0, host_identity(Some("b")).0);
+    }
+}

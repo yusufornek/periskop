@@ -1820,3 +1820,187 @@ fn no_absolute_path_reaches_the_report_through_the_event_side() {
         outcome.report.diagnostics
     );
 }
+
+/// A policy declaring the band the engine refuses to invent.
+///
+/// 5000 to 30000 basis points is half to three times the payload the calls
+/// declared. The fixture's connection carries 2048 bytes against a declared 512,
+/// which is four times and outside it.
+const POLICY_WITH_BAND: &str = r#"
+[policy]
+name = "fixture-policy"
+version = 7
+
+[reconciliation]
+volume_band = { min_basis_points = 5000, max_basis_points = 30000 }
+"#;
+
+/// The wiring F3-GAP2 was about: a threshold written in a file changes which
+/// findings exist.
+///
+/// Run through the binary rather than the library, because the library could
+/// already do this and had been able to since the rule was written. What did not
+/// exist was any path from a file on disk to `ReconcileSettings`, so the field
+/// could be declared in a policy and nothing read it, and `volume_anomaly` could
+/// not be produced by a real pipeline run at all.
+#[test]
+fn a_volume_band_declared_in_a_policy_file_produces_the_finding_through_the_binary() {
+    let fixture = Fixture::new("policy-band-cli");
+    fixture
+        .write_events("worker-1.jsonl", &[call_to("api.openai.com")])
+        .write_flows(
+            "sensor-1.jsonl",
+            &[connection(
+                "api.openai.com",
+                "openai",
+                FlowScope::InScope,
+                54_321,
+            )],
+        )
+        .write_project_file("periskop-policy.toml", POLICY_WITH_BAND);
+
+    let report = scan_json(&fixture, &[]);
+
+    assert!(
+        report.contains("volume_anomaly"),
+        "the band was declared and the finding did not appear: {report}"
+    );
+    // The policy that decided the run is named in the report, or an auditor
+    // cannot say which thresholds produced it.
+    assert!(report.contains("fixture-policy"), "{report}");
+    assert!(report.contains("\"policy_version\": \"7\""), "{report}");
+}
+
+#[test]
+fn the_same_tree_without_the_policy_file_derives_nothing_and_says_why() {
+    // The other half of the claim above. Without a declared band the kind is
+    // suppressed with its reason rather than silently absent, and no invented
+    // default fills in for the missing threshold.
+    let fixture = Fixture::new("policy-band-absent");
+    fixture
+        .write_events("worker-1.jsonl", &[call_to("api.openai.com")])
+        .write_flows(
+            "sensor-1.jsonl",
+            &[connection(
+                "api.openai.com",
+                "openai",
+                FlowScope::InScope,
+                54_321,
+            )],
+        );
+
+    let report = scan_json(&fixture, &[]);
+
+    assert!(!report.contains("\"volume_anomaly\""), "{report}");
+    assert!(report.contains("volume_band_not_declared"), "{report}");
+}
+
+#[test]
+fn a_policy_file_that_cannot_be_applied_fails_the_run_instead_of_being_skipped() {
+    // The contract's rule 2. A policy present, unusable and quietly replaced by
+    // the defaults is the exact defect this product looks for in other people's
+    // systems: a control that is there, inert, and reported as fine.
+    let fixture = Fixture::new("policy-inverted");
+    fixture.write_project_file(
+        "periskop-policy.toml",
+        r#"
+[policy]
+name = "fixture-policy"
+version = 1
+
+[reconciliation]
+volume_band = { min_basis_points = 30000, max_basis_points = 5000 }
+"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_periskop"))
+        .arg("scan")
+        .arg(fixture.project())
+        .arg("--rules")
+        .arg(repo_root().join("rules"))
+        .arg("--json")
+        .output()
+        .unwrap();
+    let report = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(1), "{report}");
+    assert!(report.contains("POLICY_LOAD_ERROR"), "{report}");
+    assert!(report.contains("engine.policy-loaded"), "{report}");
+    assert!(report.contains("\"FAIL\""), "{report}");
+    // The file name reaches the report and the absolute path does not.
+    assert!(report.contains("periskop-policy.toml"), "{report}");
+    assert!(
+        !report.contains(&fixture.root.to_string_lossy().to_string()),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_policy_path_that_is_not_there_stops_the_command() {
+    // A mistyped policy path must not silently become the engine's defaults, for
+    // the reason a mistyped flow directory must not become a quiet machine.
+    let fixture = Fixture::new("policy-missing");
+    let absent = fixture.project().join("nowhere.toml");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_periskop"))
+        .arg("scan")
+        .arg(fixture.project())
+        .arg("--rules")
+        .arg(repo_root().join("rules"))
+        .arg("--policy")
+        .arg(&absent)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no policy file"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_rule_block_this_build_does_not_evaluate_is_reported_rather_than_swallowed() {
+    // The failure this prevents: a user writes a `fail` condition, reads a
+    // passing report, and believes the condition held.
+    let fixture = Fixture::new("policy-unevaluated-rules");
+    fixture.write_project_file(
+        "periskop-policy.toml",
+        r#"
+[policy]
+name = "fixture-policy"
+version = 2
+
+[[condition]]
+id = "no-unmatched-traffic"
+when = { field = "kind", equals = "unmatched_wire_traffic" }
+severity = "fail"
+"#,
+    );
+
+    let report = scan_json(&fixture, &[]);
+    assert!(
+        report.contains("condition:no-unmatched-traffic"),
+        "{report}"
+    );
+    assert!(report.contains("not evaluated by this build"), "{report}");
+}
+
+/// Runs the binary over a fixture with every source it has, and returns the JSON.
+fn scan_json(fixture: &Fixture, extra: &[&str]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_periskop"))
+        .arg("scan")
+        .arg(fixture.project())
+        .arg("--rules")
+        .arg(repo_root().join("rules"))
+        .arg("--events")
+        .arg(fixture.events())
+        .arg("--flows")
+        .arg(fixture.flows())
+        .arg("--json")
+        .args(extra)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}

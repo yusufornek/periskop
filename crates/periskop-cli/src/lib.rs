@@ -12,6 +12,8 @@
 
 pub mod clock;
 pub mod hook;
+pub mod policy;
 pub mod render;
 pub mod rpc;
 pub mod scan;
+pub mod sensor;

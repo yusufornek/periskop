@@ -33,8 +33,8 @@ use periskop_report::coverage::{
     CoverageLanguage, CoverageStatement, RuntimeCoverage, RuntimeStatus, UnparsedFile,
 };
 use periskop_report::report::{
-    Diagnostic, DiagnosticCode, DiagnosticComponent, Envelope, PolicyRef, ReportBuilder, RuleHit,
-    ScanInputs, ScanReport, Verdict,
+    Diagnostic, DiagnosticCode, DiagnosticComponent, Envelope, ReportBuilder, RuleHit, ScanInputs,
+    ScanReport, Verdict,
 };
 use periskop_static_scanner::discovery::{discover, read_source, DiscoveryOptions};
 use periskop_static_scanner::engine::detect;
@@ -42,6 +42,8 @@ use periskop_static_scanner::language::Language;
 use periskop_static_scanner::parser::parse_as;
 use periskop_static_scanner::rules::compiler::compile_partial;
 use periskop_static_scanner::rules::{load_directory, CompiledRules, RuleFile};
+
+use crate::policy::ScanPolicy;
 
 pub use reconcile::ScanSources;
 
@@ -99,12 +101,18 @@ pub fn run_with_events(request: ScanRequest<'_>, event_dir: Option<&Path>) -> Sc
 /// The entry point the command line uses. The three narrower ones above remain
 /// because they are what several callers already state, and widening their
 /// signatures would make each of them name a source it has no opinion about.
+///
+/// The third argument is the policy this run was decided under, and
+/// [`ReconcileSettings`] converts into one, so a caller that has thresholds and
+/// no document keeps the shorter call. The command line hands over a real
+/// [`ScanPolicy`], which carries the document's identity into the report and the
+/// refusal into the verdict when the file could not be applied.
 pub fn run_with_sources(
     request: ScanRequest<'_>,
     sources: ScanSources<'_>,
-    settings: ReconcileSettings,
+    policy: impl Into<ScanPolicy>,
 ) -> ScanOutcome {
-    scan(request, sources, settings)
+    scan(request, sources, policy.into())
 }
 
 /// The same run, with the reconciliation thresholds stated by the caller.
@@ -120,10 +128,11 @@ pub fn run_with_sources(
 /// Kept as a separate entry point rather than a field on [`ScanRequest`], for
 /// the reason [`run`] gives: the request is built by several callers and a new
 /// required field would make every one of them state a threshold it has no
-/// opinion about. The command line does not expose it yet, which is a gap filed
-/// against the CLI owner in `hub/memory/interfaces.md` rather than worked around
-/// with an environment variable: a knob that changes which findings exist and
-/// leaves no trace in the report is worse than no knob.
+/// opinion about. The command line states these thresholds through
+/// `periskop-policy.toml` rather than through a flag, which is where the policy
+/// contract puts them: a knob that changes which findings exist and leaves no
+/// trace in the report is worse than no knob, and the policy travels into
+/// `policy_ref` where a reader can see which thresholds decided the run.
 pub fn run_with_events_and_settings(
     request: ScanRequest<'_>,
     event_dir: Option<&Path>,
@@ -135,16 +144,13 @@ pub fn run_with_events_and_settings(
             event_dir,
             flow_dir: None,
         },
-        settings,
+        settings.into(),
     )
 }
 
 /// The walk itself, with whatever observation sources the caller stated.
-fn scan(
-    request: ScanRequest<'_>,
-    sources: ScanSources<'_>,
-    settings: ReconcileSettings,
-) -> ScanOutcome {
+fn scan(request: ScanRequest<'_>, sources: ScanSources<'_>, policy: ScanPolicy) -> ScanOutcome {
+    let settings = policy.settings().clone();
     let (rules, load_errors) = load_directory(request.rules_root);
     let mut rule_errors: Vec<String> = load_errors.iter().map(|e| e.to_string()).collect();
 
@@ -321,18 +327,29 @@ fn scan(
         ));
     }
 
+    // What the policy file had to say about itself: a document this build
+    // refused, or rules it read and does not evaluate. Both are claims about the
+    // run rather than about the code, so they travel as diagnostics, and the
+    // refusal also travels as a failing hit below.
+    for diagnostic in policy.diagnostics() {
+        builder.add_diagnostic(diagnostic);
+    }
+
+    // Two gates, one list. A broken rule set and an unapplied policy both stop a
+    // run from reporting a pass, and neither may hide the other: a report that
+    // named only the first would send somebody to fix the rules while the policy
+    // they wrote was still being ignored.
+    let mut rule_hits = rule_set_hits(&rule_errors);
+    rule_hits.extend(policy.rule_hits());
+    rule_hits.sort_by(|a, b| a.rule_id.cmp(&b.rule_id));
+
     let report = builder.build(
         Envelope {
             generated_at: request.generated_at,
             tool_version: request.tool_version.to_owned(),
             host: None,
         },
-        PolicyRef {
-            policy_id: "default".to_owned(),
-            policy_version: "1.0.0".to_owned(),
-            policy_hash: blake3::hash(b"default/1.0.0").to_hex().to_string(),
-            rule_hits: rule_set_hits(&rule_errors),
-        },
+        policy.policy_ref(rule_hits),
         coverage,
     );
 

@@ -63,7 +63,7 @@ test("a scan crosses the boundary intact", { skip: !available }, async () => {
       summary: {
         confirmed: number;
         suspected: number;
-        providers: { confirmed: string[]; suspect: string[] };
+        by_provider: Record<string, { confirmed: number; suspect: number }>;
         reconciliation_mode: string;
         unmatched_wire_traffic: number | null;
       };
@@ -79,7 +79,31 @@ test("a scan crosses the boundary intact", { skip: !available }, async () => {
     assert.equal(result.verdict, "WARN");
     assert.ok(result.summary.confirmed >= 4, `expected findings, got ${result.summary.confirmed}`);
     assert.ok(result.summary.suspected >= 1, "the suspected list should not be empty here");
-    assert.ok(result.summary.providers.confirmed.includes("openai"));
+    // Counted from real findings rather than a recorded report, which is what
+    // proves the engine sends a provider on every one of them: a finding whose
+    // provider_ref went missing over the wire would land under another key here
+    // and this count would fall short of the list total.
+    const openai = result.summary.by_provider["openai"];
+    assert.ok(openai, "the fixtures call openai and the breakdown does not name it");
+    assert.ok(openai.confirmed > 0, `expected confirmed openai findings, got ${openai.confirmed}`);
+    const counted = Object.values(result.summary.by_provider).reduce(
+      (total, entry) => total + entry.confirmed + entry.suspect,
+      0,
+    );
+    assert.equal(counted, result.summary.confirmed + result.summary.suspected);
+
+    // The regression this field was rebuilt around, checked against the engine
+    // rather than a recorded report. The fixture set has a call matched only by
+    // the text of its URL, which the engine reports as suspected under a provider
+    // no confirmed finding names, so a breakdown answered from the confirmed list
+    // alone would drop that name entirely.
+    const suspectOnly = Object.entries(result.summary.by_provider).filter(
+      ([, entry]) => entry.confirmed === 0 && entry.suspect > 0,
+    );
+    assert.ok(
+      suspectOnly.length > 0,
+      "the engine reported a provider only suspected findings name, and it is not in the breakdown",
+    );
     assert.ok(result.coverage.files_read > 0);
 
     // This run has one source, and the answer has to say so. A reader weighing
@@ -125,7 +149,10 @@ test("the findings the engine only suspects can be paged too", { skip: !availabl
     assert.equal(confirmed.page.other.confidence, "suspect");
     assert.equal(confirmed.page.other.total, confirmed.summary.suspected);
 
-    const suspected = (await runScan(engine, { path: fixtures, confidence: "suspect" })) as {
+    const suspected = (await runScan(engine, {
+      path: fixtures,
+      filter: { confidence: "suspect" },
+    })) as {
       findings: Array<{ finding_id: string; confidence: string }>;
       page: { confidence: string; total: number };
     };
@@ -168,16 +195,19 @@ test("coverage states what was not running", { skip: !available }, async () => {
   }
 });
 
-test("the four flow buckets cross the boundary as numbers", { skip: !available }, async () => {
+test("the flow buckets and their denominator cross the boundary as numbers", { skip: !available }, async () => {
   // The half a recorded report cannot check: whether the engine actually sends
   // these fields. A null here would mean the wire dropped them, and the server
-  // would be counting nothing while looking like it counted zero.
+  // would be counting nothing while looking like it counted zero. in_scope_flows
+  // is the newest of the five, so it is also where a report schema that moved
+  // ahead of this side would show up first.
   const engine = bridge();
   try {
     const coverage = (await getCoverage(engine, { path: fixtures })) as {
       flow_buckets: Record<string, number | null>;
     };
     assert.deepEqual(coverage.flow_buckets, {
+      in_scope_flows: 0,
       out_of_scope_flows: 0,
       known_benign_flows: 0,
       unattributed_flows: 0,

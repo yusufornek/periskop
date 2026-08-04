@@ -12,6 +12,34 @@
 //! connection more or less completely depending on when the sensor started
 //! watching; letting them move the identity would turn one connection into two
 //! records and inflate a count that reconciliation reads as evidence.
+//!
+//! # The ephemeral source port, and why it is still in here
+//!
+//! `five_tuple.src_port` is part of the hash, and it is the one input that does
+//! not describe the connection so much as the moment it was opened. The kernel
+//! hands out an ephemeral port from a rotating range, so the same application
+//! talking to the same provider gets a different one every run. The consequence
+//! is concrete and costs the product something real: an `unmatched_wire_traffic`
+//! finding cannot be followed across two runs. A reader who triages the finding
+//! on Monday and re-runs the scan on Tuesday sees a new `flow_id` for the same
+//! conversation and has no way to say it is the same one, so the finding cannot
+//! be suppressed, tracked, or shown to have been fixed. This is asserted below
+//! in `an_ephemeral_source_port_gives_one_conversation_a_new_identity_each_run`
+//! rather than only described, so the cost stays measured.
+//!
+//! It stays in because the derivation is not this crate's to change. The formula
+//! is fixed by `docs/04-contracts/flow-schema.md` and `data-model.md` §2, both
+//! contract documents, and a sensor that hashed a different field list would
+//! write records the rest of the system reads under a formula nobody agreed to.
+//! Two runs of *this* build would still agree with each other, which is exactly
+//! how a silent divergence hides. The alternative is not free either: without
+//! the port, two connections opened to one destination inside one bucket collapse
+//! into a single identity, and the volume of one would be attributed to both. So
+//! the choice is between tracking across runs and separating concurrent
+//! connections, which is a contract decision with a real trade in it.
+//!
+//! The request is filed in `hub/memory/interfaces.md` against the owner of the
+//! two contract documents. Until it is answered this build follows the contract.
 
 use periskop_core::ids::{short_hash, FlowId};
 
@@ -116,6 +144,39 @@ mod tests {
         assert_ne!(baseline, id("h_1", Some("b_2"), &base, 10));
         assert_ne!(baseline, id("h_1", None, &base, 10));
         assert_ne!(baseline, id("h_1", Some("b_1"), &base, 11));
+    }
+
+    #[test]
+    fn an_ephemeral_source_port_gives_one_conversation_a_new_identity_each_run() {
+        // Critic round O3, measured rather than described. One application, one
+        // provider, one machine, two runs: the kernel hands out a different
+        // ephemeral port each time and the identity moves with it, so a wire
+        // finding raised on Monday cannot be recognised on Tuesday. It cannot be
+        // suppressed, tracked, or shown to have been fixed.
+        //
+        // The assertion is `ne` because that is what this build does and what
+        // the contract says it must do. It is written as a named cost rather
+        // than folded into `every_part_of_the_connection_key_moves_the_identity`
+        // so that the day the contract changes, this test fails and says which
+        // property was traded away, instead of a line quietly disappearing from
+        // a loop over four fields.
+        let monday = FiveTuple {
+            src_port: 54_321,
+            ..five_tuple()
+        };
+        let tuesday = FiveTuple {
+            src_port: 41_007,
+            ..five_tuple()
+        };
+        assert_eq!(monday.dst_ip, tuesday.dst_ip);
+        assert_eq!(monday.dst_port, tuesday.dst_port);
+        assert_ne!(
+            id("h_1", Some("b_1"), &monday, 1_785_834_000),
+            id("h_1", Some("b_1"), &tuesday, 1_785_834_000),
+            "the same conversation kept its identity across an ephemeral port change, \
+             so the contract's derivation has changed and the trade in the module \
+             documentation needs revisiting"
+        );
     }
 
     #[test]

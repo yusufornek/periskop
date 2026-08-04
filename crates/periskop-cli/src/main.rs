@@ -11,7 +11,7 @@ use clap::{Args, Parser, Subcommand};
 
 use periskop_cli::clock::now_rfc3339;
 use periskop_cli::hook::{self, Ambient, HookError, HookRequest, Language};
-use periskop_cli::{render, rpc, scan};
+use periskop_cli::{policy, render, rpc, scan, sensor};
 
 // The two halves of report signing. Modules of the binary rather than of the
 // library, because they are command surfaces: argument parsing, file paths and
@@ -81,10 +81,29 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         flows: Option<PathBuf>,
 
+        /// Policy file to decide this run under.
+        ///
+        /// Defaults to `periskop-policy.toml` in the scanned project's root, and
+        /// a project with no such file runs on the engine's own thresholds. The
+        /// one threshold that has no engine default is the volume band: without
+        /// a policy declaring it, `volume_anomaly` is reported as suppressed
+        /// rather than derived against an invented number.
+        #[arg(long, value_name = "FILE")]
+        policy: Option<PathBuf>,
+
         /// Fail when the share of unreadable files exceeds this many basis points.
         #[arg(long, value_name = "BASIS_POINTS")]
         max_unparsed_ratio: Option<u64>,
     },
+
+    /// Watch this machine's outbound connections and write what left it.
+    ///
+    /// The third source, and the only one that can see a connection no code and
+    /// no hooked call explains. Writes records `periskop scan --flows` reads.
+    /// Needs `CAP_BPF` and `CAP_PERFMON` on a Linux host with BTF; on any other
+    /// machine it writes an empty record set, says why, and exits non zero
+    /// rather than failing or pretending the machine was quiet.
+    Sensor(SensorArgs),
 
     /// Serve the engine over JSON-RPC on stdin and stdout.
     ///
@@ -125,6 +144,31 @@ enum Command {
         #[command(subcommand)]
         command: KeyCommand,
     },
+}
+
+#[derive(Args)]
+struct SensorArgs {
+    /// Directory the flow records are written into.
+    #[arg(long, value_name = "DIR")]
+    out: PathBuf,
+
+    /// Executable path or process name belonging to the codebase under scan.
+    ///
+    /// Repeatable. Without at least one, nothing can be attributed to the
+    /// project, every attributed flow lands in `out_of_scope_process`, and no
+    /// unmatched traffic finding can be derived from the pass. That is a
+    /// legitimate way to run the sensor and the status says what it costs, so it
+    /// is not made a required flag.
+    #[arg(long = "scope-process", value_name = "EXE_OR_COMM")]
+    scope_processes: Vec<String>,
+
+    /// Destination host the operator declares benign. Repeatable, exact match.
+    #[arg(long = "benign-host", value_name = "HOST")]
+    benign_hosts: Vec<String>,
+
+    /// Machine identity to stamp records with. Hashed before it is written.
+    #[arg(long, value_name = "ID")]
+    host_id: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -183,6 +227,7 @@ fn main() -> ExitCode {
             rules,
             events,
             flows,
+            policy,
             max_unparsed_ratio,
         } => run_scan(ScanArgs {
             path,
@@ -190,8 +235,10 @@ fn main() -> ExitCode {
             rules,
             events,
             flows,
+            policy,
             max_unparsed_ratio,
         }),
+        Command::Sensor(args) => run_sensor(&args),
         Command::ServeRpc { rules } => run_serve_rpc(rules),
         Command::Hook {
             command: HookCommand::Install(args),
@@ -292,7 +339,49 @@ struct ScanArgs {
     rules: Option<PathBuf>,
     events: Option<PathBuf>,
     flows: Option<PathBuf>,
+    policy: Option<PathBuf>,
     max_unparsed_ratio: Option<u64>,
+}
+
+/// Runs one observation pass and prints what it could and could not do.
+///
+/// Three exit codes and no fourth. Zero says the machine was watched, whatever
+/// it turned out to be doing. `INSUFFICIENT_COVERAGE` says nothing was watched,
+/// which is the honest reading of a sensor that could not start: the pass ran,
+/// and it saw too little to stand behind any statement about this machine's
+/// traffic. `ERROR` is reserved for the disk, because a directory that cannot be
+/// written is the caller's problem rather than the sensor's answer.
+fn run_sensor(args: &SensorArgs) -> ExitCode {
+    let run = match sensor::run(&sensor::SensorRequest {
+        out_dir: &args.out,
+        host_id: args.host_id.as_deref(),
+        codebase_processes: &args.scope_processes,
+        benign_hosts: &args.benign_hosts,
+    }) {
+        Ok(run) => run,
+        Err(e) => {
+            eprintln!("periskop: {e}");
+            return ExitCode::from(exit::ERROR);
+        }
+    };
+
+    match serde_json::to_string_pretty(&run.status) {
+        Ok(status) => println!("{status}"),
+        Err(e) => {
+            // The status is the whole product of this command. A pass whose
+            // account of itself cannot be printed has told the caller nothing,
+            // and exiting zero on that would be worse than the write failing.
+            eprintln!("periskop: the sensor status could not be serialized: {e}");
+            return ExitCode::from(exit::ERROR);
+        }
+    }
+    eprintln!("periskop: wrote {}", run.record_file.display());
+
+    if run.status.observed() {
+        ExitCode::from(exit::PASS)
+    } else {
+        ExitCode::from(exit::INSUFFICIENT_COVERAGE)
+    }
 }
 
 fn run_scan(args: ScanArgs) -> ExitCode {
@@ -302,6 +391,7 @@ fn run_scan(args: ScanArgs) -> ExitCode {
         rules,
         events,
         flows,
+        policy,
         max_unparsed_ratio,
     } = args;
 
@@ -349,6 +439,29 @@ fn run_scan(args: ScanArgs) -> ExitCode {
         }
     };
 
+    // A policy named on the command line and not there stops the run, for the
+    // reason the two directories above do: silently falling back to the engine's
+    // defaults would hand back a report decided under rules nobody wrote, and the
+    // one threshold that has no default would go on being undeclared while the
+    // user believed they had declared it. A policy file that is simply absent
+    // from the project is the ordinary case and stops nothing.
+    let policy_path = match policy::resolve(policy, &path) {
+        Ok(found) => found,
+        Err(given) => {
+            eprintln!(
+                "periskop: no policy file at {}. Drop --policy to run on the engine's thresholds.",
+                given.display()
+            );
+            return ExitCode::from(exit::ERROR);
+        }
+    };
+    // A file that is there and cannot be used is not resolved here: it becomes a
+    // POLICY_LOAD_ERROR diagnostic and a failing rule hit inside the report, so
+    // the refusal survives in the artefact rather than only on this terminal.
+    let scan_policy = policy_path
+        .as_deref()
+        .map_or_else(periskop_cli::policy::ScanPolicy::default, policy::load);
+
     // The clock is read before anything else runs. A report whose envelope
     // carries an invented timestamp is not auditable, and the previous behaviour
     // was to fall back to the epoch, which prints as a real date and reads as
@@ -372,13 +485,12 @@ fn run_scan(args: ScanArgs) -> ExitCode {
             event_dir: event_dir.as_deref(),
             flow_dir: flow_dir.as_deref(),
         },
-        // The reconciliation thresholds are not on the command line yet, so this
-        // run uses the declared defaults and derives no volume anomaly: that
-        // kind needs a band a policy states, and the report names the missing
-        // threshold rather than inventing one. Exposing it belongs to the policy
-        // surface rather than to a flag, and the request is filed in
-        // `hub/memory/interfaces.md`.
-        periskop_reconcile::ReconcileSettings::default(),
+        // The reconciliation thresholds come from the policy document, which is
+        // where the contract puts them. They are deliberately not flags: a knob
+        // that changes which findings exist and leaves no trace in the report is
+        // worse than no knob, and the policy is carried into `policy_ref` where
+        // an auditor can read which thresholds decided this run.
+        scan_policy,
     );
 
     for error in &outcome.rule_errors {

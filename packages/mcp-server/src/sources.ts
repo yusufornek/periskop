@@ -73,8 +73,22 @@ export function networkSensor(coverage: Coverage): string {
   return UNKNOWN;
 }
 
-/** The four counters that hold flows producing no finding. */
+/**
+ * The four counters that hold flows producing no finding, and the count they are
+ * read against.
+ *
+ * `in_scope_flows` is not a fifth silent bucket. It holds the flows attributed to
+ * the code under scan, which are the only ones derived findings come from, and it
+ * is here because the others are unreadable without it.
+ *
+ * It is the denominator of three of them, not four. `flow_scope` partitions every
+ * flow into in_scope, out_of_scope_process, known_benign and undetermined, so
+ * those three plus this one account for everything the sensor saw.
+ * `unclassified_flows` is counted on the separate `classification` axis and
+ * overlaps them, so adding it to the other three would double count.
+ */
 export interface FlowBuckets {
+  in_scope_flows: number | null;
   out_of_scope_flows: number | null;
   known_benign_flows: number | null;
   unattributed_flows: number | null;
@@ -82,20 +96,26 @@ export interface FlowBuckets {
 }
 
 /**
- * What the wire source counted and did not report as findings.
+ * What the wire source counted and did not report as findings, over what it saw.
  *
- * Three of these four hold traffic that was deliberately left out of the finding
+ * Three of the four hold traffic that was deliberately left out of the finding
  * count, and the fourth holds traffic nothing could classify. A bucket that
  * keeps flows out of the count and then does not appear in the answer is a
  * silent drop (K-15), so they are returned whether or not they are zero.
  *
+ * The denominator travels with them because a bucket count alone states nothing:
+ * 412 flows out of scope is a rounding error against 40000 and most of the
+ * traffic against 450, and the same number reads as either until the reader is
+ * told which. Withheld, it leaves the caller to guess the scale of a claim.
+ *
  * Null rather than zero for a field the report omits, for the same reason the
  * sensor has three states. What these numbers mean also depends on the sensor
- * state beside them: four zeros under a sensor that was not running are the
+ * state beside them: five zeros under a sensor that was not running are the
  * arithmetic of a run that never looked, not a quiet machine.
  */
 export function flowBuckets(coverage: Coverage): FlowBuckets {
   return {
+    in_scope_flows: coverage.in_scope_flows ?? null,
     out_of_scope_flows: coverage.out_of_scope_flows ?? null,
     known_benign_flows: coverage.known_benign_flows ?? null,
     unattributed_flows: coverage.unattributed_flows ?? null,

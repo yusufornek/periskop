@@ -15,6 +15,7 @@ import {
   getCoverage,
   getDetail,
   runScan,
+  scanInput,
   type Coverage,
   type Finding,
   type ScanReport,
@@ -32,7 +33,7 @@ type ScanAnswer = {
     confirmed: number;
     suspected: number;
     unmatched_wire_traffic: number | null;
-    providers: { confirmed: string[]; suspect: string[] };
+    by_provider: Record<string, { confirmed: number; suspect: number }>;
   };
   findings: Array<{ finding_id: string; confidence: string }>;
   page: {
@@ -41,7 +42,7 @@ type ScanAnswer = {
     limit: number;
     next_cursor: number | null;
     total: number;
-    other: { confidence: string; total: number; fetch_with: { confidence: string } };
+    other: { confidence: string; total: number; fetch_with: { filter: { confidence: string } } };
   };
 };
 
@@ -53,6 +54,7 @@ function fullCoverage(overrides: Partial<Coverage> = {}): Coverage {
     undetected_libraries: [],
     runtime_coverage: [{ language: "python", status: "instrumented" }],
     reconciliation_mode: "full",
+    in_scope_flows: 30,
     out_of_scope_flows: 9,
     known_benign_flows: 4,
     unattributed_flows: 2,
@@ -184,9 +186,16 @@ test("the summary stays a summary", async () => {
   assert.equal(typeof result.summary["unmatched_wire_traffic"], "number");
   assert.equal(typeof result.summary["reconciliation_mode"], "string");
   assert.ok(!Array.isArray(result.summary["unmatched_wire_traffic"]));
+  // Counts per provider, never the findings themselves. A hundred call sites to
+  // one provider must cost the caller one entry, not a hundred rows.
+  const providers = result.summary["by_provider"] as Record<string, unknown>;
+  assert.ok(!Array.isArray(providers));
+  for (const counts of Object.values(providers)) {
+    assert.deepEqual(Object.keys(counts as object).sort(), ["confirmed", "suspect"]);
+  }
 });
 
-test("coverage shows the four buckets that produce no finding", async () => {
+test("coverage shows the four buckets that produce no finding, over what was seen", async () => {
   const result = (await getCoverage(source(fullCoverage(), []), { path: "." })) as {
     flow_buckets: Record<string, number | null>;
     network_sensor: string;
@@ -194,6 +203,7 @@ test("coverage shows the four buckets that produce no finding", async () => {
   };
 
   assert.deepEqual(result.flow_buckets, {
+    in_scope_flows: 30,
     out_of_scope_flows: 9,
     known_benign_flows: 4,
     unattributed_flows: 2,
@@ -203,15 +213,30 @@ test("coverage shows the four buckets that produce no finding", async () => {
   assert.equal(result.reconciliation_mode, "full");
 });
 
+test("a bucket count is never returned without the count it is read against", async () => {
+  // The failure this guards: nine flows out of scope says nothing on its own.
+  // Against thirty in scope it is a quarter of the traffic, against forty
+  // thousand it is noise, and a reader given only the numerator cannot tell
+  // which claim was made.
+  const result = (await getCoverage(source(fullCoverage(), []), { path: "." })) as {
+    flow_buckets: Record<string, number | null>;
+  };
+
+  assert.ok("in_scope_flows" in result.flow_buckets);
+  assert.equal(result.flow_buckets["in_scope_flows"], 30);
+});
+
 test("coverage buckets are null, not zero, when the report never counted them", async () => {
-  // Four zeros beside an unknown sensor would read as a machine that stayed
-  // quiet. Nothing here watched it.
+  // Five zeros beside an unknown sensor would read as a machine that stayed
+  // quiet. Nothing here watched it. The denominator follows the same rule: a
+  // zero there would claim the sensor saw no traffic at all.
   const result = (await getCoverage(source(olderCoverage(), []), { path: "." })) as {
     flow_buckets: Record<string, number | null>;
     network_sensor: string;
   };
 
   assert.deepEqual(result.flow_buckets, {
+    in_scope_flows: null,
     out_of_scope_flows: null,
     known_benign_flows: null,
     unattributed_flows: null,
@@ -223,6 +248,7 @@ test("coverage buckets are null, not zero, when the report never counted them", 
 test("a run with hooks but no sensor says the sensor was not running", async () => {
   const runtimeOnly = fullCoverage({
     reconciliation_mode: "static_plus_runtime",
+    in_scope_flows: 0,
     out_of_scope_flows: 0,
     known_benign_flows: 0,
     unattributed_flows: 0,
@@ -260,7 +286,10 @@ test("findings the engine only suspects can be read, not only counted", async ()
   // The counted findings are somewhere, and the answer says where.
   assert.equal(first.page.other.total, 3);
 
-  const page = (await runScan(reports, { path: ".", confidence: "suspect" })) as ScanAnswer;
+  const page = (await runScan(reports, {
+    path: ".",
+    filter: { confidence: "suspect" },
+  })) as ScanAnswer;
   assert.deepEqual(
     page.findings.map((f) => f.finding_id),
     ["fnd_0000000000000101", "fnd_0000000000000102", "fnd_0000000000000103"],
@@ -286,14 +315,20 @@ test("the two lists never share a page", async () => {
     [suspected("fnd_0000000000000203")],
   );
 
-  const confirmed = (await runScan(reports, { path: ".", confidence: "confirmed" })) as ScanAnswer;
+  const confirmed = (await runScan(reports, {
+    path: ".",
+    filter: { confidence: "confirmed" },
+  })) as ScanAnswer;
   assert.deepEqual(
     confirmed.findings.map((f) => f.finding_id),
     ["fnd_0000000000000201", "fnd_0000000000000202"],
   );
   assert.ok(confirmed.findings.every((f) => f.confidence === "confirmed"));
 
-  const suspect = (await runScan(reports, { path: ".", confidence: "suspect" })) as ScanAnswer;
+  const suspect = (await runScan(reports, {
+    path: ".",
+    filter: { confidence: "suspect" },
+  })) as ScanAnswer;
   assert.deepEqual(
     suspect.findings.map((f) => f.finding_id),
     ["fnd_0000000000000203"],
@@ -313,7 +348,10 @@ test("a page says which list it came from", async () => {
   const byDefault = (await runScan(reports, { path: "." })) as ScanAnswer;
   assert.equal(byDefault.page.confidence, "confirmed");
 
-  const suspect = (await runScan(reports, { path: ".", confidence: "suspect" })) as ScanAnswer;
+  const suspect = (await runScan(reports, {
+    path: ".",
+    filter: { confidence: "suspect" },
+  })) as ScanAnswer;
   assert.equal(suspect.page.confidence, "suspect");
 });
 
@@ -324,14 +362,18 @@ test("the suspected list is paged like the confirmed one", async () => {
     suspected("fnd_0000000000000403"),
   ]);
 
-  const first = (await runScan(reports, { path: ".", confidence: "suspect", limit: 1 })) as ScanAnswer;
+  const first = (await runScan(reports, {
+    path: ".",
+    filter: { confidence: "suspect" },
+    limit: 1,
+  })) as ScanAnswer;
   assert.equal(first.findings.length, 1);
   assert.equal(first.page.total, 3);
   assert.equal(first.page.next_cursor, 1);
 
   const last = (await runScan(reports, {
     path: ".",
-    confidence: "suspect",
+    filter: { confidence: "suspect" },
     limit: 1,
     cursor: 2,
   })) as ScanAnswer;
@@ -355,21 +397,49 @@ test("the answer names the argument that reaches the other list", async () => {
   assert.deepEqual(confirmed.page.other, {
     confidence: "suspect",
     total: 2,
-    fetch_with: { confidence: "suspect" },
+    fetch_with: { filter: { confidence: "suspect" } },
   });
 
-  const suspect = (await runScan(reports, { path: ".", confidence: "suspect" })) as ScanAnswer;
+  const suspect = (await runScan(reports, {
+    path: ".",
+    filter: { confidence: "suspect" },
+  })) as ScanAnswer;
   assert.deepEqual(suspect.page.other, {
     confidence: "confirmed",
     total: 1,
-    fetch_with: { confidence: "confirmed" },
+    fetch_with: { filter: { confidence: "confirmed" } },
   });
 });
 
+test("the named argument is one the tool actually accepts", async () => {
+  // What deepEqual above cannot check: that fetch_with names live arguments
+  // rather than a shape the input schema stopped accepting. Nesting the filter
+  // is exactly the kind of change that leaves the hint pointing at an argument
+  // the tool rejects, and a caller following it would land on the list it was
+  // already reading.
+  const reports = source(
+    fullCoverage(),
+    [declared("fnd_0000000000000801")],
+    [suspected("fnd_0000000000000802"), suspected("fnd_0000000000000803")],
+  );
+
+  const first = (await runScan(reports, { path: "." })) as ScanAnswer;
+  const followed = (await runScan(
+    reports,
+    scanInput.parse({ path: ".", ...first.page.other.fetch_with }),
+  )) as ScanAnswer;
+
+  assert.equal(followed.page.confidence, "suspect");
+  assert.deepEqual(
+    followed.findings.map((f) => f.finding_id),
+    ["fnd_0000000000000802", "fnd_0000000000000803"],
+  );
+});
+
 test("a provider seen only in suspected findings is not left out", async () => {
-  // The provider list answered from the confirmed findings alone, so a project
-  // whose only egress was suspected reported no providers at all, which reads
-  // as a project that talks to nobody.
+  // The provider breakdown was answered from the confirmed findings alone, so a
+  // project whose only egress was suspected reported no providers at all, which
+  // reads as a project that talks to nobody.
   const reports = source(
     fullCoverage(),
     [declared("fnd_0000000000000601")],
@@ -377,8 +447,44 @@ test("a provider seen only in suspected findings is not left out", async () => {
   );
 
   const result = (await runScan(reports, { path: "." })) as ScanAnswer;
-  assert.deepEqual(result.summary.providers.confirmed, ["openai"]);
-  assert.deepEqual(result.summary.providers.suspect, ["acme"]);
+  assert.deepEqual(result.summary.by_provider, {
+    acme: { confirmed: 0, suspect: 1 },
+    openai: { confirmed: 1, suspect: 0 },
+  });
+});
+
+test("the provider breakdown counts findings and does not pool the two lists", async () => {
+  // Two things at once, because the field has to answer both. A list of names
+  // could not say that openai carries three of the four findings, and a single
+  // pooled integer per provider could not say that one of those three is only
+  // suspected. Merging them inside the count would undo, in one number, the
+  // separation the two lists exist to keep.
+  const reports = source(
+    fullCoverage(),
+    [declared("fnd_0000000000000701"), declared("fnd_0000000000000702")],
+    [suspected("fnd_0000000000000703"), suspected("fnd_0000000000000704", "acme")],
+  );
+
+  const result = (await runScan(reports, { path: "." })) as ScanAnswer;
+  assert.deepEqual(result.summary.by_provider, {
+    acme: { confirmed: 0, suspect: 1 },
+    openai: { confirmed: 2, suspect: 1 },
+  });
+});
+
+test("the provider breakdown is ordered, so two runs of one report agree byte for byte", async () => {
+  // Determinism is a stated property of every answer here (CLAUDE.md). Map
+  // insertion order follows the findings, so an engine that emitted the same
+  // findings in another order would otherwise produce a different serialisation
+  // of the same facts and every diff of two reports would be noise.
+  const reports = source(
+    fullCoverage(),
+    [declared("fnd_0000000000000901")],
+    [suspected("fnd_0000000000000902", "zeta"), suspected("fnd_0000000000000903", "acme")],
+  );
+
+  const result = (await runScan(reports, { path: "." })) as ScanAnswer;
+  assert.deepEqual(Object.keys(result.summary.by_provider), ["acme", "openai", "zeta"]);
 });
 
 test("a page of suspected findings is still a page", async () => {
@@ -390,7 +496,7 @@ test("a page of suspected findings is still a page", async () => {
 
   const result = (await runScan(source(fullCoverage(), [], many), {
     path: ".",
-    confidence: "suspect",
+    filter: { confidence: "suspect" },
   })) as ScanAnswer;
 
   assert.equal(result.findings.length, 20);

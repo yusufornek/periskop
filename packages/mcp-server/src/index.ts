@@ -50,8 +50,10 @@ async function main(): Promise<void> {
         "strong as that; summary.unmatched_wire_traffic counts findings where data left the machine " +
         "and no code explains it, and is null when the findings do not state their kind. " +
         "Confirmed and suspected findings are two separate lists and are never merged: one call " +
-        "pages one of them, the confidence argument chooses which, and page.other says how many " +
-        "are in the other. On a project with no runtime hooks installed the unmatched wire " +
+        "pages one of them, filter.confidence chooses which, and page.other says how many " +
+        "are in the other. summary.by_provider counts findings per provider and keeps that " +
+        "same split, so a provider seen only in suspected findings is still named. " +
+        "On a project with no runtime hooks installed the unmatched wire " +
         "findings are suspected, so a caller that never asks for that list never sees them.",
       inputSchema: scanInput.shape,
     },
@@ -90,8 +92,9 @@ async function main(): Promise<void> {
         "layers were running. Answers whether a clean scan means clean or means unread. " +
         "network_sensor is one of running, not running or unknown, and the third means the " +
         "report did not say rather than that nothing was watching. flow_buckets counts the " +
-        "observed flows that produced no finding, and a count there is only readable next to " +
-        "the sensor state.",
+        "observed flows that produced no finding, next to in_scope_flows, the count they are " +
+        "read against; a bucket without that denominator states no proportion, and none of " +
+        "them is readable away from the sensor state.",
       inputSchema: coverageInput.shape,
     },
     async (args) => ({

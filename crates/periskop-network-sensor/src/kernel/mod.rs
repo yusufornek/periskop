@@ -21,7 +21,7 @@ pub mod loader;
 pub use attach::{plan, AttachPlan, Program};
 pub use event::{
     CloseEvent, ConnectEvent, KernelBatch, KernelEvent, KernelProcess, PayloadEvent, PayloadFacts,
-    VolumeEvent,
+    PollState, VolumeEvent,
 };
 pub use key::FlowKey;
 pub use loader::PlatformKernel;
@@ -42,5 +42,12 @@ pub trait KernelEvents {
     fn attach(&mut self, plan: &AttachPlan) -> Result<(), SensorUnavailable>;
 
     /// Reads whatever the ring buffer holds, along with what it lost.
+    ///
+    /// The batch states whether anything was attached when the read happened.
+    /// An implementation that has loaded nothing answers
+    /// [`PollState::NotAttached`], and it must: an empty batch from an
+    /// unattached kernel and an empty batch from a quiet machine are the two
+    /// facts this whole product exists to keep apart, and only the second is a
+    /// measurement.
     fn poll(&mut self) -> KernelBatch;
 }

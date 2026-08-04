@@ -112,6 +112,14 @@ impl<K: KernelEvents> FlowSource for EbpfFlowSource<K> {
 
     fn drain(&mut self) -> Vec<Observation> {
         let batch = self.kernel.poll();
+        // A read from a kernel with nothing attached is not a window in which
+        // the machine stayed quiet, so nothing is sealed from it. Feeding it to
+        // the assembler would age the DNS map and close observations on the
+        // strength of time that nobody was watching, and the empty list that
+        // came back would be indistinguishable from a silent network.
+        if !batch.observed() {
+            return Vec::new();
+        }
         self.assembler.record_dropped(batch.dropped);
         for event in batch.events {
             self.assembler.ingest(event);
@@ -214,7 +222,11 @@ impl KernelEvents for ScriptedKernel {
 
     fn poll(&mut self) -> kernel::KernelBatch {
         if self.batches.is_empty() {
-            return kernel::KernelBatch::default();
+            // A scripted kernel that has run out of script is an attached
+            // sensor watching a quiet machine, not an unattached one: the
+            // difference decides whether the drain that follows is a
+            // measurement.
+            return kernel::KernelBatch::quiet();
         }
         self.batches.remove(0)
     }
@@ -327,6 +339,7 @@ mod tests {
     fn what_the_transport_lost_survives_into_the_coverage() {
         let mut source = EbpfFlowSource::over(
             ScriptedKernel::yielding(KernelBatch {
+                state: kernel::PollState::Attached,
                 events: Vec::new(),
                 dropped: 42,
             }),
@@ -339,7 +352,28 @@ mod tests {
 
     #[test]
     fn a_source_starts_out_claiming_no_losses_it_has_not_measured() {
-        let source = EbpfFlowSource::over(ScriptedKernel::yielding(KernelBatch::default()), "h_1");
+        let source = EbpfFlowSource::over(ScriptedKernel::yielding(KernelBatch::quiet()), "h_1");
+        assert_eq!(source.coverage(), SourceCoverage::default());
+    }
+
+    #[test]
+    fn a_read_from_an_unattached_kernel_is_not_counted_as_a_quiet_window() {
+        // Critic round k3, at the consumer. A batch from a kernel with nothing
+        // attached carries losses that were never measured and a silence that
+        // was never observed. Taking it as a window would put a dropped count
+        // into the coverage statement of a run that read nothing, which is a
+        // measurement of a machine nobody watched.
+        let mut source = EbpfFlowSource::over(
+            ScriptedKernel::yielding(KernelBatch {
+                state: kernel::PollState::NotAttached,
+                events: connect_batch().events,
+                dropped: 42,
+            }),
+            "h_1",
+        );
+        source.attach(&grant()).unwrap();
+
+        assert!(source.drain().is_empty());
         assert_eq!(source.coverage(), SourceCoverage::default());
     }
 

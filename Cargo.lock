@@ -462,6 +462,8 @@ dependencies = [
  "periskop-static-scanner",
  "serde",
  "serde_json",
+ "thiserror",
+ "toml",
  "zeroize",
 ]
 

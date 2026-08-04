@@ -106,10 +106,11 @@ test("a pcap run with no stated platform still reports its sensor as running", (
   assert.equal(networkSensor(pcap), SENSOR_RUNNING);
 });
 
-test("the four buckets are null when the report omits them, not zero", () => {
+test("the buckets are null when the report omits them, not zero", () => {
   // Zero says the sensor counted nothing. Null says nobody counted. Only one of
   // them is true of a report that never carried the field.
   assert.deepEqual(flowBuckets(coverage()), {
+    in_scope_flows: null,
     out_of_scope_flows: null,
     known_benign_flows: null,
     unattributed_flows: null,
@@ -117,18 +118,34 @@ test("the four buckets are null when the report omits them, not zero", () => {
   });
 });
 
-test("the four buckets carry the numbers the report states, including zero", () => {
+test("the buckets carry the numbers the report states, including zero", () => {
   const counted = coverage({
+    in_scope_flows: 40,
     out_of_scope_flows: 12,
     known_benign_flows: 3,
     unattributed_flows: 0,
     unclassified_flows: 7,
   });
   assert.deepEqual(flowBuckets(counted), {
+    in_scope_flows: 40,
     out_of_scope_flows: 12,
     known_benign_flows: 3,
     unattributed_flows: 0,
     unclassified_flows: 7,
+  });
+});
+
+test("the denominator is reported even when the report only counted that", () => {
+  // A wire source that saw traffic and attributed all of it produces exactly
+  // this: a denominator and four empty buckets. Dropping it because the other
+  // four are zero would leave the caller unable to tell this run apart from one
+  // where the sensor saw nothing at all.
+  assert.deepEqual(flowBuckets(coverage({ in_scope_flows: 450 })), {
+    in_scope_flows: 450,
+    out_of_scope_flows: null,
+    known_benign_flows: null,
+    unattributed_flows: null,
+    unclassified_flows: null,
   });
 });
 

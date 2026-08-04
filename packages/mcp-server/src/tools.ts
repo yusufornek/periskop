@@ -77,6 +77,7 @@ export interface Coverage {
   // unknown in the answer. What each one means is in sources.ts, which is the
   // only reader.
   reconciliation_mode?: string;
+  in_scope_flows?: number;
   out_of_scope_flows?: number;
   known_benign_flows?: number;
   unattributed_flows?: number;
@@ -92,8 +93,15 @@ export interface ScanReport {
   coverage: Coverage;
 }
 
-export const scanInput = z.object({
-  path: z.string().describe("Project directory to scan."),
+/**
+ * Which findings this call is about.
+ *
+ * Nested rather than a flat argument, as `mcp-tools.md` §1 writes it. The
+ * contract names three filters on this tool and only one of them is built, so a
+ * flat argument would have to be renamed the day the second arrives; the object
+ * takes a new key instead of a new signature.
+ */
+const scanFilter = z.object({
   confidence: z
     .enum(CONFIDENCE_LEVELS)
     .optional()
@@ -102,6 +110,11 @@ export const scanInput = z.object({
         "The lists are never merged, and every answer says how many findings are in the one " +
         "it is not showing.",
     ),
+});
+
+export const scanInput = z.object({
+  path: z.string().describe("Project directory to scan."),
+  filter: scanFilter.optional().describe("Which findings to page. Defaults to the confirmed list."),
   limit: z
     .number()
     .int()
@@ -134,9 +147,45 @@ function condense(finding: Finding): Record<string, unknown> {
   };
 }
 
-/** Provider identifiers in a list, deduplicated and ordered so answers diff. */
-function providersOf(findings: readonly Finding[]): string[] {
-  return [...new Set(findings.map((f) => f.provider_ref))].sort();
+/** How many findings one provider accounts for, kept on the confidence axis. */
+interface ProviderCount {
+  confirmed: number;
+  suspect: number;
+}
+
+/**
+ * How many findings each provider accounts for.
+ *
+ * Counted over both lists, which is what keeps a provider that appears only in
+ * suspected findings in the answer at all. Answered from the confirmed list
+ * alone, such a provider vanished entirely and the project read as one that
+ * talks to nobody.
+ *
+ * The count per provider is split rather than pooled. A single number would
+ * merge what the engine proved with what it could not rule out, and those are
+ * the two states a reader has to act on differently; pooling them here would
+ * undo, inside one integer, the separation the two lists exist to keep.
+ *
+ * Keys are sorted by code unit so that two runs over the same report serialise
+ * byte for byte.
+ */
+function byProvider(
+  confirmed: readonly Finding[],
+  suspect: readonly Finding[],
+): Record<string, ProviderCount> {
+  const counts = new Map<string, ProviderCount>();
+
+  const tally = (findings: readonly Finding[], level: ConfidenceLevel): void => {
+    for (const finding of findings) {
+      const entry = counts.get(finding.provider_ref) ?? { confirmed: 0, suspect: 0 };
+      entry[level] += 1;
+      counts.set(finding.provider_ref, entry);
+    }
+  };
+  tally(confirmed, "confirmed");
+  tally(suspect, "suspect");
+
+  return Object.fromEntries([...counts].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
 }
 
 export async function runScan(
@@ -150,7 +199,7 @@ export async function runScan(
   // the summary counted flows nothing explained, the page was empty, the total
   // was zero and no cursor reached them. The product's central claim was a
   // number the caller could not open.
-  const shown: ConfidenceLevel = input.confidence ?? "confirmed";
+  const shown: ConfidenceLevel = input.filter?.confidence ?? "confirmed";
   const paged = shown === "confirmed" ? report.findings : report.suspect_findings;
   const other: ConfidenceLevel = shown === "confirmed" ? "suspect" : "confirmed";
   const otherList = shown === "confirmed" ? report.suspect_findings : report.findings;
@@ -175,15 +224,12 @@ export async function runScan(
       // a scan that only read code has said nothing about what left the machine,
       // and its silence has to be readable as silence.
       reconciliation_mode: reconciliationMode(report.coverage),
-      // Kept apart rather than pooled, and keyed by the confidence enum. Answered
-      // from the confirmed findings alone, this list omitted any provider that
-      // only ever appeared in a suspected finding, which reads as a project that
-      // talks to nobody. Pooling the two would have hidden the opposite thing:
-      // which of the names was proved.
-      providers: {
-        confirmed: providersOf(report.findings),
-        suspect: providersOf(report.suspect_findings),
-      },
+      // Counts per provider, the name and the question `mcp-tools.md` §1 gives
+      // this field. A list of names could not answer it: one call site to a
+      // provider and two hundred read identically, and weighing a scan starts
+      // with which name carries the traffic. The value stays split by confidence
+      // for the reason byProvider gives.
+      by_provider: byProvider(report.findings, report.suspect_findings),
     },
     // Coverage travels with the summary rather than waiting to be asked for.
     // A caller who sees only counts would reasonably read zero findings as
@@ -215,7 +261,11 @@ export async function runScan(
       // findings does not depend on the caller having read the tool
       // description, and paged rather than inlined so that neither list can
       // empty the caller's context in one response.
-      other: { confidence: other, total: otherList.length, fetch_with: { confidence: other } },
+      other: {
+        confidence: other,
+        total: otherList.length,
+        fetch_with: { filter: { confidence: other } },
+      },
     },
   };
 }

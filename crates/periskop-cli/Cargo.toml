@@ -33,6 +33,12 @@ periskop-runtime-collector = { workspace = true }
 periskop-static-scanner = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Reading `periskop-policy.toml`. Already a workspace dependency (the static
+# scanner reads its rule files with it), so this is a wiring line rather than a
+# dependency decision: K-25 requires an ADR for a new dependency, and this one
+# was decided when the rule loader took it.
+toml = { workspace = true }
 # Only the signing command touches it, and only for the buffer a private key
 # file is read into. The key type itself clears its own copy (ADR-015).
 zeroize = { workspace = true }

@@ -133,6 +133,33 @@ impl KernelEvent {
     }
 }
 
+/// Whether anything was attached when a read happened.
+///
+/// The distinction this product exists to make, applied to itself. An empty
+/// event list has two completely different meanings: no program is attached, so
+/// nothing *could* have been seen, or programs are attached and the machine sent
+/// nothing. A batch that could not tell them apart hands a caller a plausible
+/// looking empty result and lets a run report a network it never watched.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PollState {
+    /// Nothing is attached. This read establishes nothing about the machine.
+    ///
+    /// The default, because it is the honest state of a kernel object nobody has
+    /// loaded anything into, and a type whose default claimed attachment would
+    /// put the wrong answer one `..Default::default()` away.
+    #[default]
+    NotAttached,
+    /// Programs are attached and this is what they had for us.
+    Attached,
+}
+
+impl PollState {
+    /// Whether this read is evidence about the machine at all.
+    pub fn observed(self) -> bool {
+        matches!(self, Self::Attached)
+    }
+}
+
 /// One read of the ring buffer.
 ///
 /// `dropped` is not an error path. A fixed size buffer under load loses events,
@@ -141,13 +168,37 @@ impl KernelEvent {
 /// first hop.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KernelBatch {
+    /// Whether anything was attached when this read happened.
+    pub state: PollState,
     pub events: Vec<KernelEvent>,
     pub dropped: u64,
 }
 
 impl KernelBatch {
+    /// A read from attached programs that had these events.
     pub fn of(events: Vec<KernelEvent>) -> Self {
-        Self { events, dropped: 0 }
+        Self {
+            state: PollState::Attached,
+            events,
+            dropped: 0,
+        }
+    }
+
+    /// A read from attached programs that had nothing.
+    ///
+    /// Written out because it is the one an empty `KernelBatch::default()` used
+    /// to be mistaken for. A quiet machine is a measurement; an unattached
+    /// kernel is the absence of one.
+    pub fn quiet() -> Self {
+        Self {
+            state: PollState::Attached,
+            ..Self::default()
+        }
+    }
+
+    /// Whether this read establishes anything about the machine.
+    pub fn observed(&self) -> bool {
+        self.state.observed()
     }
 }
 
@@ -197,11 +248,31 @@ mod tests {
         // Under load the ring buffer overruns. A batch that could only carry
         // events would turn that into a quiet shortfall in the flow count.
         let batch = KernelBatch {
+            state: PollState::Attached,
             events: Vec::new(),
             dropped: 17,
         };
         assert_eq!(batch.dropped, 17);
         assert_eq!(KernelBatch::of(Vec::new()).dropped, 0);
+    }
+
+    #[test]
+    fn a_kernel_that_never_attached_is_not_a_kernel_that_saw_nothing() {
+        // Critic round k3. Both reads carry no events, and until the state
+        // existed they were the same value: a caller could not tell "nothing is
+        // attached, so nothing could have been seen" from "programs are attached
+        // and the machine was quiet". The first establishes nothing about the
+        // machine and the second is a measurement, and a report built on the
+        // wrong one claims a clean network it never watched.
+        let unattached = KernelBatch::default();
+        let quiet = KernelBatch::quiet();
+
+        assert!(unattached.events.is_empty() && quiet.events.is_empty());
+        assert_ne!(unattached, quiet);
+        assert!(!unattached.observed());
+        assert!(quiet.observed());
+        // A batch carrying events is a read from something that was attached.
+        assert!(KernelBatch::of(Vec::new()).observed());
     }
 
     #[test]
