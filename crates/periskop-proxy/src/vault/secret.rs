@@ -146,6 +146,31 @@ impl<P: KeyPurpose> ZeroizeOnDrop for Key<P> {}
 pub type MasterKey = Key<Master>;
 /// The per session key alias derivation will run under.
 pub type SessionKey = Key<SessionScope>;
+
+impl SessionKey {
+    /// The 32 bytes `alias::derive` runs its HMAC over.
+    ///
+    /// **The one key accessor that leaves this module, and the name says so.**
+    /// It closes the request F4-D left in `hub/memory/interfaces.md`: `alias`
+    /// needs `K_session` to derive an alias seed, `Key::as_bytes` is
+    /// `pub(in crate::vault)`, and without a bridge the request path would have
+    /// had to mint under a key that is not session scoped. Aliases would then be
+    /// linkable across conversations, which is the exact property ADR-007 spends a
+    /// per session HKDF expansion to remove.
+    ///
+    /// Option (a) of the two the request offered, for the reason it gave: the
+    /// alternative handed the vault a dependency on the alias module and reversed
+    /// the direction of the arrow between them. The precedent is
+    /// [`SecretValue::expose`], the caller is `alias::derive::alias_seed`, and the
+    /// name is deliberately uncomfortable so that a second caller has to justify
+    /// itself.
+    ///
+    /// The bytes are borrowed, never copied out into a buffer of the caller's
+    /// own: `AliasKey` wraps them in `Zeroizing` on the way in.
+    pub fn expose_for_alias_derivation(&self) -> &[u8; KEY_BYTES] {
+        self.as_bytes()
+    }
+}
 /// The key records are sealed under.
 pub type RecordKey = Key<RecordScope>;
 /// The key the vault file's integrity chain is computed under.

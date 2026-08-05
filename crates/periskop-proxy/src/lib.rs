@@ -21,7 +21,15 @@
 //! [`policy`] is what an operator writes down, loaded fail closed, because a
 //! rule that is silently dropped is a value the operator believes is masked.
 //!
-//! The request path follows. Nothing here reads an HTTP request yet.
+//! [`http`] is where all of it becomes a running component, and it is the first
+//! module in this crate that opens a socket. Everything below it was reachable
+//! only from this process; from there a port is listening, and the vault keys, the
+//! session to alias map and the unmasked request bodies are behind it. That is why
+//! the default bind address is loopback, why header redaction is enforced by a
+//! function rather than by review, and why every refusal in it is fail closed.
+//!
+//! Response streaming is not here: tasks 89 to 93 own the buffered state machine
+//! and alias restoration, and until they land a response body is forwarded whole.
 //!
 //! # Binary targets
 //!
@@ -39,5 +47,6 @@
 
 pub mod alias;
 pub mod detect;
+pub mod http;
 pub mod policy;
 pub mod vault;

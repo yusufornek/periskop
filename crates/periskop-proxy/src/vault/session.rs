@@ -349,6 +349,11 @@ impl SessionStore {
         &self.limits
     }
 
+    /// Takes the operator's configured limits (`proxy/spec.md` section 5).
+    pub(super) fn set_limits(&mut self, limits: SessionLimits) {
+        self.limits = limits;
+    }
+
     pub(super) fn len(&self) -> usize {
         self.sessions.len()
     }

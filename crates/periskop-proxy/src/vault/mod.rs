@@ -480,6 +480,31 @@ impl Vault {
         self.sessions.purge_expired(now_ms)
     }
 
+    /// Replaces the session limits on an open vault.
+    ///
+    /// `proxy/spec.md` section 5 says both numbers are configurable, and this is
+    /// where an operator's choice lands: [`Vault::open`] takes the defaults
+    /// because a vault has to be openable before anything has been configured.
+    /// Applied to an empty store only, which is the shape of a vault that has just
+    /// been opened; lowering the ceiling under a session that is already over it
+    /// would refuse a conversation that was legal when it started.
+    pub fn with_limits(mut self, limits: SessionLimits) -> Self {
+        self.sessions.set_limits(limits);
+        self
+    }
+
+    /// An in memory vault with limits a test chose, around a key that was not
+    /// derived.
+    ///
+    /// Test only, and crate visible so that the request path's tests can drive the
+    /// alias ceiling without spending Argon2id on every case. The production
+    /// entry point is [`Vault::open`], which is the only one that takes a
+    /// passphrase.
+    #[cfg(test)]
+    pub(crate) fn in_memory_with_limits(limits: SessionLimits) -> Result<Self, VaultError> {
+        Self::from_master_key(MasterKey::from_bytes([0x3c; 32]), limits)
+    }
+
     /// Exchanges two records' sealed bodies, as an attacker with write access to
     /// a vault file would. Test only; see [`session::Session::swap_sealed_bodies`].
     #[cfg(test)]

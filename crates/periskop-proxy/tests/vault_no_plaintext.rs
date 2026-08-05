@@ -14,9 +14,18 @@
 //! | the vault file | every byte of `vault.psk` after a full lifecycle |
 //! | temporary files | every other file the vault's directory ever holds, including a compaction candidate left behind by a process that was killed |
 //! | `TRACE` level output | every `Debug` and `Display` rendering of every vault type a caller can reach, plus every refusal message |
-//! | `/admin/*` responses | the body of `GET /admin/vault/status` |
+//! | `/admin/*` responses | the body of `GET /admin/vault/status`, and of `GET /admin/policy` and `GET /admin/metrics` |
 //! | the `ProxyEvent` record | the counters the vault contributes to it |
 //! | `stdout` and `stderr` | everything a real child process that opens, loads and compacts a vault wrote to either stream |
+//! | the HTTP response to the client | status, every header and the body of a real masked request |
+//! | the request record | the line the proxy leaves behind for one request |
+//!
+//! The last two rows arrived with task 85, in the same change that opened a port.
+//! Before it there was nothing outside this process to reach; after it there is a
+//! response travelling back over a socket and a per request record, and neither is
+//! covered by any row above. They also carry a second planted value the vault rows
+//! do not: the **caller's API key**, which `proxy/spec.md` section 2.3 says
+//! periskop never logs and which task 85 requires this byte sweep to cover.
 //!
 //! The last row was missing, and its absence was a hole in this gate rather than a
 //! narrower claim: a single `dbg!(plaintext)` added to `record::seal` writes every
@@ -217,6 +226,146 @@ fn f4_gate_no_planted_value_reaches_any_surface_outside_this_process() {
     );
 }
 
+/// The credential a client sends, planted so that the sweep covers it.
+///
+/// Assembled at run time for the reason `tests/no_credential_literals.rs` gives.
+fn planted_credential() -> String {
+    format!("sk-{}-{}", "proj", "5TnW8kJ2xQeR7bZmVhLdAcGu")
+}
+
+/// The surfaces task 85 added: a real masked request, and everything it leaves.
+///
+/// Drives one request through the gateway with every planted value in its body and
+/// the credential in its `Authorization` header, then returns the response, the
+/// request record and the three administrative bodies. The upstream request is
+/// **not** returned as a surface, because the credential belongs there by contract
+/// (`proxy/spec.md` section 2.3: unchanged to the provider); it is asserted here
+/// instead, as the positive control that keeps the searches below meaningful.
+fn http_surfaces() -> Result<Vec<(String, Vec<u8>)>, String> {
+    use std::sync::Arc;
+
+    use periskop_proxy::http::gateway::{Clock, Gateway, Incoming};
+    use periskop_proxy::http::headers::{HeaderList, SESSION_HEADER};
+    use periskop_proxy::http::upstream::{Recorder, Upstream};
+    use periskop_proxy::http::AllowList;
+    use periskop_proxy::policy::Policy;
+
+    let policy = Policy::load(
+        "policy_id = \"acme\"\npolicy_version = \"1\"\n[default]\nmode = \"mask\"\n",
+        Path::new("."),
+        None,
+    )
+    .map_err(|refusal| format!("{refusal}"))?;
+
+    // The reduced profile: this helper is about the HTTP surface, and spending
+    // 256 MiB again here would slow the gate without widening it. The shipped
+    // profile is exercised by the vault half of this same sweep.
+    let vault = open_vault(&Scratch::new("http").directory(), ProfileName::Ci)
+        .map_err(|refusal| format!("{refusal}"))?;
+
+    let upstream = Arc::new(Recorder::ok());
+    let gateway = Gateway::new(
+        policy,
+        vault,
+        Arc::clone(&upstream) as Arc<dyn Upstream>,
+        AllowList::shipped(),
+        Clock::Fixed(NOW),
+    )
+    .map_err(|refusal| refusal.detail().to_owned())?;
+
+    let prompt = PLANTED
+        .iter()
+        .map(|(kind, value)| format!("{kind}: {value}"))
+        .collect::<Vec<String>>()
+        .join("\n");
+    let request = Incoming {
+        method: "POST".to_owned(),
+        path: "/v1/chat/completions".to_owned(),
+        query: None,
+        headers: HeaderList::new()
+            .with("authorization", format!("Bearer {}", planted_credential()))
+            .with("x-api-key", planted_credential())
+            .with(SESSION_HEADER, "the-sweep-s-conversation"),
+        body: serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": prompt}]
+        })
+        .to_string()
+        .into_bytes(),
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|why| format!("no runtime: {why}"))?;
+
+    let response = runtime.block_on(async {
+        let response = gateway.handle(request).await;
+        let admin = |path: &'static str| {
+            gateway.handle(Incoming {
+                method: "GET".to_owned(),
+                path: path.to_owned(),
+                query: None,
+                headers: HeaderList::new(),
+                body: Vec::new(),
+            })
+        };
+        let policy_body = admin("/admin/policy").await;
+        let status_body = admin("/admin/vault/status").await;
+        let metrics_body = admin("/admin/metrics").await;
+        (response, policy_body, status_body, metrics_body)
+    });
+    let (response, policy_body, status_body, metrics_body) = response;
+
+    // The positive control. Without it, a gateway that refused every request would
+    // produce clean surfaces and this whole helper would prove nothing.
+    let calls = upstream.calls();
+    let call = calls
+        .first()
+        .ok_or_else(|| "the sweep's request never reached the provider".to_owned())?;
+    if call.headers.get("authorization")
+        != Some(format!("Bearer {}", planted_credential()).as_str())
+    {
+        return Err(
+            "the credential did not reach the provider unchanged, so the \
+                    searches below are searching for something that was never sent"
+                .to_owned(),
+        );
+    }
+
+    let render = |response: &periskop_proxy::http::gateway::Outgoing| -> Vec<u8> {
+        let headers: Vec<String> = response
+            .headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}"))
+            .collect();
+        format!(
+            "{}\n{}\n{}",
+            response.status,
+            headers.join("\n"),
+            String::from_utf8_lossy(&response.body)
+        )
+        .into_bytes()
+    };
+
+    Ok(vec![
+        ("http_response".to_owned(), render(&response)),
+        (
+            "http_request_record".to_owned(),
+            gateway
+                .log()
+                .iter()
+                .map(periskop_proxy::http::observe::RequestRecord::to_line)
+                .collect::<Vec<String>>()
+                .join("\n")
+                .into_bytes(),
+        ),
+        ("http_admin_policy".to_owned(), render(&policy_body)),
+        ("http_admin_vault_status".to_owned(), render(&status_body)),
+        ("http_admin_metrics".to_owned(), render(&metrics_body)),
+    ])
+}
+
 /// Runs a whole vault lifetime under one profile and collects every surface.
 fn sweep(profile: ProfileName) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let scratch = Scratch::new(profile.as_str());
@@ -267,6 +416,14 @@ fn sweep(profile: ProfileName) -> Result<BTreeMap<String, Vec<u8>>, String> {
         "admin_vault_status".to_owned(),
         vault.status().to_json().into_bytes(),
     );
+    // The HTTP surface, which did not exist when this sweep was written. Task 85
+    // opened a port and gave the process a request record; both are places a
+    // planted value or the caller's API key could reach, and neither is covered by
+    // any row above. The three surfaces are collected by driving a whole masked
+    // request through the gateway.
+    for (name, bytes) in http_surfaces()? {
+        surfaces.insert(name, bytes);
+    }
     surfaces.insert(
         "proxy_event_counters".to_owned(),
         format!("{:?}", vault.counters()).into_bytes(),
@@ -383,6 +540,27 @@ fn check(profile: ProfileName, surfaces: &BTreeMap<String, Vec<u8>>) {
         profile.as_str()
     );
 
+    // The four HTTP surfaces task 85 added. Controlled the same way as the rest:
+    // a response with no headers or an empty log would pass every search below
+    // without carrying anything.
+    for (name, marker) in [
+        ("http_response", &b"x-periskop-alias-scope"[..]),
+        ("http_request_record", b"alias_scope="),
+        ("http_admin_policy", b"masking_profile"),
+        ("http_admin_vault_status", b"vault_state"),
+        ("http_admin_metrics", b"periskop_proxy_requests_total"),
+    ] {
+        let surface = surfaces
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} is a surface"));
+        assert!(
+            contains(surface, marker),
+            "{} profile: the {name} surface is not what it claims to be, so searching \
+             it proves nothing",
+            profile.as_str()
+        );
+    }
+
     // The claim.
     for (kind, value) in PLANTED {
         for (name, bytes) in surfaces {
@@ -392,6 +570,19 @@ fn check(profile: ProfileName, surfaces: &BTreeMap<String, Vec<u8>>) {
                 profile.as_str()
             );
         }
+    }
+
+    // And the same claim for the caller's credential, which task 85 requires this
+    // sweep to cover. It is checked against every surface rather than only the new
+    // ones: a key that ended up in a vault record or in a `Debug` rendering would
+    // be exactly as leaked as one in a log line.
+    for (name, bytes) in surfaces {
+        assert!(
+            !contains(bytes, planted_credential().as_bytes()),
+            "{} profile: the caller's API key reached the {name} surface. \
+             `proxy/spec.md` section 2.3: periskop does not store, mint or log a key",
+            profile.as_str()
+        );
     }
 }
 

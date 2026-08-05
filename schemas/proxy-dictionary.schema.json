@@ -31,8 +31,8 @@
             "description": "The literal to match. Matching is word boundary aware and, for languages listed in affix_rules, affix aware."
           },
           "type": {
-            "enum": ["PERSON", "ORG", "LOC", "ADDRESS", "HOST", "API_KEY", "SECRET"],
-            "description": "Which alias generator claims this entry. Restricted to the types a word list can legitimately carry: the checksum bearing types (TCKN, IBAN, VKN, CREDIT_CARD) are detected by layer A, whose validation is self proving, and listing one of them here would move a decision that verifies itself onto a list that cannot."
+            "enum": ["PERSON", "ORG", "LOC", "ADDRESS", "HOST", "SECRET"],
+            "description": "Which alias generator claims this entry. Restricted to the types a word list can legitimately carry: the checksum bearing types (TCKN, IBAN, VKN, CREDIT_CARD) are detected by layer A, whose validation is self proving, and listing one of them here would move a decision that verifies itself onto a list that cannot. API_KEY was removed for a second reason, and the two should not be confused: ADR-011 section 1 assigns it to layer A and states that a type is not searched in two layers, so an entry naming it here would have been rejected by the loader while this schema went on promising it. SECRET and HOST stay, because the ADR does not claim them for A and no pattern decides them."
           }
         }
       }

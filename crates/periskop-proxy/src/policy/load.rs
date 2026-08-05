@@ -57,6 +57,19 @@ pub enum DatePolicy {
     Block,
 }
 
+impl DatePolicy {
+    /// The spelling `policy.toml` uses and `/admin/policy` returns.
+    ///
+    /// There is no `"shift"` arm, and its absence is what makes the read only
+    /// projection unable to claim a mode this build does not implement.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Block => "block",
+        }
+    }
+}
+
 /// `on_hold_timeout` (`proxy/spec.md` section 6.2 F2).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HoldTimeout {
@@ -83,6 +96,16 @@ pub enum ToolCallPolicy {
     #[default]
     PassThrough,
     Reject,
+}
+
+impl ToolCallPolicy {
+    /// The spelling `policy.toml` uses and `/admin/policy` returns.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PassThrough => "pass-through",
+            Self::Reject => "reject",
+        }
+    }
 }
 
 /// A loaded, validated policy.

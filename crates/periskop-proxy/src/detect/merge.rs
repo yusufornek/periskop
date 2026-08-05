@@ -81,6 +81,16 @@ pub enum DegradedReason {
     /// Inside a fenced code block only layer A ran (`code_block_policy =
     /// "pattern-only"`).
     CodeBlockSkipped,
+    /// Structured tool-call or tool-result arguments reached the provider
+    /// unmasked (`proxy-api.md`, "Tool-call argümanları": the default is to pass
+    /// and to declare, and this is one of the three places the declaration is
+    /// made).
+    ToolArgumentsUnmasked,
+    /// A whole endpoint with no masking passed through: the Responses and
+    /// Assistants surfaces (roadmap F4 phase boundary item 4). Field level and
+    /// endpoint level are counted apart on purpose, because they are two
+    /// different sizes of gap.
+    EndpointUnsupportedPassthrough,
 }
 
 impl DegradedReason {
@@ -90,8 +100,24 @@ impl DegradedReason {
             Self::NerDisabled => "ner_disabled",
             Self::DictionaryUnavailable => "dictionary_unavailable",
             Self::CodeBlockSkipped => "code_block_skipped",
+            Self::ToolArgumentsUnmasked => "tool_arguments_unmasked",
+            Self::EndpointUnsupportedPassthrough => "endpoint_unsupported_passthrough",
         }
     }
+
+    /// Every reason this build can declare.
+    ///
+    /// Shorter than the schema's list, which also holds the four NER and vault
+    /// restart reasons no code path in F4 reaches. Named so that the header
+    /// renderer can be tested against a closed set rather than against whichever
+    /// reasons a particular request happened to raise.
+    pub const ALL: [Self; 5] = [
+        Self::NerDisabled,
+        Self::DictionaryUnavailable,
+        Self::CodeBlockSkipped,
+        Self::ToolArgumentsUnmasked,
+        Self::EndpointUnsupportedPassthrough,
+    ];
 }
 
 /// The sentence ADR-011 section 2 requires to reach the user verbatim.

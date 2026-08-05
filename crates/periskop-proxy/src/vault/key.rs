@@ -568,18 +568,49 @@ mod tests {
         assert_eq!(ProfileName::default().as_str(), "default");
     }
 
+    /// The passphrase check runs before Argon2 does, proved by which refusal
+    /// arrives rather than by how long one takes.
+    ///
+    /// This used to assert that the refusal came back inside a wall clock budget,
+    /// and that assertion was wrong in a way that only showed under load: the
+    /// shipped profile wants 256 MiB, four of these run at once under
+    /// `--test-threads=4`, and on a busy machine a *correct* refusal can be
+    /// descheduled past any budget somebody picks. The failure it then reports is
+    /// "the ordering is broken", which is not what happened. Raising the budget
+    /// would only move the flake further away.
+    ///
+    /// The observable fact instead: a profile whose parameters **Argon2 itself
+    /// will not accept**. `derive_master_key` does three things in order, and the
+    /// second is `Params::new`. With a passphrase, this profile can only produce
+    /// `KeyDerivationFailed`; that is the control, and it is what makes the second
+    /// assertion mean something. With no passphrase it produces
+    /// `PassphraseMissing`, and the only way to get that answer out of parameters
+    /// that cannot even be built is for the passphrase check to have run first.
+    ///
+    /// No clock, no memory, and nothing that depends on what else is running.
     #[test]
     fn an_empty_passphrase_refuses_before_argon2_is_called() {
-        let started = Instant::now();
-        let refusal = derived(
-            &KdfProfile::named(ProfileName::Standard),
-            &Passphrase::new(Vec::new()),
-            &salt(),
-        )
-        .unwrap_err();
+        // Zero lanes, zero passes, zero memory: `Params::new` refuses all three.
+        let unbuildable = KdfProfile {
+            memory_kib: 0,
+            iterations: 0,
+            parallelism: 0,
+        };
 
-        assert_eq!(refusal, VaultError::PassphraseMissing);
-        assert!(started.elapsed() < REFUSAL_BUDGET);
+        assert_eq!(
+            derive_master_key(&unbuildable, &passphrase(), &salt()).unwrap_err(),
+            VaultError::KeyDerivationFailed,
+            "the control failed: this profile has to be one Argon2 refuses, or the \
+             assertion below proves nothing about ordering"
+        );
+
+        assert_eq!(
+            derive_master_key(&unbuildable, &Passphrase::new(Vec::new()), &salt()).unwrap_err(),
+            VaultError::PassphraseMissing,
+            "the empty passphrase was carried past the check and into the parameter \
+             build, which means an empty passphrase reaches Argon2 on a profile \
+             that works"
+        );
     }
 
     #[test]
