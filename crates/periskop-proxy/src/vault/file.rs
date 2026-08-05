@@ -1163,11 +1163,21 @@ mod tests {
         tampered[12..16].copy_from_slice(&4_000_000u32.to_le_bytes());
         std::fs::write(&path, &tampered).unwrap();
 
-        let started = std::time::Instant::now();
+        // Counted rather than timed. The earlier version of this bounded the
+        // elapsed time at five seconds, which passed here and failed on a CI
+        // runner where other threads were holding Argon2's memory: the clock was
+        // measuring the machine, not the ordering this test is about.
+        use std::sync::atomic::Ordering;
+        let before = super::key::DERIVATIONS_ENTERED.load(Ordering::SeqCst);
         let refusal = reopen(&path, CounterFloor::Unknown).unwrap_err();
         assert!(matches!(refusal, VaultError::KdfParameterOutOfRange { .. }));
         assert_eq!(refusal.integrity(), None);
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(
+            super::key::DERIVATIONS_ENTERED.load(Ordering::SeqCst),
+            before,
+            "the header claimed 3.8 GiB and a derivation was entered anyway, which is the \
+             resource exhaustion the bound exists to refuse"
+        );
     }
 
     #[test]
