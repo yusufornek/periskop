@@ -331,13 +331,13 @@ async fn row_8_the_shared_namespace_messages_path_is_a_404_and_is_not_sent_to_an
 
 #[tokio::test]
 async fn row_9_an_upstream_failure_is_forwarded_transparently() {
-    let upstream = Arc::new(Recorder::answering(Answer {
-        status: 503,
-        headers: HeaderList::new()
+    let upstream = Arc::new(Recorder::answering(Answer::whole(
+        503,
+        HeaderList::new()
             .with("content-type", "application/json")
             .with("retry-after", "30"),
-        body: br#"{"error":{"message":"overloaded"}}"#.to_vec(),
-    }));
+        br#"{"error":{"message":"overloaded"}}"#.to_vec(),
+    )));
     let gateway = Gateway::new(
         policy(""),
         vault(),
@@ -404,11 +404,11 @@ async fn row_10_losing_the_vault_after_the_answer_started_cuts_it_and_delivers_n
     let access = periskop_proxy::http::VaultAccess::live();
     let upstream = Arc::new(LosesTheVaultMidAnswer {
         access: access.clone(),
-        inner: Recorder::answering(Answer {
-            status: 200,
-            headers: HeaderList::new().with("content-type", "application/json"),
-            body: br#"{"choices":[{"message":{"content":"send it to PSK_IBAN_1"}}]}"#.to_vec(),
-        }),
+        inner: Recorder::answering(Answer::whole(
+            200,
+            HeaderList::new().with("content-type", "application/json"),
+            br#"{"choices":[{"message":{"content":"send it to PSK_IBAN_1"}}]}"#.to_vec(),
+        )),
     });
 
     let gateway = Gateway::new(

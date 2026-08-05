@@ -40,7 +40,10 @@ use super::passthrough::{shipped_base, AllowList, BaseUrl};
 use super::request_path::{alias_key_for, mask, Pass};
 use super::route::{self, Admin, Periskop, Provider, Resolved, Route, Treatment};
 use super::session::Binding;
-use super::upstream::{Call, Upstream};
+use super::stream::automaton::Snapshot;
+use super::stream::restore::{Lookup, SessionLookup};
+use super::stream::{is_event_stream, is_json, restore_body, Measured, Relay, Settings};
+use super::upstream::{Answer, Call, Upstream};
 
 /// How many conversations keep a minter in memory.
 ///
@@ -134,6 +137,14 @@ impl Outgoing {
 
 struct Slot {
     minter: Minter,
+    /// The conversation's alias set, frozen (ADR-010 section 4).
+    ///
+    /// Rebuilt only when the session has issued an alias since it was taken, so
+    /// two requests that minted nothing new share one automaton through the
+    /// version counter rather than paying to build the same trie twice. Nothing
+    /// on the response path may replace it: a stream holds an `Arc` of the one it
+    /// started with, so a rebuild here cannot reach a stream in flight.
+    snapshot: Arc<Snapshot>,
     last_used_ms: u64,
     /// The opaque handle the client holds for this conversation, kept so that
     /// `/_periskop/session/{id}` can answer without reconstructing it from the
@@ -317,6 +328,7 @@ impl Gateway {
             upstream_status: None,
             error: None,
             added_latency_ms: 0,
+            measured: Measured::default(),
         }
     }
 
@@ -436,8 +448,8 @@ impl Gateway {
         record.alias_scope = identity.scope();
 
         let prepared = self.prepare_body(treatment, parsed, &identity, &mut record);
-        let body = match prepared {
-            Ok(body) => body,
+        let (body, snapshot) = match prepared {
+            Ok(prepared) => prepared,
             Err(refusal) => {
                 let outgoing = self.refuse(&refusal, &mut record);
                 return (outgoing, record);
@@ -511,46 +523,113 @@ impl Gateway {
 
         // An upstream 4xx or 5xx is forwarded transparently (`proxy-api.md`,
         // "Hata davranışı"). It is the provider's answer, not periskop's refusal,
-        // and rewriting it would hide a rate limit behind a proxy error.
+        // and rewriting it would hide a rate limit behind a proxy error. Its body
+        // still goes through restoration, because a masked value can be quoted in
+        // an error message as easily as in an answer.
         record.status = answer.status;
+        let body = self.restore_answer(&answer, &snapshot, &identity, &mut record);
+
         let marks = Marks {
             masked_entities: record.masked_entities,
             policy_id: self.policy.policy_id().to_owned(),
             alias_scope: record.alias_scope.clone(),
             degraded: record.degraded.clone(),
+            stream_truncated: record.measured.truncated,
             ..Marks::default()
         };
         (
             Outgoing {
                 status: answer.status,
                 headers: super::headers::to_downstream(&answer.headers, &marks),
-                body: answer.body,
+                body,
             },
             record,
         )
     }
 
+    /// Puts this conversation's values back into the provider's answer.
+    ///
+    /// Two shapes, one state machine. A server sent event stream is driven
+    /// through [`Relay`] chunk by chunk, in the pieces the transport delivered,
+    /// so that an alias cut in half by the wire is held rather than emitted. A
+    /// buffered JSON answer is the degenerate case of the same walk. Anything
+    /// else crosses untouched: this build rewrites text it can find through a
+    /// contract, never bytes it guessed at.
+    fn restore_answer(
+        &self,
+        answer: &Answer,
+        snapshot: &Arc<Snapshot>,
+        identity: &super::session::Identity,
+        record: &mut RequestRecord,
+    ) -> Vec<u8> {
+        if snapshot.is_empty() {
+            return answer.body.clone();
+        }
+        let content_type = answer.headers.get("content-type");
+        if !is_event_stream(content_type) && !is_json(content_type) {
+            return answer.body.clone();
+        }
+
+        let now_ms = self.clock.now_ms();
+        let session = identity.id();
+        let mut vault = lock(&self.vault);
+        let mut lookup = SessionLookup::new(&mut vault, snapshot, session, now_ms);
+
+        if is_event_stream(content_type) {
+            let mut relay = Relay::new(&Settings {
+                snapshot: Arc::clone(snapshot),
+                style: self.policy.alias_style(),
+                declared_l_max_session: self.policy.l_max_session(),
+                hold_timeout_ms: self.policy.hold_timeout_ms(),
+                on_hold_timeout: self.policy.on_hold_timeout(),
+            });
+            let mut out = Vec::new();
+            for piece in answer.pieces() {
+                out.extend(relay.push(piece, &mut lookup, now_ms));
+            }
+            out.extend(relay.finish(&mut lookup, now_ms));
+            record.measured = relay.measured();
+            return out;
+        }
+
+        match restore_body(snapshot, &mut lookup, &answer.body) {
+            Some((body, stats)) => {
+                record.measured.restore = stats;
+                record.measured.record_tamper = lookup.tampered();
+                body
+            }
+            // A body that does not parse is the provider's, not ours to rewrite.
+            None => answer.body.clone(),
+        }
+    }
+
     /// Masks the body, or declares why it was not masked.
+    ///
+    /// Returns the bytes to send **and** the alias set the answer will be read
+    /// against, frozen here because here is where the request is accepted
+    /// (ADR-010 section 4). Freezing it any later would mean a stream could be
+    /// read against a set that changed while it was arriving.
     fn prepare_body(
         &self,
         treatment: Treatment,
         parsed: Option<Value>,
         identity: &super::session::Identity,
         record: &mut RequestRecord,
-    ) -> Result<Vec<u8>, Refusal> {
+    ) -> Result<(Vec<u8>, Arc<Snapshot>), Refusal> {
         let session = &identity.id();
+        let empty = || Arc::new(Snapshot::empty());
         let Some(parsed) = parsed else {
             // No body: a model list. Nothing to scan and nothing to declare.
-            return Ok(Vec::new());
+            return Ok((Vec::new(), empty()));
         };
 
         if treatment == Treatment::UnmaskedAndDeclared {
             let declared = Declared::make(Gap::UnsupportedEndpoint, true, true)?;
             record.degraded.push(declared.reason());
-            return Ok(parsed.to_string().into_bytes());
+            return Ok((parsed.to_string().into_bytes(), empty()));
         }
         if treatment == Treatment::NoUserText {
-            return Ok(parsed.to_string().into_bytes());
+            return Ok((parsed.to_string().into_bytes(), empty()));
         }
 
         if carries_tool_arguments(&parsed) {
@@ -573,6 +652,7 @@ impl Gateway {
         })?;
         let slot = minters.entry(*session).or_insert_with(|| Slot {
             minter: Minter::new(key, self.policy.alias_style()),
+            snapshot: Arc::new(Snapshot::empty()),
             last_used_ms: now_ms,
             scope: identity.scope(),
         });
@@ -605,7 +685,21 @@ impl Gateway {
         record.degraded.extend(masked.degraded.iter().copied());
         record.degraded.sort_unstable();
         record.degraded.dedup();
-        Ok(masked.body.to_string().into_bytes())
+
+        let snapshot = {
+            let Some(slot) = minters.get_mut(session) else {
+                // The slot was inserted a few lines above and pruning keeps the
+                // most recently used; written as a fallback rather than an unwrap
+                // so that a future bound change cannot turn this into a panic.
+                return Ok((
+                    masked.body.to_string().into_bytes(),
+                    Arc::new(Snapshot::empty()),
+                ));
+            };
+            slot.snapshot = refreshed(&slot.snapshot, &slot.minter);
+            Arc::clone(&slot.snapshot)
+        };
+        Ok((masked.body.to_string().into_bytes(), snapshot))
     }
 
     /// A vault failure that means the vault may not be used again.
@@ -621,6 +715,24 @@ impl Gateway {
             self.access.lost();
         }
     }
+}
+
+/// The conversation's frozen alias set, rebuilt only when it has changed.
+///
+/// ADR-010 section 4: "Oturuma yeni takma ad eklenmediyse bir sonraki istek aynı
+/// otomatı sürüm sayacıyla paylaşır." The version is the number of aliases the
+/// session has issued, which only ever grows, so an unchanged count is an
+/// unchanged set. Sharing is not only a saving: it is what makes "the automaton
+/// was not rebuilt" a checkable property rather than an intention.
+fn refreshed(current: &Arc<Snapshot>, minter: &Minter) -> Arc<Snapshot> {
+    let version = minter.issued_count() as u64;
+    if current.version() == version {
+        return Arc::clone(current);
+    }
+    Arc::new(Snapshot::frozen(
+        version,
+        minter.issued_aliases().map(str::to_owned),
+    ))
 }
 
 fn endpoint_name(treatment: Treatment) -> &'static str {
@@ -706,5 +818,70 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use crate::alias::{AliasKey, AliasStyle, EntityType};
+
+    use super::*;
+
+    fn minter() -> Minter {
+        Minter::new(
+            AliasKey::from_key_bytes([0x91; 32]),
+            AliasStyle::TypePreserving,
+        )
+    }
+
+    /// ADR-010 section 4, the sharing half.
+    #[test]
+    fn a_session_that_minted_nothing_new_keeps_the_automaton_it_had() {
+        let mut book = minter();
+        book.mint(EntityType::Person, "Ahmet Yilmaz")
+            .expect("a person is minted");
+
+        let first = refreshed(&Arc::new(Snapshot::empty()), &book);
+        assert_eq!(first.alias_count(), 1);
+        assert_eq!(first.version(), 1);
+
+        // Same conversation, next request, nothing new masked.
+        let again = refreshed(&first, &book);
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "the automaton was rebuilt for a session whose alias set did not change"
+        );
+    }
+
+    /// And the other half: a set that did change is not reused.
+    #[test]
+    fn a_session_that_minted_something_gets_an_automaton_that_holds_it() {
+        let mut book = minter();
+        book.mint(EntityType::Person, "Ahmet Yilmaz")
+            .expect("a person is minted");
+        let first = refreshed(&Arc::new(Snapshot::empty()), &book);
+
+        book.mint(EntityType::Loc, "Kadikoy").expect("a place");
+        let second = refreshed(&first, &book);
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.alias_count(), 2);
+        assert_eq!(second.version(), 2);
+    }
+
+    /// The literal the user wrote is not in the automaton, on any path.
+    #[test]
+    fn a_withheld_literal_never_enters_the_frozen_set() {
+        let mut book = minter();
+        book.reserve_literal("PSK_PERSON_9");
+        book.mint(EntityType::Person, "Ahmet Yilmaz")
+            .expect("a person is minted");
+
+        let snapshot = refreshed(&Arc::new(Snapshot::empty()), &book);
+        assert!(
+            !snapshot.holds("PSK_PERSON_9"),
+            "a string the user wrote is in the set the response is read against"
+        );
+        assert_eq!(snapshot.alias_count(), 1);
     }
 }

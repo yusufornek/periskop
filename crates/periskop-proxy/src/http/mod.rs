@@ -21,16 +21,17 @@
 //! | [`errors`] | the closed error vocabulary and the fail closed matrix |
 //! | [`declare`] | the three legged declaration for what is not masked |
 //! | [`observe`] | what one request may leave behind |
+//! | [`stream`] | the response side: frames, the hold buffer and alias restoration |
 //! | [`gateway`] | the order all of the above run in |
 //! | [`serve`] | the translation between `hyper` and the types above |
 //! | [`upstream`] | the connection to the provider, behind a seam |
 //!
-//! # What is not here
+//! # Which direction streams
 //!
-//! Response streaming. `proxy-api.md` fixes that the **request** side never
-//! streams: the body is taken in full, masked, and only then sent. The response
-//! side's buffered state machine, the flush invariant and alias restoration are
-//! tasks 89 to 93, and until they land a response body is forwarded whole.
+//! The **request** side never does, and that is a contract rather than an
+//! omission (`proxy-api.md`, "Streaming SSE" point 1): the body is taken in full,
+//! masked, and only then sent, because a masking decision cannot be taken on half
+//! a document. The **response** side does, and [`stream`] is where it happens.
 
 pub mod admin;
 pub mod declare;
@@ -45,6 +46,7 @@ pub mod request_path;
 pub mod route;
 pub mod serve;
 pub mod session;
+pub mod stream;
 pub mod upstream;
 
 pub use errors::{ProxyError, Refusal};

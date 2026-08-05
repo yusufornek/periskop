@@ -37,7 +37,48 @@ pub struct Call {
 pub struct Answer {
     pub status: u16,
     pub headers: HeaderList,
+    /// The whole body, concatenated.
     pub body: Vec<u8>,
+    /// The pieces the body arrived in, in order.
+    ///
+    /// Empty means "in one piece", which is what a body somebody collected looks
+    /// like. It is kept because the response side's state machine is only
+    /// exercised by the cuts the wire actually made: a proxy that collected a
+    /// stream and only then ran the hold buffer would pass every split alias test
+    /// while doing none of the work the test is about (`proxy/spec.md` section
+    /// 6.1). [`Answer::pieces`] is the accessor, so no caller has to know which
+    /// shape it was handed.
+    pub chunks: Vec<Vec<u8>>,
+}
+
+impl Answer {
+    /// A body that arrived in one piece.
+    pub fn whole(status: u16, headers: HeaderList, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            headers,
+            body,
+            chunks: Vec::new(),
+        }
+    }
+
+    /// A body that arrived in these pieces, in this order.
+    pub fn in_pieces(status: u16, headers: HeaderList, chunks: Vec<Vec<u8>>) -> Self {
+        Self {
+            status,
+            headers,
+            body: chunks.concat(),
+            chunks,
+        }
+    }
+
+    /// The body as the transport delivered it.
+    pub fn pieces(&self) -> Vec<&[u8]> {
+        if self.chunks.is_empty() {
+            return vec![&self.body];
+        }
+        self.chunks.iter().map(Vec::as_slice).collect()
+    }
 }
 
 /// Why a call did not complete.
@@ -51,7 +92,12 @@ pub struct Unreachable {
     pub why: String,
 }
 
-type Pending<'a> = Pin<Box<dyn Future<Output = Result<Answer, Unreachable>> + Send + 'a>>;
+/// One call in flight.
+///
+/// Public because the trait below is implementable from outside this crate and
+/// the integration tests do implement it; a private return type would force every
+/// one of them to spell the same `Pin<Box<dyn Future<...>>>` out by hand.
+pub type Pending<'a> = Pin<Box<dyn Future<Output = Result<Answer, Unreachable>> + Send + 'a>>;
 
 /// Somewhere to send a masked request.
 pub trait Upstream: Send + Sync {
@@ -128,21 +174,24 @@ impl Upstream for RustlsUpstream {
                 );
             }
 
-            let body = response
-                .into_body()
-                .collect()
-                .await
-                .map_err(|why| Unreachable {
+            // Frame by frame rather than `collect()`. The cuts the provider's
+            // stream arrives in are the input the response state machine exists
+            // to survive, and collecting first would erase them here and hand the
+            // buffer one perfect chunk it never has to hold anything across.
+            let mut body = response.into_body();
+            let mut chunks: Vec<Vec<u8>> = Vec::new();
+            while let Some(frame) = body.frame().await {
+                let frame = frame.map_err(|why| Unreachable {
                     why: format!("the provider's answer could not be read: {why}"),
-                })?
-                .to_bytes()
-                .to_vec();
+                })?;
+                if let Ok(data) = frame.into_data() {
+                    if !data.is_empty() {
+                        chunks.push(data.to_vec());
+                    }
+                }
+            }
 
-            Ok(Answer {
-                status,
-                headers,
-                body,
-            })
+            Ok(Answer::in_pieces(status, headers, chunks))
         })
     }
 }
@@ -168,11 +217,24 @@ impl Recorder {
 
     /// An upstream that answers `200` with an empty JSON object.
     pub fn ok() -> Self {
-        Self::answering(Answer {
-            status: 200,
-            headers: HeaderList::new().with("content-type", "application/json"),
-            body: b"{}".to_vec(),
-        })
+        Self::answering(Answer::whole(
+            200,
+            HeaderList::new().with("content-type", "application/json"),
+            b"{}".to_vec(),
+        ))
+    }
+
+    /// An upstream that answers with a server sent event stream, delivered in the
+    /// pieces given.
+    ///
+    /// The seam every split alias assertion runs through: the caller decides where
+    /// the cuts fall, including inside an alias and inside a `data:` line.
+    pub fn streaming(chunks: Vec<Vec<u8>>) -> Self {
+        Self::answering(Answer::in_pieces(
+            200,
+            HeaderList::new().with("content-type", "text/event-stream"),
+            chunks,
+        ))
     }
 
     /// Everything that was sent, in order.

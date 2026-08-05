@@ -19,13 +19,26 @@
 //! | `stdout` and `stderr` | everything a real child process that opens, loads and compacts a vault wrote to either stream |
 //! | the HTTP response to the client | status, every header and the body of a real masked request |
 //! | the request record | the line the proxy leaves behind for one request |
+//! | the **streamed** response body | the server sent events of a real answer whose aliases could not be resolved |
+//! | the **streamed** request record | the line left behind by a request whose answer *was* restored |
 //!
-//! The last two rows arrived with task 85, in the same change that opened a port.
-//! Before it there was nothing outside this process to reach; after it there is a
-//! response travelling back over a socket and a per request record, and neither is
-//! covered by any row above. They also carry a second planted value the vault rows
-//! do not: the **caller's API key**, which `proxy/spec.md` section 2.3 says
-//! periskop never logs and which task 85 requires this byte sweep to cover.
+//! Rows seven and eight arrived with task 85, in the same change that opened a
+//! port. Before it there was nothing outside this process to reach; after it there
+//! is a response travelling back over a socket and a per request record, and
+//! neither is covered by any row above. They also carry a second planted value the
+//! vault rows do not: the **caller's API key**, which `proxy/spec.md` section 2.3
+//! says periskop never logs and which task 85 requires this byte sweep to cover.
+//!
+//! The last two rows arrived with tasks 89 to 93, which gave the component two
+//! output surfaces it did not have: a response body **assembled by this process**
+//! rather than forwarded, and a record line carrying the stream and restore
+//! counters. Both are searched, from two deliberately different runs. The streamed
+//! **body** comes from an exchange whose aliases resolve to nothing, because that
+//! is the shape in which a value could reach a stream by accident
+//! (`masking_unresolved`: the buffer holds and releases with no value to put in).
+//! The streamed **record** comes from an exchange whose aliases *do* resolve, so
+//! the restored plaintext is in this process while the line is written, and a
+//! counter that started carrying the value it counts is found here.
 //!
 //! The last row was missing, and its absence was a hole in this gate rather than a
 //! narrower claim: a single `dbg!(plaintext)` added to `record::seal` writes every
@@ -348,7 +361,7 @@ fn http_surfaces() -> Result<Vec<(String, Vec<u8>)>, String> {
         .into_bytes()
     };
 
-    Ok(vec![
+    let mut surfaces = vec![
         ("http_response".to_owned(), render(&response)),
         (
             "http_request_record".to_owned(),
@@ -363,6 +376,154 @@ fn http_surfaces() -> Result<Vec<(String, Vec<u8>)>, String> {
         ("http_admin_policy".to_owned(), render(&policy_body)),
         ("http_admin_vault_status".to_owned(), render(&status_body)),
         ("http_admin_metrics".to_owned(), render(&metrics_body)),
+    ];
+    surfaces.extend(stream_surfaces(&prompt, &render)?);
+    Ok(surfaces)
+}
+
+/// The two surfaces the response state machine added (tasks 89 to 93).
+///
+/// Two runs, because the leak they can carry is a different one in each. The
+/// first restores nothing and its **body** is searched; the second restores
+/// everything and its **record** is searched while the plaintext is in the
+/// process. Each carries its own positive control, or the search below would be
+/// looking through bytes that never went near a value.
+fn stream_surfaces(
+    prompt: &str,
+    render: &dyn Fn(&periskop_proxy::http::gateway::Outgoing) -> Vec<u8>,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    use std::sync::Arc;
+
+    use periskop_proxy::http::gateway::{Clock, Gateway, Incoming};
+    use periskop_proxy::http::headers::{HeaderList, SESSION_HEADER};
+    use periskop_proxy::http::upstream::{Answer, Call, Pending, Recorder, Unreachable, Upstream};
+    use periskop_proxy::http::AllowList;
+    use periskop_proxy::policy::Policy;
+
+    /// An upstream that streams the masked prompt back, cut every few bytes.
+    ///
+    /// The cuts are the point: they land inside aliases, so the hold buffer runs
+    /// and the restored values are assembled by this process rather than
+    /// forwarded from the provider.
+    struct EchoesTheMaskedTextInSmallPieces;
+
+    impl Upstream for EchoesTheMaskedTextInSmallPieces {
+        fn send(&self, call: Call) -> Pending<'_> {
+            let body: serde_json::Value =
+                serde_json::from_slice(&call.body).unwrap_or(serde_json::Value::Null);
+            let masked = body["messages"][0]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .replace('\n', " ");
+            let mut chunks: Vec<Vec<u8>> = Vec::new();
+            let mut at = 0usize;
+            while at < masked.len() {
+                let mut end = (at + 3).min(masked.len());
+                while !masked.is_char_boundary(end) {
+                    end += 1;
+                }
+                let piece = serde_json::json!({
+                    "choices": [{"index": 0, "delta": {"content": masked[at..end]}}]
+                });
+                chunks.push(format!("data: {piece}\n\n").into_bytes());
+                at = end;
+            }
+            chunks.push(b"data: [DONE]\n\n".to_vec());
+            let answer = Answer::in_pieces(
+                200,
+                HeaderList::new().with("content-type", "text/event-stream"),
+                chunks,
+            );
+            Box::pin(async move { Ok::<Answer, Unreachable>(answer) })
+        }
+    }
+
+    let build = |upstream: Arc<dyn Upstream>| -> Result<Gateway, String> {
+        let policy = Policy::load(
+            "policy_id = \"acme\"\npolicy_version = \"1\"\n[default]\nmode = \"mask\"\n",
+            Path::new("."),
+            None,
+        )
+        .map_err(|refusal| format!("{refusal}"))?;
+        let vault = open_vault(&Scratch::new("stream").directory(), ProfileName::Ci)
+            .map_err(|refusal| format!("{refusal}"))?;
+        Gateway::new(
+            policy,
+            vault,
+            upstream,
+            AllowList::shipped(),
+            Clock::Fixed(NOW),
+        )
+        .map_err(|refusal| refusal.detail().to_owned())
+    };
+
+    let request = |body: String| Incoming {
+        method: "POST".to_owned(),
+        path: "/v1/chat/completions".to_owned(),
+        query: None,
+        headers: HeaderList::new()
+            .with("authorization", format!("Bearer {}", planted_credential()))
+            .with(SESSION_HEADER, "the-sweep-s-stream"),
+        body: body.into_bytes(),
+    };
+    let ask = serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": prompt}]
+    })
+    .to_string();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|why| format!("no runtime: {why}"))?;
+
+    // Run one: nothing resolves, and the body is the surface. The stub answers
+    // with alias shaped strings this conversation never issued, which is the
+    // `masking_unresolved` path.
+    let unresolved_gateway = build(Arc::new(Recorder::streaming(vec![
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"about PSK_PER\"}}]}\n\n".to_vec(),
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"SON_1 and PSK_EMAIL_1\"}}]}\n\n"
+            .to_vec(),
+        b"data: [DONE]\n\n".to_vec(),
+    ])) as Arc<dyn Upstream>)?;
+    let unresolved =
+        runtime.block_on(async { unresolved_gateway.handle(request(ask.clone())).await });
+
+    // Run two: everything resolves, so the restored plaintext is in this process
+    // while the record line is written.
+    let restoring_gateway = build(Arc::new(EchoesTheMaskedTextInSmallPieces) as Arc<dyn Upstream>)?;
+    let restored = runtime.block_on(async { restoring_gateway.handle(request(ask)).await });
+
+    let restored_body = String::from_utf8_lossy(&restored.body).into_owned();
+    let planted_in_the_stream = PLANTED
+        .iter()
+        .filter(|(_, value)| restored_body.contains(value))
+        .count();
+    if planted_in_the_stream == 0 {
+        return Err(
+            "no planted value came back out of the streamed answer, so the record \
+             below was written by a run that restored nothing and searching it \
+             proves nothing"
+                .to_owned(),
+        );
+    }
+
+    let line = |gateway: &Gateway| -> Vec<u8> {
+        gateway
+            .log()
+            .iter()
+            .map(periskop_proxy::http::observe::RequestRecord::to_line)
+            .collect::<Vec<String>>()
+            .join("\n")
+            .into_bytes()
+    };
+
+    Ok(vec![
+        ("http_stream_response".to_owned(), render(&unresolved)),
+        (
+            "http_stream_request_record".to_owned(),
+            line(&restoring_gateway),
+        ),
     ])
 }
 
@@ -549,6 +710,11 @@ fn check(profile: ProfileName, surfaces: &BTreeMap<String, Vec<u8>>) {
         ("http_admin_policy", b"masking_profile"),
         ("http_admin_vault_status", b"vault_state"),
         ("http_admin_metrics", b"periskop_proxy_requests_total"),
+        // The streaming rows. The body has to be a stream that actually carried
+        // an unresolved alias, and the record has to carry the restore counters,
+        // or neither is the surface it claims to be.
+        ("http_stream_response", b"data: "),
+        ("http_stream_request_record", b"aliases_restored="),
     ] {
         let surface = surfaces
             .get(name)
@@ -1104,7 +1270,8 @@ fn record_outcome(covered: &[&str], skipped: &[&str]) {
          \"status\": \"{status}\",\n  \"profiles_covered\": [{}],\n  \"profiles_skipped\": [{}],\n  \
          \"planted_values\": {},\n  \"surfaces\": [\"vault_file\",\"temporary_files\",\
          \"renderings\",\"admin_vault_status\",\"proxy_event_counters\",\
-         \"process_stdout_and_stderr\"],\n  \
+         \"process_stdout_and_stderr\",\"http_response\",\"http_request_record\",\
+         \"http_stream_response\",\"http_stream_request_record\"],\n  \
          \"caveat\": \"There is no logging framework and no ProxyEvent type in this crate yet. \
          The TRACE surface is approximated by every Debug and Display rendering a log line could \
          contain, and the event surface by the counters the vault contributes. Both are held in \

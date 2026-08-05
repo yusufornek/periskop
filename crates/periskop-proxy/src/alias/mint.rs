@@ -178,6 +178,17 @@ impl Minter {
         self.issued.len()
     }
 
+    /// Every alias this session actually produced, in sorted order.
+    ///
+    /// This is what the response side's frozen automaton is built from
+    /// (`proxy/spec.md` section 6.2 step 2), and what it leaves out is the point:
+    /// a string the **user** wrote that merely looks like one of ours is in
+    /// `withheld`, not here, so it is never matched on the way back and never
+    /// replaced by somebody else's value (ADR-010 section 6).
+    pub fn issued_aliases(&self) -> impl Iterator<Item = &str> {
+        self.taken.keys().map(String::as_str)
+    }
+
     /// Takes a literal out of the pool.
     ///
     /// Called for every string in the request that could be an alias. Answering

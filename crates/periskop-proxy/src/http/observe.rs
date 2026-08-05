@@ -17,6 +17,7 @@ use crate::detect::{DegradedReason, MaskingProfile};
 
 use super::errors::ProxyError;
 use super::session::Origin;
+use super::stream::{Measured, Warning};
 
 /// One request, as a record.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,6 +47,10 @@ pub struct RequestRecord {
     pub error: Option<ProxyError>,
     /// Milliseconds this proxy added.
     pub added_latency_ms: u64,
+    /// What the response side measured: counters only, and the same counters
+    /// `proxy-events.md` names. No alias string and no value has a field here,
+    /// which is why this whole struct can be written to a log line.
+    pub measured: Measured,
 }
 
 impl RequestRecord {
@@ -68,6 +73,13 @@ impl RequestRecord {
         "upstream_status",
         "error",
         "added_latency_ms",
+        "stream_chunks",
+        "hold_timeout_flush",
+        "partial_alias_flushed",
+        "aliases_seen_in_response",
+        "aliases_restored",
+        "aliases_leaked",
+        "warn",
     ];
 
     /// The line.
@@ -104,9 +116,48 @@ impl RequestRecord {
             ),
             format!("error={}", self.error.map_or("-", |error| error.as_str())),
             format!("added_latency_ms={}", self.added_latency_ms),
+            format!("stream_chunks={}", self.measured.stream.chunks),
+            format!(
+                "hold_timeout_flush={}",
+                self.measured.stream.hold_timeout_flush
+            ),
+            format!(
+                "partial_alias_flushed={}",
+                self.measured.stream.partial_alias_flushed
+            ),
+            format!(
+                "aliases_seen_in_response={}",
+                self.measured.restore.aliases_seen_in_response
+            ),
+            format!(
+                "aliases_restored={}",
+                self.measured.restore.aliases_restored
+            ),
+            format!("aliases_leaked={}", self.measured.restore.aliases_leaked),
+            format!("warn={}", render_warnings(&self.measured.warnings())),
         ]
         .join(" ")
     }
+
+    /// The counters that crossed the line `proxy-events.md` draws under them.
+    ///
+    /// A WARN is not a log level here, it is a named counter that went above
+    /// zero, and it is on the line so that a run cannot be read as clean when it
+    /// was not.
+    pub fn warnings(&self) -> Vec<Warning> {
+        self.measured.warnings()
+    }
+}
+
+fn render_warnings(warnings: &[Warning]) -> String {
+    if warnings.is_empty() {
+        return "-".to_owned();
+    }
+    warnings
+        .iter()
+        .map(|warning| warning.as_str())
+        .collect::<Vec<&str>>()
+        .join(",")
 }
 
 #[cfg(test)]
@@ -128,7 +179,44 @@ mod tests {
             upstream_status: Some(200),
             error: None,
             added_latency_ms: 7,
+            measured: Measured::default(),
         }
+    }
+
+    #[test]
+    fn a_warning_counter_is_on_the_line_and_a_clean_run_says_so() {
+        // Task 92 and 93 both require a WARN that is not silent. The line is the
+        // surface it appears on, and a run with nothing wrong has to be readable
+        // as such or the marker means nothing.
+        assert!(
+            record().to_line().contains("warn=-"),
+            "{}",
+            record().to_line()
+        );
+
+        let mut measured = Measured::default();
+        measured.stream.partial_alias_flushed = 1;
+        measured.restore.aliases_leaked = 2;
+        let noisy = RequestRecord {
+            measured,
+            ..record()
+        };
+        assert!(
+            noisy
+                .to_line()
+                .contains("warn=partial_alias_flushed,aliases_leaked"),
+            "{}",
+            noisy.to_line()
+        );
+        assert_eq!(
+            noisy.warnings(),
+            vec![Warning::PartialAliasFlushed, Warning::AliasesLeaked]
+        );
+        assert!(
+            noisy.to_line().contains("aliases_leaked=2"),
+            "{}",
+            noisy.to_line()
+        );
     }
 
     #[test]

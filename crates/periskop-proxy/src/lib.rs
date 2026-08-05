@@ -28,8 +28,15 @@
 //! the default bind address is loopback, why header redaction is enforced by a
 //! function rather than by review, and why every refusal in it is fail closed.
 //!
-//! Response streaming is not here: tasks 89 to 93 own the buffered state machine
-//! and alias restoration, and until they land a response body is forwarded whole.
+//! `http::stream` is the answer coming back, and it is the hardest thing in this
+//! crate. Everything above it decides once, over a whole document; a stream
+//! arrives in pieces the network chose, and `PSK_PERSON_1` can be `PSK_PER` in one
+//! of them and `SON_1` in the next. Three claims have to hold at the same time
+//! there: no alias reaches the client cut in half, no un-masked value is released
+//! early, and the latency budget is not spent holding everything back. They pull
+//! against each other, so the resolution is one function that decides every
+//! release and returns what proves it safe, rather than a rule spread over the
+//! code and remembered.
 //!
 //! # Binary targets
 //!
