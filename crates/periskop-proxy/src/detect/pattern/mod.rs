@@ -296,6 +296,29 @@ pub fn scan(text: &str) -> Vec<Candidate> {
 ///
 /// The whole match first, because that is the ordinary case and it has to stay
 /// free. Only a refusal pays for the retry walk.
+///
+/// # The known cost of trying the whole match first
+///
+/// Trying the whole region before any shorter reading is what makes this cheap,
+/// and it is also a measured source of **over**-masking. When a greedy shape has
+/// swallowed a trailing token and the gate still admits the resulting string, the
+/// admission covers the value and the token, and no shorter reading is ever
+/// offered: [`longest_admitted_reading`] runs on a refusal and not on a success.
+/// The alias then stands for slightly more text than the entity did. The second
+/// closing audit measured this at 8 regions in 676, near one in ninety.
+///
+/// It is left this way on purpose rather than left unnoticed. The error is
+/// entirely in the false positive direction: more of the prompt is replaced than
+/// strictly had to be, and nothing that should have been masked crosses. The only
+/// reading order that would trim it is preferring the **shortest** admitted
+/// reading, and that trades a cosmetic loss for a real one, because the short
+/// reading of a card number or an IBAN is a prefix of it and masking a prefix
+/// leaves the tail in the prompt. For a component whose whole rule is that it
+/// refuses rather than under-masks, biased long is the correct bias.
+///
+/// The limit belongs in `docs/05-quality/known-gaps.md` as a catalogued escape
+/// case, and this role does not write that file; the owned row is on
+/// `hub/task-board.md`.
 fn admit_region(
     detector: &Detector,
     expression: &Regex,

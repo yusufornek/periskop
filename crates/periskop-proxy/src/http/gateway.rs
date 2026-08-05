@@ -304,12 +304,31 @@ impl Gateway {
     }
 
     /// Files one finding, dropping the oldest once the bound is reached.
+    ///
+    /// The drop is **counted**. It used to be silent, and a silent drop is the
+    /// one thing this repository does not allow a loss to be: a reader of
+    /// [`Self::findings`] saw a list with no way to tell whether it was the whole
+    /// of what this process produced or the most recent thousand of it. The
+    /// count goes to `periskop_proxy_findings_evicted_total`, so the answer is on
+    /// the same endpoint an operator is already watching.
+    ///
+    /// The metrics lock is taken **after** the findings lock is released rather
+    /// than inside it. Nesting is what makes a lock order, and a lock order that
+    /// only exists on one path is the kind that is reversed by the next caller.
     fn file_finding(&self, document: Value) {
-        let mut findings = lock(&self.findings);
-        while findings.len() >= FINDINGS_KEPT {
-            findings.remove(0);
+        let evicted = {
+            let mut findings = lock(&self.findings);
+            let mut evicted = 0u64;
+            while findings.len() >= FINDINGS_KEPT {
+                findings.remove(0);
+                evicted += 1;
+            }
+            findings.push(document);
+            evicted
+        };
+        if evicted > 0 {
+            lock(&self.metrics).record_findings_evicted(evicted);
         }
-        findings.push(document);
     }
 
     /// Handles one request.
@@ -337,11 +356,23 @@ impl Gateway {
             }
         }
         if let Some(event) = self.event_for(&record) {
-            let mut events = lock(&self.events);
-            while events.len() >= EVENTS_KEPT {
-                events.remove(0);
+            // Counted for the reason `file_finding` gives: the buffer is bounded
+            // on purpose and the eviction was invisible, so a reader of the event
+            // list could not tell a complete measurement series from a window on
+            // one. Locks are not nested here either.
+            let evicted = {
+                let mut events = lock(&self.events);
+                let mut evicted = 0u64;
+                while events.len() >= EVENTS_KEPT {
+                    events.remove(0);
+                    evicted += 1;
+                }
+                events.push(event);
+                evicted
+            };
+            if evicted > 0 {
+                lock(&self.metrics).record_events_evicted(evicted);
             }
-            events.push(event);
         }
         lock(&self.log).push(record);
         outgoing
@@ -1870,6 +1901,106 @@ mod tests {
                 .contains("periskop_proxy_stream_reassembly_errors_total 0"),
             "{}",
             buffered.metrics_snapshot().render()
+        );
+    }
+
+    /// A bounded buffer that drops the oldest says how many it dropped.
+    ///
+    /// The gap this closes: both buffers were bounded on purpose and both
+    /// dropped their oldest entry with `remove(0)` and no record of it, so a
+    /// reader of `findings()` or `events()` had a list and no way to tell a
+    /// complete one from a window. A day that produced more findings than the
+    /// bound showed the bound's worth and read as if the rest had never
+    /// happened, which is exactly the "a loss is never discarded silently" rule
+    /// this component applies to everything else it measures.
+    #[test]
+    fn a_finding_dropped_by_the_bound_is_counted_where_an_operator_reads_it() {
+        let gateway = tamper_gateway();
+
+        // Under the bound: nothing is dropped, so the counter is zero. Without
+        // this half a build that counted every filing would pass the half below.
+        for _ in 0..8 {
+            gateway.file_finding(serde_json::json!({ "kind": "unmasked_passthrough" }));
+        }
+        assert_eq!(gateway.findings().len(), 8);
+        assert_eq!(gateway.metrics_snapshot().findings_evicted_total(), 0);
+        assert!(
+            gateway
+                .metrics_snapshot()
+                .render()
+                .contains("periskop_proxy_findings_evicted_total 0"),
+            "{}",
+            gateway.metrics_snapshot().render()
+        );
+
+        // Over it: the buffer stays at its bound and every entry that left is on
+        // the endpoint.
+        let over = 5usize;
+        for _ in 0..(FINDINGS_KEPT - 8 + over) {
+            gateway.file_finding(serde_json::json!({ "kind": "unmasked_passthrough" }));
+        }
+        assert_eq!(gateway.findings().len(), FINDINGS_KEPT);
+        assert_eq!(
+            gateway.metrics_snapshot().findings_evicted_total(),
+            over as u64,
+            "the buffer dropped {over} findings and the count disagrees"
+        );
+        assert!(
+            gateway
+                .metrics_snapshot()
+                .render()
+                .contains(&format!("periskop_proxy_findings_evicted_total {over}")),
+            "{}",
+            gateway.metrics_snapshot().render()
+        );
+    }
+
+    /// The same rule for the event buffer, driven through `handle`.
+    ///
+    /// Through the running path rather than over the buffer, because what was
+    /// missing is the call site: a counter raised only by its own unit test is
+    /// the defect `record_stream_reassembly_error` already had once in this file.
+    #[test]
+    fn an_event_dropped_by_the_bound_is_counted_where_an_operator_reads_it() {
+        let gateway = tamper_gateway();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+
+        let over = 3usize;
+        runtime.block_on(async {
+            for _ in 0..(EVENTS_KEPT + over) {
+                gateway.handle(ask("what is one plus one")).await;
+            }
+        });
+
+        assert_eq!(gateway.events().len(), EVENTS_KEPT);
+        assert_eq!(
+            gateway.metrics_snapshot().events_evicted_total(),
+            over as u64
+        );
+        assert!(
+            gateway
+                .metrics_snapshot()
+                .render()
+                .contains(&format!("periskop_proxy_events_evicted_total {over}")),
+            "{}",
+            gateway.metrics_snapshot().render()
+        );
+
+        // And the other direction on a process that stayed under the bound, or
+        // the assertion above would pass on a build that counted every request.
+        let quiet = tamper_gateway();
+        blocking(&quiet, ask("what is one plus one"));
+        assert_eq!(quiet.metrics_snapshot().events_evicted_total(), 0);
+        assert!(
+            quiet
+                .metrics_snapshot()
+                .render()
+                .contains("periskop_proxy_events_evicted_total 0"),
+            "{}",
+            quiet.metrics_snapshot().render()
         );
     }
 

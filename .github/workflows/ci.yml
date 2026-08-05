@@ -384,10 +384,34 @@ jobs:
               sys.exit(f"the observation did not come through eBPF: capture={proof.get('capture')!r}")
           if not proof.get("proves") or not proof.get("does_not_prove"):
               sys.exit("the artefact must state both what it proves and what it does not")
-          evidence = proof.get("evidence") or {}
-          if evidence.get("payload_marker_found_in_any_record"):
+          # The payload check reads a field that has to be *there*. It used to be
+          # `if evidence.get("payload_marker_found_in_any_record")`, and a missing
+          # evidence block, a renamed field or a run that never searched the
+          # records all produced None, which is falsy, which read as "no payload
+          # leaked". That is the shape CLAUDE.md O6b forbids: an absent
+          # measurement counted as a passing one. proof_f4_kernel.rs asserts the
+          # same thing with a hard assert, and this step is what stops the
+          # artefact from claiming a search that did not happen.
+          evidence = proof.get("evidence")
+          if not isinstance(evidence, dict):
+              sys.exit(f"the artefact carries no evidence block, so nothing here searched a record: evidence={evidence!r}")
+          for field in ("payload_marker_found_in_any_record",
+                        "ring_buffer_frames_dropped",
+                        "records_the_decoder_refused",
+                        "flows_recorded"):
+              if field not in evidence:
+                  sys.exit(f"the evidence block has no {field}, so this step is reading an artefact from a different gate")
+          leaked = evidence["payload_marker_found_in_any_record"]
+          if not isinstance(leaked, bool):
+              sys.exit(f"payload_marker_found_in_any_record is {leaked!r} and not a boolean, so it is not an answer")
+          if leaked:
               sys.exit("payload reached a record")
-          print(f"proved: {len(proof['proves'])} claims, {len(proof['does_not_prove'])} exclusions")
+          # A search over no record proves nothing, exactly as an empty surface
+          # list would.
+          if not evidence["flows_recorded"]:
+              sys.exit("the gate recorded no flow, so the payload search ran over nothing")
+          print(f"proved: {len(proof['proves'])} claims, {len(proof['does_not_prove'])} exclusions, "
+                f"{evidence['flows_recorded']} flows searched for the payload marker")
           CHECK
 
       - name: Publish the kernel proof
@@ -614,9 +638,35 @@ jobs:
 
       # The suite runs against the emitted JavaScript rather than the sources,
       # which is what the interpreter loads through --require at run time.
+      #
+      # The count is read for the reason O6b gives, and it is not hypothetical
+      # here: `node --test` exits zero over a file that declares no test, so a
+      # build that emitted an empty suite, or a rename that left the glob matching
+      # one stale file, would leave this job green with the hook's whole suite
+      # unrun. The Python job next door has had this floor since it was written.
       - name: Tests
         working-directory: hooks/node
-        run: node --test dist/*.test.js
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap dist/*.test.js 2>&1 | tee /tmp/hook-node-tests.txt
+          python3 - /tmp/hook-node-tests.txt "hooks/node" <<'CHECK'
+          import re, sys
+          path, package = sys.argv[1], sys.argv[2]
+          log = open(path).read()
+          def total(name):
+              found = re.findall(rf"^# {name} (\d+)$", log, re.MULTILINE)
+              if not found:
+                  sys.exit(f"{package}: the runner printed no '# {name}' line, so nothing here reported a run")
+              return sum(int(value) for value in found)
+          passed, failed, skipped = total("pass"), total("fail"), total("skipped")
+          if failed:
+              sys.exit(f"{package}: {failed} tests failed")
+          if passed == 0:
+              sys.exit(f"{package}: the runner found no test to run, so this step proved nothing")
+          if skipped:
+              sys.exit(f"{package}: {skipped} tests were skipped; this suite skips nothing")
+          print(f"{package}: {passed} tests ran, skipped 0")
+          CHECK
 
   mcp:
     name: MCP server
@@ -653,9 +703,34 @@ jobs:
       # added later ran on a developer machine and nowhere else, which is the
       # same defect this project exists to report: a check that looks like it
       # covers something and does not.
+      #
+      # And the count is read, for the same reason: the glob covers whatever is
+      # emitted, and `node --test` exits zero over a file with no test in it, so
+      # the exit code alone cannot tell a suite that ran from one that was not
+      # built (CLAUDE.md O6b).
       - name: Tests
         working-directory: packages/mcp-server
-        run: node --test dist/*.test.js
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap dist/*.test.js 2>&1 | tee /tmp/mcp-tests.txt
+          python3 - /tmp/mcp-tests.txt "packages/mcp-server" <<'CHECK'
+          import re, sys
+          path, package = sys.argv[1], sys.argv[2]
+          log = open(path).read()
+          def total(name):
+              found = re.findall(rf"^# {name} (\d+)$", log, re.MULTILINE)
+              if not found:
+                  sys.exit(f"{package}: the runner printed no '# {name}' line, so nothing here reported a run")
+              return sum(int(value) for value in found)
+          passed, failed, skipped = total("pass"), total("fail"), total("skipped")
+          if failed:
+              sys.exit(f"{package}: {failed} tests failed")
+          if passed == 0:
+              sys.exit(f"{package}: the runner found no test to run, so this step proved nothing")
+          if skipped:
+              sys.exit(f"{package}: {skipped} tests were skipped; this suite skips nothing")
+          print(f"{package}: {passed} tests ran, skipped 0")
+          CHECK
 
       # Every contract under schemas/ has had an ajv gate from the start except
       # the MCP tool surface, which had only prose. Four deviations between

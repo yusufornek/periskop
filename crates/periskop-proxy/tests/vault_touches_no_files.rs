@@ -14,19 +14,37 @@
 //! 1. **Watching.** A whole vault lifetime runs, from passphrase to purge, with
 //!    the working directory and `~/.periskop` listed before and after. Any new,
 //!    removed or resized entry fails.
-//! 2. **Reading our own source.** Every module under `src/vault/` is scanned for
-//!    the names of filesystem APIs, and there are no exceptions. This is the same
+//! 2. **Reading our own source.** Every module under `src/` is scanned for the
+//!    names of filesystem APIs, against a written allowance. This is the same
 //!    device ADR-014 used for its `unsafe` boundary, and it is here for the same
 //!    reason: a boundary written down before anything crosses it is a boundary,
 //!    and one written afterwards is a description.
 //!
 //! **The `file` backend has arrived** (`vault.psk`, milestone 71 and 72) and this
 //! test did fail, which was the intended behaviour rather than an obstacle. Two
-//! modules were added to `MAY_TOUCH_FILES` below, by name and with a reason, so
+//! modules were added to `MAY_TOUCH_FILES` below, by path and with a reason, so
 //! that persistence is a decision somebody signed rather than an edit. What must
 //! never happen is the allowance being widened to the whole vault: the facade, the
 //! keys, the records, the sessions, the byte layout and the chain are all still
 //! scanned, and none of them may open a file.
+//!
+//! # Why the scan is the crate and not the vault subtree
+//!
+//! It read `src/vault` alone, and the claim it was making is not a claim about a
+//! directory. The thing that may not reach a disk is the map from alias back to a
+//! real person, and that map is at its widest **outside** the vault: it is read
+//! out of a request body in `http`, scanned in `detect`, minted in `alias` and put
+//! back into an answer in `http::stream`. A `std::fs::write` of a request record,
+//! a findings dump or a debug snapshot in any of those modules was a new disk
+//! surface that this scan could not see, while the file's own summary said the
+//! default configuration writes nothing to a disk. `vault_no_plaintext.rs`'s
+//! `no_source_writes_to_a_process_stream` had exactly this hole and was widened
+//! for exactly this reason; this is the other half of the same correction.
+//!
+//! Widening the scan means the allowance has to name **paths** rather than file
+//! names. A bare `file.rs` was unambiguous inside one directory and would hand a
+//! future `src/http/file.rs` the vault backend's permission the day somebody
+//! created it.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -36,24 +54,48 @@ use periskop_proxy::vault::{
     ALIAS_SEED_BYTES,
 };
 
-/// Vault modules allowed to name a filesystem API.
+/// Modules of this crate allowed to name a filesystem API, by path under `src/`.
 ///
-/// Every entry here is a place where the alias to person map can reach a disk, so
-/// every entry carries the reason it is allowed to:
+/// Paths and not file names: the scan covers the whole crate, and a bare
+/// `file.rs` would silently extend the vault backend's permission to any future
+/// module that happened to be called the same thing.
 ///
-/// - **`file.rs`** owns `vault.psk`: it creates the file, reads it back, verifies
-///   the chain over it and appends to it. It is the `file` backend
+/// The first two are the only places the alias to person map can reach a disk,
+/// and each carries the reason it is allowed to:
+///
+/// - **`vault/file.rs`** owns `vault.psk`: it creates the file, reads it back,
+///   verifies the chain over it and appends to it. It is the `file` backend
 ///   (`proxy/spec.md` section 9), which is opt in and is not the default.
-/// - **`compaction.rs`** owns the swap: it writes the rebuilt file beside the old
-///   one and renames it over. ADR-007 requires the rename to be atomic, and a
-///   rename is a filesystem call.
+/// - **`vault/compaction.rs`** owns the swap: it writes the rebuilt file beside
+///   the old one and renames it over. ADR-007 requires the rename to be atomic,
+///   and a rename is a filesystem call.
 ///
-/// Nothing else may appear here. In particular `mod.rs` may not: the facade
+/// The next three came with the widening and are reads of configuration, in the
+/// opposite direction to the one this test is about. They are listed rather than
+/// waved through, because "it only reads" is a claim about today's code and this
+/// list is what makes changing it a decision:
+///
+/// - **`policy/load.rs`** reads the policy document and the dictionary the policy
+///   points at. Both are operator authored input; nothing derived from a prompt
+///   travels back out through it.
+/// - **`detect/affix.rs`** reads `rules/masking/<language>/affixes.toml`, which is
+///   rule data shipped with the build.
+/// - **`alias/entity.rs`** reads `schemas/proxy-policy.schema.json` in its own
+///   test, so that the entity registry and the contract's closed set cannot drift
+///   apart unnoticed.
+///
+/// Nothing else may appear here. In particular `vault/mod.rs` may not: the facade
 /// decides *whether* records are persisted, and if it could also write them the
 /// two modules above would stop being the whole of the disk surface. The
 /// `file`-backed tests of the facade live in `tests/vault_file_backend.rs` for
 /// exactly that reason.
-const MAY_TOUCH_FILES: &[&str] = &["file.rs", "compaction.rs"];
+const MAY_TOUCH_FILES: &[&str] = &[
+    "vault/file.rs",
+    "vault/compaction.rs",
+    "policy/load.rs",
+    "detect/affix.rs",
+    "alias/entity.rs",
+];
 
 /// What a filesystem call looks like in this codebase.
 ///
@@ -136,29 +178,33 @@ fn a_whole_vault_lifetime_leaves_the_filesystem_as_it_found_it() {
 }
 
 #[test]
-fn no_vault_module_names_a_filesystem_api() {
-    let vault_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vault");
+fn no_module_of_this_crate_names_a_filesystem_api_without_an_allowance() {
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut sources = Vec::new();
-    collect_rust_sources(&vault_root, &mut sources);
+    collect_rust_sources(&source_root, &mut sources);
 
     // A scan that found nothing to scan would pass silently, which is the failure
-    // shape this repository has been bitten by before.
+    // shape this repository has been bitten by before. The floor is the crate
+    // rather than the vault subtree now, so it is a number this crate cannot fall
+    // below without somebody having deleted most of it.
     assert!(
-        sources.len() >= 5,
-        "only {} vault sources found under {}",
+        sources.len() >= 40,
+        "only {} sources found under {}, so this scan is reading a fraction of the crate",
         sources.len(),
-        vault_root.display()
+        source_root.display()
+    );
+    // And the vault is inside what was read, because it is the subtree the claim
+    // at the top of this file is about.
+    assert!(
+        sources.iter().any(|path| path.ends_with("vault/record.rs")),
+        "the scan did not reach the vault sources"
     );
 
     let mut offences = Vec::new();
     let mut allowance_used: BTreeSet<&str> = BTreeSet::new();
     for source in &sources {
-        let name = source
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_owned();
-        if let Some(allowed) = MAY_TOUCH_FILES.iter().find(|entry| **entry == name) {
+        let path = relative_to(&source_root, source);
+        if let Some(allowed) = MAY_TOUCH_FILES.iter().find(|entry| **entry == path) {
             if names_a_filesystem_api(source) {
                 allowance_used.insert(allowed);
             }
@@ -175,17 +221,22 @@ fn no_vault_module_names_a_filesystem_api() {
             }
             for api in FILESYSTEM_APIS {
                 if code.contains(api) {
-                    offences.push(format!("{name}:{} names {api}", number + 1));
+                    offences.push(format!("{path}:{} names {api}", number + 1));
                 }
             }
         }
     }
 
-    assert!(offences.is_empty(), "{offences:#?}");
+    assert!(
+        offences.is_empty(),
+        "a module of this crate names a filesystem API and is not on MAY_TOUCH_FILES. \
+         The alias to person map is at its widest outside the vault, so a write here is \
+         a disk surface nothing else in this repository is looking at: {offences:#?}"
+    );
 
     // An exception nobody needs is an exception that quietly widens the boundary
-    // the next time somebody adds a file. Every name on the list has to be a
-    // module that actually writes, or it comes off the list.
+    // the next time somebody adds a file. Every path on the list has to be a
+    // module that actually names one, or it comes off the list.
     let unused: Vec<&&str> = MAY_TOUCH_FILES
         .iter()
         .filter(|entry| !allowance_used.contains(**entry))
@@ -194,6 +245,18 @@ fn no_vault_module_names_a_filesystem_api() {
         unused.is_empty(),
         "these modules are allowed to touch files and do not: {unused:?}"
     );
+}
+
+/// A source path as the allowance list spells it: relative to `src/`, with
+/// forward slashes.
+fn relative_to(root: &Path, source: &Path) -> String {
+    source
+        .strip_prefix(root)
+        .unwrap_or(source)
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<String>>()
+        .join("/")
 }
 
 /// Whether one source names a filesystem API, by the same screen the scan uses.

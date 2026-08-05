@@ -128,6 +128,10 @@ pub struct Metrics {
     refusals_total: u64,
     masked_entities_total: u64,
     stream_reassembly_errors_total: u64,
+    /// Findings dropped from the in-process buffer because it was full.
+    findings_evicted_total: u64,
+    /// Event records dropped from the in-process buffer because it was full.
+    events_evicted_total: u64,
     /// Added latency samples, most recent first, bounded.
     added_latency_ms: Vec<u64>,
 }
@@ -164,6 +168,45 @@ impl Metrics {
     /// is visibly missing.
     pub fn record_stream_reassembly_error(&mut self) {
         self.stream_reassembly_errors_total += 1;
+    }
+
+    /// Records findings the gateway's bounded buffer had to drop.
+    ///
+    /// Both buffers in `http::gateway` are bounded on purpose, because an
+    /// unbounded list per request is a leak in a long lived process. What was
+    /// missing is the other half: the oldest entry was removed with `remove(0)`
+    /// and nothing anywhere said so, so an auditor reading `/admin/findings`
+    /// could not tell a complete list from a window onto one. A day that
+    /// produced 1200 `unmasked_passthrough` findings showed 1024 of them and
+    /// read as if the first 176 had never happened. This repository's own rule
+    /// is that a loss is not discarded without being declared, and these two
+    /// counters are where the declaration goes.
+    ///
+    /// **Not in `proxy-api.md`'s counter set.** That document enumerates the
+    /// `GET /admin/metrics` counters in prose and adding a name is widening it,
+    /// which this role may not do (CLAUDE.md A3). The request is filed in
+    /// `hub/memory/interfaces.md` and owned on `hub/task-board.md`; until it is
+    /// answered the number exists and is readable, which is strictly better than
+    /// a loss nothing counts.
+    pub fn record_findings_evicted(&mut self, dropped: u64) {
+        self.findings_evicted_total = self.findings_evicted_total.saturating_add(dropped);
+    }
+
+    /// The same declaration for the event buffer; see
+    /// [`Self::record_findings_evicted`].
+    pub fn record_events_evicted(&mut self, dropped: u64) {
+        self.events_evicted_total = self.events_evicted_total.saturating_add(dropped);
+    }
+
+    /// How many findings this process dropped, for a caller that wants the
+    /// number without parsing the exposition format.
+    pub fn findings_evicted_total(&self) -> u64 {
+        self.findings_evicted_total
+    }
+
+    /// How many event records this process dropped.
+    pub fn events_evicted_total(&self) -> u64 {
+        self.events_evicted_total
     }
 
     pub fn requests_total(&self) -> u64 {
@@ -216,6 +259,18 @@ impl Metrics {
             "periskop_proxy_stream_reassembly_errors_total",
             "Stream events that could not be reassembled.",
             self.stream_reassembly_errors_total,
+        );
+        counter(
+            "periskop_proxy_findings_evicted_total",
+            "Findings dropped from the in-process buffer because it was full. \
+             A non zero value means /admin/findings is a window and not the whole list.",
+            self.findings_evicted_total,
+        );
+        counter(
+            "periskop_proxy_events_evicted_total",
+            "Event records dropped from the in-process buffer because it was full. \
+             A non zero value means the event list is a window and not the whole list.",
+            self.events_evicted_total,
         );
 
         out.push_str(

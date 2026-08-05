@@ -101,18 +101,7 @@ pub(super) fn compact(file: &mut VaultFile, frames: &[Frame]) -> Result<Compacte
         drop(handle);
         return Err(match std::fs::remove_file(&candidate) {
             Ok(()) => refusal,
-            // Both facts, in that order. The reason the swap was refused is what
-            // an operator has to act on, and it used to be replaced by whatever
-            // the cleanup hit: a compaction refused because a second opener had
-            // committed a record reported a file permission problem instead, and
-            // the refusal it was actually protecting against went unsaid. The
-            // leftover candidate is the second fact and stays, because the next
-            // compaction clears it silently and this message is the only place
-            // it is ever visible.
-            Err(cause) => VaultError::VaultFileUnavailable {
-                operation: "compacted, and its candidate could not be removed either",
-                cause: format!("{:?}; the swap was refused first: {refusal}", cause.kind()),
-            },
+            Err(cause) => with_leftover_candidate(refusal, &cause),
         });
     }
 
@@ -141,6 +130,46 @@ pub(super) fn compact(file: &mut VaultFile, frames: &[Frame]) -> Result<Compacte
         before,
         after: file.frame_count(),
     })
+}
+
+/// Adds "and the candidate is still beside the vault" to a refusal without
+/// changing what the refusal **is**.
+///
+/// Both facts, in that order. The reason the swap was refused is what an operator
+/// has to act on, and it used to be replaced outright by whatever the cleanup hit:
+/// a compaction refused because a second opener had committed a record reported a
+/// file permission problem instead.
+///
+/// The first correction kept the refusal's sentence and still replaced its
+/// **variant**, which is the half a caller reads rather than prints.
+/// `http::errors` derives `ProxyError` from the variant alone, so a refusal that
+/// came back as `IntegrityFailed` and was relabelled `VaultFileUnavailable`
+/// reached the request path as `vault_unavailable`, the "stop and fix the
+/// environment" value, instead of `vault_integrity_failed`, which `proxy/spec.md`
+/// section 10 says is a security event that is never recovered from. A failed
+/// `remove_file` cannot be allowed to decide that.
+///
+/// So the note is merged only into the variant that has somewhere to put it, and
+/// every other refusal is returned exactly as it came. That is not a loss of the
+/// second fact: a candidate that cannot be removed is refused again by
+/// [`remove_stale`] on the next compaction, under its own operation string.
+fn with_leftover_candidate(refusal: VaultError, cause: &std::io::Error) -> VaultError {
+    match refusal {
+        VaultError::VaultFileUnavailable {
+            operation,
+            cause: why,
+        } => VaultError::VaultFileUnavailable {
+            // The operation the refusal named, not one this function invents: it
+            // is the step that failed, and the cleanup is a consequence of it.
+            operation,
+            cause: format!(
+                "{why}; its compaction candidate could not be removed either ({:?}), so a file \
+                 nobody was told about is beside the vault",
+                cause.kind()
+            ),
+        },
+        other => other,
+    }
 }
 
 fn candidate_path(vault: &Path) -> PathBuf {
@@ -470,6 +499,52 @@ mod tests {
         let reloaded = open_here(&scratch.vault(), CounterFloor::AtLeast(4)).unwrap();
         assert_eq!(reloaded.frames.len(), 4);
         assert_eq!(reloaded.frames[3].alias, "PSK_PERSON_9");
+    }
+
+    /// A cleanup that failed may add to the refusal and may not become it.
+    ///
+    /// The half the first correction left open. It kept the refusal's sentence
+    /// and still replaced its variant, and the variant is what `http::errors`
+    /// turns into a `ProxyError`: an integrity failure relabelled
+    /// `VaultFileUnavailable` reaches the request path as `vault_unavailable`
+    /// rather than as `vault_integrity_failed`, so a security event
+    /// `proxy/spec.md` section 10 forbids recovering from arrives as an
+    /// environment problem to retry. A `remove_file` that returned
+    /// `PermissionDenied` decided that.
+    #[test]
+    fn a_failed_cleanup_adds_to_the_refusal_and_never_relabels_it() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+        // The security refusal keeps its own variant, whole.
+        let integrity = VaultError::IntegrityFailed {
+            integrity: super::super::Integrity::ChainMismatch,
+        };
+        let carried = with_leftover_candidate(integrity, &denied);
+        assert!(
+            matches!(carried, VaultError::IntegrityFailed { .. }),
+            "a failed cleanup relabelled a security refusal: {carried:?}"
+        );
+        assert_eq!(
+            crate::http::errors::ProxyError::from(&carried),
+            crate::http::errors::ProxyError::VaultIntegrityFailed
+        );
+
+        // And the availability refusal, which has somewhere to put the note,
+        // keeps its own operation and gains the second fact.
+        let unavailable = VaultError::VaultFileUnavailable {
+            operation: "compacted",
+            cause: "another opener is writing to it".to_owned(),
+        };
+        let merged = with_leftover_candidate(unavailable, &denied);
+        match &merged {
+            VaultError::VaultFileUnavailable { operation, cause } => {
+                assert_eq!(*operation, "compacted");
+                assert!(cause.contains("another opener is writing to it"), "{cause}");
+                assert!(cause.contains("PermissionDenied"), "{cause}");
+                assert!(cause.contains("candidate could not be removed"), "{cause}");
+            }
+            other => panic!("the refusal changed variant: {other:?}"),
+        }
     }
 
     /// The candidate is beside the vault, which is what keeps the rename on one

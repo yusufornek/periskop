@@ -82,12 +82,28 @@ impl Finding {
     /// `finding_id`: `fnd_` and sixteen hex characters.
     ///
     /// Content addressed over the four inputs `finding.schema.json` names (kind,
-    /// source, primary ref and the rule identifier) and over nothing else, so the
-    /// same gap in the same conversation is the same finding on every run. There
-    /// is no wall clock in the inputs, which is what keeps a re-run byte
-    /// identical. The primary ref carries the whole of the condition: see
-    /// `Subject::exchange` for the one session origin under which a conversation
-    /// cannot be the same one twice.
+    /// source, primary ref and the rule identifier) and over nothing else, which
+    /// is the schema's rule for this field and is satisfied here in full: no wall
+    /// clock, no counter and no process identity is hashed, so this function is a
+    /// pure function of the record it names.
+    ///
+    /// **What that does not buy is determinism across runs, and the difference is
+    /// the primary ref.** Content addressing makes the identifier reproducible
+    /// exactly as far as its inputs are, and one of the four is
+    /// [`Subject::exchange`], which is derived from the alias scope. Under
+    /// `session::Origin::Ephemeral` that scope comes fresh from the operating
+    /// system's entropy on every request (`http::session::fresh`, `getrandom`), so
+    /// two identical unanchored requests produce two different `finding_id`s.
+    /// That is not a defect in the derivation and cannot be fixed in it: under
+    /// that origin there is no "same conversation" to reproduce, because a request
+    /// with no session header and no conversation anchor is a conversation of one
+    /// by construction. Under the other two origins, which are the ones an
+    /// integrated client uses, the whole identifier reproduces byte for byte.
+    ///
+    /// `the_finding_id_reproduces_exactly_as_far_as_its_primary_ref_does` is what
+    /// holds both halves of that sentence, so the condition is a checked property
+    /// rather than a paragraph. The limit itself is filed for
+    /// `docs/05-quality/known-gaps.md`, which this role does not write.
     pub fn id(&self) -> String {
         format!(
             "fnd_{}",
@@ -515,6 +531,81 @@ mod tests {
         )
         .unwrap();
         assert_ne!(once.finding().id(), elsewhere.finding().id());
+    }
+
+    /// The determinism claim, with its condition, asserted rather than described.
+    ///
+    /// `finding.schema.json` calls `finding_id` "deterministic, content addressed"
+    /// and this build satisfies the derivation half exactly: the four named inputs
+    /// and nothing else. The half that is **not** unconditional is the primary
+    /// ref, which is derived from the alias scope, and `session::Binding::identify`
+    /// draws that scope from `getrandom` whenever a request arrives with no
+    /// session header and no conversation anchor. Both halves are pinned here
+    /// because the file used to claim the first and leave the second in prose, and
+    /// an auditor who diffed two runs of an unanchored request would have found a
+    /// difference nothing in this repository predicted.
+    #[test]
+    fn the_finding_id_reproduces_exactly_as_far_as_its_primary_ref_does() {
+        // Half one: a reproducible scope reproduces the whole identifier, and it
+        // is a pure function of the record rather than of when it was built.
+        let anchored = Declared::make(Gap::ToolArguments, true, true, subject())
+            .unwrap()
+            .finding()
+            .id();
+        let again = Declared::make(Gap::ToolArguments, true, true, subject())
+            .unwrap()
+            .finding()
+            .id();
+        assert_eq!(anchored, again);
+
+        // Half two: the ephemeral origin's scope is what `http::session::fresh`
+        // produces, and two of those are two conversations. Drawn from the same
+        // entropy source rather than from two literals, so this asserts the real
+        // condition and not a restatement of "different input, different hash".
+        let scopes: Vec<String> = (0..2)
+            .map(|_| {
+                let mut bytes = [0u8; 16];
+                getrandom::fill(&mut bytes).expect("the operating system has entropy");
+                bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+            })
+            .collect();
+        assert_ne!(scopes[0], scopes[1], "the entropy source repeated itself");
+        let ephemeral: Vec<String> = scopes
+            .iter()
+            .map(|scope| {
+                Declared::make(
+                    Gap::ToolArguments,
+                    true,
+                    true,
+                    Subject {
+                        scope,
+                        provider: "anthropic",
+                    },
+                )
+                .unwrap()
+                .finding()
+                .id()
+            })
+            .collect();
+        assert_ne!(
+            ephemeral[0], ephemeral[1],
+            "two unanchored requests produced one finding_id, so the scope is not what \
+             the primary ref is derived from and the condition above is describing \
+             something else"
+        );
+
+        // And the identifier still satisfies the schema's shape under that origin,
+        // because a limit on reproducibility is not permission to write a
+        // malformed identifier.
+        for id in &ephemeral {
+            assert!(id.starts_with("fnd_") && id.len() == 20, "{id}");
+            assert!(
+                id.get(4..).unwrap_or_default().chars().all(|character| {
+                    character.is_ascii_hexdigit() && !character.is_ascii_uppercase()
+                }),
+                "{id}"
+            );
+        }
     }
 
     /// The one thing this record may never hold.
