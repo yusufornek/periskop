@@ -15,5 +15,12 @@
 [toolchain]
 channel = "nightly-2026-02-01"
 components = ["rust-src"]
-targets = ["bpfel-unknown-none"]
 profile = "minimal"
+
+# `targets` is deliberately absent, and leaving it out is the whole reason this
+# builds at all. Listing a target there tells rustup to download a precompiled
+# `rust-std` for it, and `bpfel-unknown-none` has none to download: that is the
+# same fact that forces `build-std` in `.cargo/config.toml`. The first CI run of
+# this job failed on exactly that line, with "component 'rust-std' for target
+# 'bpfel-unknown-none' is unavailable for download". The target specification
+# itself is built into rustc, and `core` is compiled from `rust-src` above.
