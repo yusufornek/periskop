@@ -549,11 +549,11 @@ fn run_offline(class: &TaskClass) -> Mechanical {
     for event in gateway.events() {
         let document: Value = serde_json::from_str(&event.to_json()).unwrap();
         for entry in document["entities_masked"].as_array().into_iter().flatten() {
-            let count = entry["count"].as_u64().unwrap_or(0);
+            let count = counted(entry, &["count"], &document);
             measured.masked_entities += count;
             *measured
                 .by_type
-                .entry(entry["type"].as_str().unwrap_or("?").to_owned())
+                .entry(named(entry, "type", &document))
                 .or_insert(0) += count;
         }
         for (_, stat) in document["alias_stats"]["by_type"]
@@ -563,21 +563,23 @@ fn run_offline(class: &TaskClass) -> Mechanical {
         {
             *measured
                 .ladder_rungs
-                .entry(stat["ladder_rung"].as_str().unwrap_or("?").to_owned())
-                .or_insert(0) += stat["count"].as_u64().unwrap_or(0);
+                .entry(named(stat, "ladder_rung", &document))
+                .or_insert(0) += counted(stat, &["count"], &document);
         }
-        measured.alias_pool_exhausted += document["alias_stats"]["alias_pool_exhausted"]
-            .as_u64()
-            .unwrap_or(0);
-        measured.aliases_seen += document["restore_stats"]["aliases_seen_in_response"]
-            .as_u64()
-            .unwrap_or(0);
-        measured.aliases_restored_exact += document["restore_stats"]["aliases_restored"]
-            .as_u64()
-            .unwrap_or(0);
-        measured.aliases_leaked += document["restore_stats"]["aliases_leaked"]
-            .as_u64()
-            .unwrap_or(0);
+        measured.alias_pool_exhausted += counted(
+            &document,
+            &["alias_stats", "alias_pool_exhausted"],
+            &document,
+        );
+        measured.aliases_seen += counted(
+            &document,
+            &["restore_stats", "aliases_seen_in_response"],
+            &document,
+        );
+        measured.aliases_restored_exact +=
+            counted(&document, &["restore_stats", "aliases_restored"], &document);
+        measured.aliases_leaked +=
+            counted(&document, &["restore_stats", "aliases_leaked"], &document);
     }
 
     // The round trip claim: what the client got back holds the values the client
@@ -595,6 +597,49 @@ fn run_offline(class: &TaskClass) -> Mechanical {
         }
     }
     measured
+}
+
+/// One counter out of a measurement record, or this run stops.
+///
+/// The aggregation above used to read every counter with `unwrap_or(0)`, and
+/// that is a worse default here than anywhere else in this file, because the
+/// sum it feeds is compared against zero afterwards. The assertion looks like it
+/// could catch a missing measurement: it compares a `Value` and would see
+/// `Null`. It never could, because the aggregator turned the `Null` into a zero
+/// before the assertion was reached. Rename `aliases_leaked` and every class
+/// adds nothing to the total, every cell publishes `"aliases_leaked": 0`, and
+/// the artefact says no alias left any class unresolved on the strength of a
+/// field nobody read. `aliases_seen` and `aliases_restored` are the numerator
+/// and denominator of `restore_recovery_rate`, so the same absence publishes a
+/// rate as well.
+fn counted(value: &Value, path: &[&str], document: &Value) -> u64 {
+    let mut cursor = value;
+    for key in path {
+        cursor = &cursor[*key];
+    }
+    match cursor.as_u64() {
+        Some(count) => count,
+        None => panic!(
+            "the measurement record carries no `{}` counter, so this class measured nothing \
+             there and the cell may not publish a number for it: {document}",
+            path.join(".")
+        ),
+    }
+}
+
+/// The label a counter is filed under, on the same terms.
+///
+/// `unwrap_or("?")` put every entity type and every ladder rung into one bucket
+/// named `?` the moment a field was renamed, and a `?` row in the artefact reads
+/// as a category rather than as a failure to read one.
+fn named(value: &Value, field: &str, document: &Value) -> String {
+    match value[field].as_str() {
+        Some(name) => name.to_owned(),
+        None => panic!(
+            "the measurement record carries no `{field}`, so this row cannot say what it \
+             counted: {document}"
+        ),
+    }
 }
 
 /// Every synthetic value this file plants in a prompt.

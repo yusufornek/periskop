@@ -168,11 +168,19 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 20, 0);
 ///
 /// What a full map costs, stated rather than implied: this is a plain hash map,
 /// not an LRU one, so the kernel refuses the insert rather than evicting
-/// somebody. The call that could not stash its socket produces no record at all,
-/// which is a loss this object does not count. It is the one loss here that the
-/// coverage statement cannot name, and it is recorded as such rather than hidden
-/// behind a map type whose eviction would have made it look like nothing
-/// happened.
+/// somebody, and the call that could not stash its socket produces no record at
+/// all. It is a loss that never reaches the ring buffer, so the ring buffer's
+/// own loss counter cannot see it.
+///
+/// It used to be uncounted for that reason, and the sentence recording the
+/// decision said there was no counter it belonged in. There is now:
+/// [`DROPPED_UNTRACKED_CALLS`]. The reason it had to exist is that the absence
+/// was not neutral. A machine under load fills this map, no record is produced,
+/// `dropped_events` stays at zero because nothing was dropped from the buffer,
+/// and the coverage statement then reads as a complete capture of a period in
+/// which flows went unobserved. That is the confusion between "there was none"
+/// and "I could not tell" this product exists to argue against, appearing in
+/// this product.
 #[map]
 static IN_FLIGHT: HashMap<u64, u64> = HashMap::with_max_entries(10_240, 0);
 
@@ -184,13 +192,29 @@ static IN_FLIGHT: HashMap<u64, u64> = HashMap::with_max_entries(10_240, 0);
 #[map]
 static CONFIG: Array<u64> = Array::with_max_entries(4, 0);
 
-/// Frames the ring buffer had no room for.
+/// The two losses this object can see, one per slot.
 ///
-/// Counted here because this is the only side that sees a reservation fail. The
-/// loader reads it and the sensor declares it, so a run that lost a thousand
+/// Counted here because this is the only side that sees either of them. The
+/// loader reads them and the sensor declares them, so a run that lost a thousand
 /// records does not look like a run that lost none.
+///
+/// Two slots rather than one sum. A frame the ring buffer had no room for and a
+/// call that could not be tracked are different losses with different remedies:
+/// the first is a buffer to enlarge, the second is a map to enlarge, and a
+/// single number would let either present itself as the other. That is the same
+/// reason the loader keeps `undecodable` apart from `dropped`.
 #[map]
-static DROPPED: Array<u64> = Array::with_max_entries(1, 0);
+static DROPPED: Array<u64> = Array::with_max_entries(2, 0);
+
+/// Frames the ring buffer had no room for.
+const DROPPED_RING_FRAMES: u32 = 0;
+
+/// Calls that produced no record because [`IN_FLIGHT`] was full.
+///
+/// One increment per entry probe that could not stash its socket. It is not a
+/// count of lost flows: the same connection may be missed on several calls, and
+/// nothing on this side can tell. So it is a floor, and the sensor says so.
+const DROPPED_UNTRACKED_CALLS: u32 = 1;
 
 const CONFIG_WALL_OFFSET_NS: u32 = 0;
 const CONFIG_ATTACHED_AT_NS: u32 = 1;
@@ -222,9 +246,9 @@ pub fn periskop_connect_entry(ctx: ProbeContext) -> u32 {
     };
     // The insert can fail, and what it costs is stated on the map: a full map
     // means this call is not tracked and produces no record at all. Nothing here
-    // can recover from that, and there is no counter it belongs in, so it is
-    // discarded deliberately rather than by omission.
-    let _ = IN_FLIGHT.insert(bpf_get_current_pid_tgid(), sk as u64, 0);
+    // can recover from that, so what is left is to count it, which is what
+    // `track_in_flight` does.
+    track_in_flight(sk);
     0
 }
 
@@ -293,11 +317,9 @@ pub fn periskop_tcp_recvmsg_entry(ctx: ProbeContext) -> u32 {
     let Some(sk) = ctx.arg::<*const u8>(0) else {
         return 0;
     };
-    // The insert can fail, and what it costs is stated on the map: a full map
-    // means this call is not tracked and produces no record at all. Nothing here
-    // can recover from that, and there is no counter it belongs in, so it is
-    // discarded deliberately rather than by omission.
-    let _ = IN_FLIGHT.insert(bpf_get_current_pid_tgid(), sk as u64, 0);
+    // Same loss and the same counter as the connect entry probe; see
+    // `track_in_flight`.
+    track_in_flight(sk);
     0
 }
 
@@ -488,11 +510,34 @@ fn emit<const N: usize>(frame: &[u8; N]) {
     if EVENTS.output::<[u8; N]>(frame, 0).is_ok() {
         return;
     }
-    // SAFETY: the pointer addresses this object's own single element array, and
-    // nothing else in this program writes to it, so there is no other reference
-    // to the slot while it is incremented.
-    if let Some(slot) = DROPPED.get_ptr_mut(0) {
-        unsafe { *slot = (*slot).saturating_add(1) };
+    count_loss(DROPPED_RING_FRAMES);
+}
+
+/// Adds one to a slot of [`DROPPED`].
+///
+/// Saturating rather than wrapping: a counter that rolled over would report a
+/// busy machine as a quiet one, which is the failure the counter exists to
+/// prevent. A slot the kernel will not hand back is left alone, because there is
+/// nothing here that could carry that fact anywhere.
+fn count_loss(slot: u32) {
+    // SAFETY: the pointer addresses this object's own array, and nothing else in
+    // this program writes to it, so there is no other reference to the slot
+    // while it is incremented.
+    if let Some(counter) = DROPPED.get_ptr_mut(slot) {
+        unsafe { *counter = (*counter).saturating_add(1) };
+    }
+}
+
+/// Stashes the socket a call is working on, counting the call if it cannot.
+///
+/// Both entry probes go through here, so the loss is counted in one place and
+/// the two probes cannot drift apart on whether they report it.
+fn track_in_flight(sk: *const u8) {
+    if IN_FLIGHT
+        .insert(bpf_get_current_pid_tgid(), sk as u64, 0)
+        .is_err()
+    {
+        count_loss(DROPPED_UNTRACKED_CALLS);
     }
 }
 

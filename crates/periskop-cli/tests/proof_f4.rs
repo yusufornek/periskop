@@ -1406,10 +1406,21 @@ fn one_run(
     );
 
     // -- Claim 4: the two counters that may not be anything but zero ----------
-    let restore = &event["restore_stats"];
-    let stream = &event["stream_stats"];
-    let leaked = restore["aliases_leaked"].as_u64().unwrap_or(u64::MAX);
-    let flushed = stream["partial_alias_flushed"].as_u64().unwrap_or(u64::MAX);
+    //
+    // Read through `required_count`, so an absent counter fails here instead of
+    // arriving as a zero that satisfies the two assertions below by itself.
+    let leaked = required_count(
+        &event,
+        &["restore_stats", "aliases_leaked"],
+        policy,
+        &event_json,
+    );
+    let flushed = required_count(
+        &event,
+        &["stream_stats", "partial_alias_flushed"],
+        policy,
+        &event_json,
+    );
     assert_eq!(
         leaked, 0,
         "{policy}: an alias was delivered unresolved: {event_json}"
@@ -1418,10 +1429,21 @@ fn one_run(
         flushed, 0,
         "{policy}: part of an alias was flushed to the client: {event_json}"
     );
-    let seen_in_response = restore["aliases_seen_in_response"]
-        .as_u64()
-        .unwrap_or_default();
-    let restored = restore["aliases_restored"].as_u64().unwrap_or_default();
+    // `aliases_seen_in_response` is asserted nowhere and goes straight into the
+    // artefact, which is exactly why it needs the reader that refuses a default:
+    // it was the one counter whose absence nothing at all would have noticed.
+    let seen_in_response = required_count(
+        &event,
+        &["restore_stats", "aliases_seen_in_response"],
+        policy,
+        &event_json,
+    );
+    let restored = required_count(
+        &event,
+        &["restore_stats", "aliases_restored"],
+        policy,
+        &event_json,
+    );
     assert_eq!(
         restored, masked_values as u64,
         "{policy}: the response side did not resolve every alias it was sent: {event_json}"
@@ -1603,6 +1625,35 @@ fn required(event: &Value, field: &str, policy: &str, event_json: &str) -> Strin
     value.to_owned()
 }
 
+/// One counted field of the measurement record, on the same terms.
+///
+/// The numeric half of [`required`], and it was missing. The rule above is about
+/// **fields**, not about strings, and it was enforced on the strings alone:
+/// every counter came through `unwrap_or_default()`, which turns a renamed or
+/// unwritten field into a measured zero. That is fatal in both directions here.
+/// Two of this gate's claims assert that a counter **is** zero, so an absent
+/// field satisfies them for free; and the counters go on into
+/// `target/f4-proof.json`, where a zero nobody read is published beside
+/// `status: proved` and reads as a measurement.
+///
+/// The path is a list because the counters sit under `restore_stats` and
+/// `stream_stats`; indexing a `Value` with a missing key yields `Null`, so the
+/// walk is the same failure at whichever depth it happens.
+fn required_count(event: &Value, path: &[&str], policy: &str, event_json: &str) -> u64 {
+    let mut cursor = event;
+    for key in path {
+        cursor = &cursor[*key];
+    }
+    match cursor.as_u64() {
+        Some(count) => count,
+        None => panic!(
+            "{policy}: the measurement record carries no `{}` counter, so this run measured \
+             nothing there and the artefact may not publish a number for it: {event_json}",
+            path.join(".")
+        ),
+    }
+}
+
 /// How long a conversation's records live in the two ordinary runs.
 const LONG_TTL_MS: u64 = 3_600_000;
 
@@ -1682,12 +1733,26 @@ fn expired_records_are_counted_and_never_invented(
         .last()
         .unwrap_or_else(|| panic!("the second turn produced no measurement record"))
         .to_value();
-    let leaked = event["restore_stats"]["aliases_leaked"]
-        .as_u64()
-        .unwrap_or_default();
-    let restored = event["restore_stats"]["aliases_restored"]
-        .as_u64()
-        .unwrap_or_default();
+    // The same reader the ordinary runs use. `restored` is the one that made
+    // this necessary: the assertion under it is `restored == 0`, so reading the
+    // field with a default meant a renamed or unwritten counter passed the check
+    // by being absent. An expired record could then have been resolved twice
+    // over, `aliases_restored` could really have been two, and this positive
+    // control would still have reported that nothing was restored.
+    let policy = "expired-records";
+    let event_json = event.to_string();
+    let leaked = required_count(
+        &event,
+        &["restore_stats", "aliases_leaked"],
+        policy,
+        &event_json,
+    );
+    let restored = required_count(
+        &event,
+        &["restore_stats", "aliases_restored"],
+        policy,
+        &event_json,
+    );
 
     assert_eq!(
         leaked,

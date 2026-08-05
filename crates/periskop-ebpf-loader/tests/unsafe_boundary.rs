@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 /// being named after it.
 const DESIGNATED_MODULE: &str = "src/syscall.rs";
 
-/// How many times the exception may be opened in this crate.
+/// How many times the exception may be opened in this crate's shipped code.
 ///
 /// Three: `capget`, `capset` and `clock_gettime`, which is one call per thing
 /// the loader needs and `std` does not provide. Raising this is a decision about
@@ -64,7 +64,20 @@ const DESIGNATED_MODULE: &str = "src/syscall.rs";
 /// has to change on purpose and explain in a commit message. A budget rather
 /// than an exact match on the current count, because the point is to stop the
 /// surface growing, not to make refactoring inside it a test failure.
+///
+/// The count is over shipped code alone. The module's own test code opens the
+/// exception as well, to stand in for the kernel writing into the capability
+/// buffer, and that is the only shape of those two calls miri can interpret at
+/// all; counting it here would put the miri coverage and the size of the shipped
+/// surface into one number where neither could move without the other.
 const OPENING_BUDGET: usize = 3;
+
+/// The attribute that starts a file's test code.
+///
+/// Everything after it in a source file is compiled only under `cfg(test)` and
+/// ships in nothing. Assembled from parts for the reason the patterns below are:
+/// this file is inside its own scan.
+const TEST_ATTRIBUTE: &str = "#[cfg(test)]";
 
 /// The keyword, and the five things that may follow it when it is doing
 /// something rather than being talked about.
@@ -87,6 +100,9 @@ fn opening_forms() -> Vec<String> {
 struct Opening {
     file: String,
     line: usize,
+    /// Whether the opening sits after the file's `#[cfg(test)]` attribute, and
+    /// therefore ships in nothing.
+    in_test_code: bool,
 }
 
 fn source_files(directory: &Path, found: &mut Vec<PathBuf>) {
@@ -149,19 +165,36 @@ fn openings(include: impl Fn(&Path) -> bool) -> Vec<Opening> {
         }
         let file = relative(&path);
         let Ok(source) = fs::read_to_string(&path) else {
-            found.push(Opening { file, line: 0 });
+            found.push(Opening {
+                file,
+                line: 0,
+                in_test_code: false,
+            });
             continue;
         };
+        let mut in_test_code = false;
         for (index, line) in source.lines().enumerate() {
+            if line.trim_start().starts_with(TEST_ATTRIBUTE) {
+                in_test_code = true;
+            }
             if forms.iter().any(|form| line.contains(form.as_str())) {
                 found.push(Opening {
                     file: file.clone(),
                     line: index + 1,
+                    in_test_code,
                 });
             }
         }
     }
     found
+}
+
+/// The openings that end up in a shipped binary.
+fn shipped(openings: Vec<Opening>) -> Vec<Opening> {
+    openings
+        .into_iter()
+        .filter(|opening| !opening.in_test_code)
+        .collect()
 }
 
 fn is_designated(path: &Path) -> bool {
@@ -206,12 +239,60 @@ fn the_exception_surface_stays_within_its_budget() {
     // other half: the count of places the workspace steps outside its own
     // guarantee is fixed at a number somebody decided, and adding a fourth is a
     // failing test rather than a diff nobody read closely.
-    let inside = openings(is_designated);
+    let inside = shipped(openings(is_designated));
     assert!(
         inside.len() <= OPENING_BUDGET,
         "the unsafe surface grew past its budget of {OPENING_BUDGET}: {:?}",
         describe(&inside)
     );
+}
+
+#[test]
+fn the_designated_module_opens_the_exception_in_its_test_code_too() {
+    // ADR-014 §5 asks for a miri target for this crate, and miri does not
+    // execute foreign functions: `libc::syscall` stops the interpreter rather
+    // than being checked by it. So the interpretable part of `capget` and
+    // `capset` is what surrounds the call, and reaching it needs a stand-in that
+    // writes into the capability buffer the way the kernel does, through the
+    // same raw pointer. That stand-in is the exception opened in test code, and
+    // deleting it would leave `cargo miri test --lib` green over an exception it
+    // never interpreted, which is exactly the state this crate was in.
+    //
+    // Checked here rather than in the module because this file runs on every
+    // platform, and `src/syscall.rs` is compiled on Linux with a program object
+    // and nowhere else.
+    let in_tests: Vec<Opening> = openings(is_designated)
+        .into_iter()
+        .filter(|opening| opening.in_test_code)
+        .collect();
+    assert!(
+        !in_tests.is_empty(),
+        "{DESIGNATED_MODULE} has no stand-in for the kernel in its test code, so the miri job \
+         compiles the exception and interprets none of it"
+    );
+
+    // And that the stand-in is pointed at the shipped seams rather than at a
+    // buffer of its own. A test that allocated its own array and wrote into it
+    // would open the exception, satisfy the assertion above, and interpret code
+    // no binary contains.
+    //
+    // A file this cannot read becomes an empty source, which fails every
+    // assertion below rather than passing one. That is the same direction
+    // `openings` above is wrong in, and for the same reason: a check that reads
+    // an unreadable file as clean can be switched off by making a file
+    // unreadable.
+    let source = fs::read_to_string(package_root().join(DESIGNATED_MODULE)).unwrap_or_default();
+    let test_code = source
+        .split_once(TEST_ATTRIBUTE)
+        .map(|(_, tests)| tests)
+        .unwrap_or_default();
+    for seam in ["read_capabilities_with", "write_capabilities_with"] {
+        assert!(
+            test_code.contains(seam),
+            "{DESIGNATED_MODULE}'s test code does not drive `{seam}`, so the buffer the kernel \
+             fills is interpreted by nothing"
+        );
+    }
 }
 
 #[test]

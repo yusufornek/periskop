@@ -168,6 +168,28 @@ impl KernelEvents for PlatformKernel {
                 .entry("record_undecodable")
                 .or_insert(0) += batch.undecodable;
         }
+        // The third loss, and the one nothing above could see. A kernel probe
+        // whose in flight map is full produces no frame at all, so it never
+        // reaches the ring buffer and the ring buffer's counter is structurally
+        // blind to it: a machine in that state reported `dropped_events: 0`,
+        // which is what a machine that lost nothing reports.
+        //
+        // It goes into the same tally for the reason the line above gives, and
+        // under a key of its own because the remedy differs: an in flight map to
+        // enlarge rather than a decoder to fix.
+        //
+        // Read through the accessor, so a counter the kernel would not answer
+        // for arrives as `None` and adds nothing rather than arriving as a zero.
+        // A `None` here needs no second flag beside `dropped_events_unknown`:
+        // both counters are slots of one array read through one map lookup, so a
+        // kernel that will not answer for one will not answer for the other, and
+        // that state is already declared.
+        if let Some(untracked) = batch.untracked().filter(|count| *count > 0) {
+            *self
+                .rejected_samples
+                .entry("kernel_call_not_tracked")
+                .or_insert(0) += untracked;
+        }
         // Read before the events are consumed, and through the accessor rather
         // than off the number. The loader crate answers `None` when the kernel
         // would not read its loss counter, and copying `batch.dropped` across

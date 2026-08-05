@@ -291,6 +291,38 @@ jobs:
           cargo build --release
           ls -l target/bpfel-unknown-none/release/periskop-ebpf-object
 
+      # The formatting and lint gates for this crate, which had none.
+      #
+      # `cargo fmt --all --check` and `cargo clippy --workspace ...` in the Rust
+      # job scan the workspace rooted at the repository root. This package
+      # declares an empty `[workspace]` table and is therefore its own workspace
+      # root, for the three reasons its manifest gives, so it cannot enter that
+      # scan at all: no path from the root manifest reaches it. The only thing
+      # that touched it in this file was `cargo build --release` above, and a
+      # build says nothing about the lints. Clippy's raw pointer lints are the
+      # ones that matter here, because every helper call in `main.rs` is a read
+      # into kernel memory and the crate is the one place in the tree that cannot
+      # be exercised by a test on any development machine.
+      #
+      # The command is the one `src/main.rs` already documents, moved from a
+      # comment nobody runs into a step that fails the job. `RUSTC_BOOTSTRAP=1`
+      # is what lets a stable toolchain accept the `build-std` in
+      # `.cargo/config.toml`; it is redundant under the dated nightly this
+      # directory pins and is kept so that the line a developer runs and the line
+      # continuous integration runs are the same line. `rustfmt` and `clippy` are
+      # in that toolchain file's components for this step, and its `profile =
+      # "minimal"` would otherwise leave both uninstalled.
+      #
+      # Chained with `&&` so that a failing format check cannot be passed over by
+      # a later success (CLAUDE.md O6b).
+      - name: Formatting and lints for the kernel side object
+        working-directory: crates/periskop-ebpf-object
+        env:
+          RUSTC_BOOTSTRAP: 1
+        run: |
+          cargo fmt --check \
+            && cargo clippy --release -- -D warnings
+
       # The object's existence is what makes the loader a loader. Checked here
       # rather than trusted, because every later step would otherwise fall back
       # to the honest-but-useless `loader_not_built` path and still report green.
@@ -437,10 +469,33 @@ jobs:
       # miri run over a build with no unsafe in it is worse than no miri run: it
       # reads as coverage.
       #
-      # Nothing here reaches a kernel. Miri interprets rather than executes, and
-      # no test in the lib target calls `capget` or `capset`; what it is worth
-      # running against is the record decoder, which reads bytes this process did
-      # not write and is the one place an out of bounds read would live.
+      # Nothing here reaches a kernel, and that used to be written down as a
+      # reason this job was pointed at the record decoder rather than at the
+      # exception. `src/lib.rs` said the opposite in its own words, that the
+      # reason for the job is `syscall`, and the two sentences described two
+      # different modules while the code delivered neither: every path in the lib
+      # target that reaches `capget` or `capset` runs through `EbpfLoader::open`,
+      # and `missing_program` turns each of them back before it gets there. So
+      # this step compiled the exception, as `under_miri` insists, and
+      # interpreted none of it.
+      #
+      # Both halves are now real, and the reason they have to be two halves is a
+      # property of miri rather than a choice: **miri does not execute foreign
+      # functions**, so a test that reached `libc::syscall` would stop the
+      # interpreter with an unsupported operation instead of checking anything.
+      # What can be interpreted is everything around the call, which is where the
+      # defect would be:
+      #
+      #   * the capability buffer, through `read_capabilities_with` and
+      #     `write_capabilities_with` in `src/syscall.rs`. Their tests drive them
+      #     with a stand-in that writes as many blocks as the header's version
+      #     declares, through the same raw pointer, into the same stack array, so
+      #     a `CAP_BLOCKS` that stopped matching that version is an out of bounds
+      #     write the interpreter reports. `tests/unsafe_boundary.rs` fails on
+      #     every platform if those tests are removed.
+      #   * the record decoder, which reads bytes this process did not write and
+      #     is the other place an out of bounds read would live.
+      #
       # Isolation is off so that the monotonic clock reading in `syscall`'s own
       # tests resolves; it relaxes what the interpreter may ask the host for and
       # changes nothing about what it checks.

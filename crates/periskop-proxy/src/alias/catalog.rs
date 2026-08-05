@@ -268,12 +268,6 @@ impl FictionRange {
     pub const fn national_digits(&self) -> usize {
         self.head_digits + self.block.len() + self.tail_digits
     }
-
-    /// How many distinct numbers the range holds, saturating rather than
-    /// overflowing on a plan with many free digits.
-    pub fn capacity(&self) -> u64 {
-        10u64.saturating_pow((self.head_digits + self.tail_digits) as u32)
-    }
 }
 
 /// What is published about one country's numbering plan.

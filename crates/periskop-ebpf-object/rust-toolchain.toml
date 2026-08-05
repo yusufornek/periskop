@@ -14,7 +14,13 @@
 # or not at all. The pair in force is recorded in ADR-014 section 8.
 [toolchain]
 channel = "nightly-2026-02-01"
-components = ["rust-src"]
+# `rust-src` is what `build-std` compiles `core` from. `rustfmt` and `clippy` are
+# here because this package is its own workspace root, so the repository's
+# `cargo fmt --all --check` and `cargo clippy --workspace` cannot reach it and it
+# needs its own gate; `profile = "minimal"` below installs neither on its own, and
+# the step in `.github/workflows/ci.yml` that runs them would fail on a missing
+# component rather than on a finding.
+components = ["rust-src", "rustfmt", "clippy"]
 profile = "minimal"
 
 # `targets` is deliberately absent, and leaving it out is the whole reason this

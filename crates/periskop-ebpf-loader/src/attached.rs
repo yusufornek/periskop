@@ -40,6 +40,14 @@ const CONFIG_MAP: &str = "CONFIG";
 const EVENTS_MAP: &str = "EVENTS";
 const DROPPED_MAP: &str = "DROPPED";
 
+/// The two slots of `DROPPED`, in the order the kernel object declares them.
+///
+/// Kept apart rather than summed, because the two losses have different
+/// remedies: a ring buffer to enlarge and an in flight map to enlarge. A single
+/// number would let either present itself as the other.
+const DROPPED_RING_FRAMES: u32 = 0;
+const DROPPED_UNTRACKED_CALLS: u32 = 1;
+
 const CONFIG_WALL_OFFSET_NS: u32 = 0;
 const CONFIG_ATTACHED_AT_NS: u32 = 1;
 const CONFIG_BUCKET_SECS: u32 = 2;
@@ -146,7 +154,25 @@ impl Attached {
     /// between "I do not know" and "there is none" this whole product argues
     /// against.
     pub fn dropped(&self) -> Option<u64> {
-        self.dropped.get(&0, 0).ok()
+        self.dropped.get(&DROPPED_RING_FRAMES, 0).ok()
+    }
+
+    /// Calls the kernel program could not track, when the kernel will say how
+    /// many.
+    ///
+    /// The second loss this object can see, and the one the coverage statement
+    /// used to have no word for. An entry probe that cannot stash its socket in
+    /// the in flight map produces no record at all, so the loss never reaches
+    /// the ring buffer and the counter above cannot see it: a busy machine
+    /// reported `dropped_events: 0` while flows went unobserved, and an operator
+    /// reading that number read a complete capture.
+    ///
+    /// `None` for the same reason [`Self::dropped`] uses it, and a floor rather
+    /// than a count even when it is `Some`: one connection missed on several
+    /// calls increments this several times, and nothing on either side of the
+    /// seam can collapse them.
+    pub fn untracked_calls(&self) -> Option<u64> {
+        self.dropped.get(&DROPPED_UNTRACKED_CALLS, 0).ok()
     }
 }
 

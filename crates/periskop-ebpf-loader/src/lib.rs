@@ -111,6 +111,16 @@ pub use unavailable::LoaderUnavailable;
 /// A comment would not have caught it, because the job was green either way. So
 /// it is a test, and it is red on exactly the configuration that used to be
 /// silently green.
+///
+/// # What this test does not establish, and what does
+///
+/// That the module is **in the build**, not that anything **ran** it. Those came
+/// apart: for two milestones every lib test path that reaches [`syscall`] went
+/// through `EbpfLoader::open`, and `missing_program` turned all of them back
+/// before the first call, so miri compiled the exception and interpreted none of
+/// it. The other half is in [`syscall`]'s own tests, which drive the capability
+/// buffer through a stand-in for the kernel, and in `tests/unsafe_boundary.rs`,
+/// which fails on every platform if those tests stop being there.
 #[cfg(all(test, miri))]
 mod under_miri {
     #[test]

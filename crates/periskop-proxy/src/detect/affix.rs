@@ -88,6 +88,39 @@ struct RuleFile {
     suffixes: Vec<String>,
 }
 
+/// The apostrophe set, refusing every way the list can mean less than it looks.
+///
+/// One character per entry, and at least one entry. A rule file is edited by
+/// hand, and the two edits that used to pass were an entry typed as `""` and an
+/// entry typed as a two character sequence: the first vanished, the second was
+/// silently truncated to its first character. Neither is a boundary marker the
+/// author asked for, and a load that accepts them under-masks without saying so.
+fn apostrophes_of(language: &str, entries: &[String]) -> Result<Vec<char>, AffixError> {
+    let mut apostrophes = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let mut characters = entry.chars();
+        match (characters.next(), characters.next()) {
+            (Some(apostrophe), None) => apostrophes.push(apostrophe),
+            _ => {
+                return Err(AffixError::Malformed {
+                    language: language.to_owned(),
+                    detail: format!(
+                        "the apostrophe entry {entry:?} is not a single character, and an entry \
+                         that is dropped or truncated marks no boundary"
+                    ),
+                })
+            }
+        }
+    }
+    if apostrophes.is_empty() {
+        return Err(AffixError::Malformed {
+            language: language.to_owned(),
+            detail: "the apostrophe list is empty".to_owned(),
+        });
+    }
+    Ok(apostrophes)
+}
+
 impl AffixRules {
     /// Loads `rules/masking/<language>/affixes.toml` under `root`.
     pub fn load(root: &Path, language: &str) -> Result<Self, AffixError> {
@@ -135,13 +168,20 @@ impl AffixRules {
                 detail: "the suffix list is empty".to_owned(),
             });
         }
+        // The same reasoning, applied to the list four lines above it. It was
+        // not, and the difference was `filter_map`: an empty string or a
+        // multi-character entry was dropped without a word, and an empty list
+        // parsed into an empty set. Both are silent under-masking of exactly the
+        // kind the suffix check exists to stop. With no apostrophe registered,
+        // `tail_is_an_affix` loses the boundary short circuit, `boundaries_hold`
+        // returns false, and `Dictionary::scan` discards the whole candidate
+        // rather than just its suffix: `Ahmet'in dosyasi` sends the name to the
+        // provider with a clean policy load, an empty `degraded_reasons` and no
+        // counter moving anywhere.
+        let apostrophes = apostrophes_of(language, &parsed.apostrophes)?;
         Ok(Self {
             language: parsed.language,
-            apostrophes: parsed
-                .apostrophes
-                .iter()
-                .filter_map(|entry| entry.chars().next())
-                .collect(),
+            apostrophes,
             suffixes: parsed.suffixes.into_iter().map(|s| fold(&s).0).collect(),
             min_base_chars: parsed.min_base_chars,
             max_affix_chain: parsed.max_affix_chain,
@@ -345,6 +385,54 @@ suffixes = []
         )
         .unwrap_err();
         assert!(matches!(error, AffixError::Malformed { .. }));
+    }
+
+    /// The rule file with one field replaced, so the cases below differ from the
+    /// shipped shape in exactly the thing they are about.
+    fn with_apostrophes(list: &str) -> Result<AffixRules, AffixError> {
+        AffixRules::parse(
+            "tr",
+            &format!(
+                r#"
+schema_version = "1.0"
+language = "tr"
+apostrophes = {list}
+min_base_chars = 3
+max_affix_chain = 3
+suffixes = ["ler", "in"]
+"#
+            ),
+        )
+    }
+
+    #[test]
+    fn an_apostrophe_list_that_marks_no_boundary_is_refused_rather_than_thinned() {
+        // Three edits of `rules/masking/tr/affixes.toml` that used to load
+        // cleanly and then under-mask. The cost is not the apostrophe path
+        // alone: with no apostrophe registered, `boundaries_hold` fails and
+        // `Dictionary::scan` drops the whole candidate, so `Ahmet'in` sends
+        // `Ahmet` to the provider with nothing anywhere saying so.
+        for list in [
+            r#"[]"#,        // the list emptied
+            r#"[""]"#,      // an entry typed as an empty string
+            r#"["''"]"#,    // an entry with two characters in it
+            r#"["'", ""]"#, // one good entry beside a bad one
+        ] {
+            let error = with_apostrophes(list).unwrap_err();
+            assert!(
+                matches!(error, AffixError::Malformed { .. }),
+                "apostrophes = {list} loaded instead of stopping the policy load"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shipped_apostrophes_still_load_and_still_mark_the_boundary() {
+        // The negative control for the case above: the refusal has to be about
+        // entries that mark nothing, not about apostrophes in general.
+        let rules = with_apostrophes(r#"["'", "’"]"#).unwrap();
+        assert!(rules.tail_is_an_affix("ahmet", "'in"));
+        assert!(rules.tail_is_an_affix("ahmet", "\u{2019}in"));
     }
 
     #[test]

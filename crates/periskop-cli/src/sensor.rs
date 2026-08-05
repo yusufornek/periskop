@@ -324,13 +324,7 @@ fn not_measured(
             outcome.dns_evictions_forgotten()
         ));
     }
-    if !outcome.rejected_payload_samples().is_empty() {
-        let total: u64 = outcome.rejected_payload_samples().values().sum();
-        notes.push(format!(
-            "{total} payload samples could not be parsed, so those connections were observed with \
-             no destination name: see rejected_payload_samples for the causes"
-        ));
-    }
+    notes.extend(refused_sample_notes(outcome.rejected_payload_samples()));
     // The one number in this status that reads as an all clear when it is not.
     // `dropped_events` is zero both for a capture that lost nothing and for one
     // whose ring buffer loss counter the kernel would not answer for, and the
@@ -343,6 +337,46 @@ fn not_measured(
              dropped_events ({}) is a floor rather than a count and this pass cannot say whether \
              events were lost",
             outcome.dropped_events()
+        ));
+    }
+    notes
+}
+
+/// The cause the kernel object records when its in flight map is full.
+const KERNEL_CALL_NOT_TRACKED: &str = "kernel_call_not_tracked";
+
+/// What the refused-sample tally means, in two sentences rather than one.
+///
+/// The two entries in that map cost a reader different things, and one sentence
+/// covering both understated the second badly enough to be worth splitting.
+///
+/// A sample the parsers refused is a connection that **was** observed and has no
+/// destination name on it: incomplete in the capture. A call the kernel could
+/// not track is a connection that was never described at all: missing from the
+/// capture. And `dropped_events` cannot say so, because it counts frames the
+/// ring buffer had no room for and this loss never became a frame. That is what
+/// made a busy machine with a full in flight map report `dropped_events: 0`,
+/// which is what a machine that lost nothing reports.
+fn refused_sample_notes(samples: &BTreeMap<&'static str, u64>) -> Vec<String> {
+    let mut notes = Vec::new();
+    let unnamed: u64 = samples
+        .iter()
+        .filter(|(cause, _)| **cause != KERNEL_CALL_NOT_TRACKED)
+        .map(|(_, count)| count)
+        .sum();
+    if unnamed > 0 {
+        notes.push(format!(
+            "{unnamed} payload samples could not be parsed, so those connections were observed \
+             with no destination name: see rejected_payload_samples for the causes"
+        ));
+    }
+    let untracked = samples.get(KERNEL_CALL_NOT_TRACKED).copied();
+    if let Some(untracked) = untracked.filter(|count| *count > 0) {
+        notes.push(format!(
+            "{untracked} kernel calls produced no record at all because the in flight map was \
+             full, so those connections are missing from this capture rather than incomplete in \
+             it, and dropped_events does not count them: nothing was ever handed to the ring \
+             buffer. The number counts calls and not flows, so it is a floor"
         ));
     }
     notes
@@ -437,6 +471,40 @@ mod tests {
                 run.status.not_measured
             );
         }
+    }
+
+    #[test]
+    fn a_full_in_flight_map_is_declared_as_missing_flows_rather_than_a_clean_capture() {
+        // `known-gaps.md` KG-034. The kernel object counts a call it could not
+        // track, and that loss never reaches `dropped_events` because it never
+        // becomes a frame: an operator reading `dropped_events: 0` beside a
+        // capture taken while the map was full would read a complete capture of
+        // a quiet machine. This is the sentence that stops that reading, and it
+        // has to be a sentence of its own rather than a share of the refused
+        // samples total, because the two losses cost different things.
+        let notes = refused_sample_notes(&[(KERNEL_CALL_NOT_TRACKED, 9)].into_iter().collect());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("missing from this capture"), "{notes:?}");
+        assert!(
+            notes[0].contains("dropped_events does not count them"),
+            "{notes:?}"
+        );
+
+        // The other cause keeps its own sentence, and a run carrying both says
+        // both. A single total would have made nine untracked calls read as nine
+        // connections that were seen and could not be named.
+        let both = refused_sample_notes(
+            &[(KERNEL_CALL_NOT_TRACKED, 9), ("dns_truncated", 4)]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(both[0].starts_with("4 payload samples"), "{both:?}");
+        assert!(both[1].starts_with("9 kernel calls"), "{both:?}");
+
+        // And a tally with nothing in it says nothing, so the absence of the
+        // sentence is evidence rather than a default.
+        assert!(refused_sample_notes(&BTreeMap::new()).is_empty());
     }
 
     #[test]

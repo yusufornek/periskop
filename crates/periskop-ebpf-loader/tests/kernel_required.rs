@@ -60,23 +60,51 @@ const KERNEL_OBJECT_COMPILED_IN: bool = cfg!(all(target_os = "linux", periskop_k
 /// Deliberately not the sensor's parser: these tests exist to check the machine,
 /// so borrowing the production reader would make them agree with it by
 /// construction even when both were wrong about the machine.
+///
+/// # Why an unreadable procfs stops the test instead of answering zero
+///
+/// Every reading here used to fall back to a default, and the default was "this
+/// process holds nothing". That value is used twice, and the two uses are what
+/// made it dangerous: it is the input handed to `loader.load(...)` **and** the
+/// selector deciding which of the two assertion branches runs. So a run that
+/// could not read `/proc/self/status` invented an unprivileged process, took the
+/// "this machine cannot load" branch, and asserted `first.is_err()`, which was
+/// already true of the input it had just made up. The claim these tests exist
+/// for, that a load succeeds and then genuinely gives the capabilities up, never
+/// ran, and `ci.yml`'s count only looks at `passed > 0` and `skipped == 0`, so
+/// the run reported as a pass.
+///
+/// The function's own heading is what settles the direction of the fix: these
+/// tests are here to check the machine. A machine it cannot read is a machine it
+/// has nothing to say about, and saying it anyway is the one outcome that must
+/// not be available.
 fn capabilities_of_this_process() -> Capabilities {
-    let status = std::fs::read_to_string(PROC_SELF_STATUS).unwrap_or_default();
+    let status = std::fs::read_to_string(PROC_SELF_STATUS).expect(
+        "/proc/self/status could not be read, so this process's authority is unknown; these \
+         tests assert what the machine does and must not invent an answer for it",
+    );
     let effective = status
         .lines()
         .find_map(|line| line.strip_prefix("CapEff:"))
         .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
-        .unwrap_or(0);
+        .expect(
+            "/proc/self/status carries no readable CapEff line, so the capability set below \
+             would be a guess rather than a reading",
+        );
     let uid = status
         .lines()
         .find_map(|line| line.strip_prefix("Uid:"))
         .and_then(|value| value.split_whitespace().nth(1))
-        .and_then(|value| value.parse::<u32>().ok());
+        .and_then(|value| value.parse::<u32>().ok())
+        .expect(
+            "/proc/self/status carries no readable effective Uid, and `root: false` on a run \
+             that is actually root is the same invented answer in a smaller field",
+        );
     Capabilities {
         cap_bpf: effective & (1u64 << CAP_BPF) != 0,
         cap_perfmon: effective & (1u64 << CAP_PERFMON) != 0,
         cap_net_admin: effective & (1u64 << CAP_NET_ADMIN) != 0,
-        root: uid == Some(0),
+        root: uid == 0,
         btf_available: Path::new(BTF_VMLINUX).exists(),
     }
 }
@@ -106,15 +134,15 @@ const ATTRIBUTING_HOOKS: [Hook; 6] = [
             and a binary built with a kernel side object; none is arrangeable on the \
             macOS development machine"]
 fn the_load_gives_up_the_capabilities_that_allowed_it() {
-    let capabilities = capabilities_of_this_process();
-    // Asserted rather than skipped over. If the machine running this is not
-    // Linux, the honest outcome is a failure that says so, not a pass that
-    // checked nothing.
+    // Asserted rather than skipped over, and asserted first: the reader below
+    // opens a Linux interface, so on any other machine this is the sentence that
+    // should come out rather than a missing file.
     assert_eq!(
         HostPlatform::current(),
         HostPlatform::Linux,
         "this test asserts kernel behaviour and was run somewhere else"
     );
+    let capabilities = capabilities_of_this_process();
 
     let mut loader = EbpfLoader::default();
     let first = loader.load(HostPlatform::current(), &capabilities, &ATTRIBUTING_HOOKS);
@@ -170,8 +198,8 @@ fn the_load_gives_up_the_capabilities_that_allowed_it() {
 #[ignore = "needs a Linux machine; the macOS development machine reports the platform \
             before it reaches the question this asks"]
 fn the_loader_agrees_with_the_authority_this_process_actually_holds() {
-    let capabilities = capabilities_of_this_process();
     assert_eq!(HostPlatform::current(), HostPlatform::Linux);
+    let capabilities = capabilities_of_this_process();
 
     // The full plan, which every build of this crate refuses before it reaches a
     // kernel because no build carries a `clsact` classifier. So this asks the

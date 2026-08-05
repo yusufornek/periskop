@@ -312,10 +312,8 @@ impl Relay {
             let holding = !state.buffer.is_empty();
             state.clock.observe(holding, now_ms);
 
-            let (rendered, restored) =
-                render(&frame, slot, released.pieces, lookup, &mut self.restore);
+            let rendered = render(&frame, slot, released.pieces, lookup, &mut self.restore);
             self.tamper = self.tamper.max(lookup.tampered());
-            let _ = restored;
             if let Some(bytes) = rendered {
                 // Straight out, never deferred: text that is being released is
                 // older than anything already waiting, because a frame only ever
@@ -381,7 +379,7 @@ impl Relay {
         let Some((template, slot)) = state.template.clone() else {
             return;
         };
-        let (rendered, _) = render(&template, slot, released.pieces, lookup, &mut self.restore);
+        let rendered = render(&template, slot, released.pieces, lookup, &mut self.restore);
         self.tamper = self.tamper.max(lookup.tampered());
         if let Some(bytes) = rendered {
             out.extend_from_slice(&bytes);
@@ -429,15 +427,21 @@ impl Relay {
 ///
 /// `None` when nothing was released: an empty delta frame would be noise between
 /// two halves of a word.
+///
+/// How many aliases were resolved is deliberately **not** returned. It used to
+/// be, as the second half of a pair, and neither caller read it: one wrote
+/// `let _ = restored;` and the other `let (rendered, _)`. The number is already
+/// accumulated into the `stats` parameter, so the return value was a second copy
+/// of a fact with one owner, discarded in two different ways that both looked
+/// intentional enough for the next reader to build on.
 fn render(
     template: &Frame,
     slot: Slot,
     pieces: Vec<Piece>,
     lookup: &mut dyn Lookup,
     stats: &mut RestoreStats,
-) -> (Option<Vec<u8>>, usize) {
+) -> Option<Vec<u8>> {
     let mut text = String::new();
-    let mut restored = 0usize;
     for piece in pieces {
         match piece {
             Piece::Text(part) => text.push_str(&part),
@@ -446,7 +450,6 @@ fn render(
                     stats.aliases_seen_in_response =
                         stats.aliases_seen_in_response.saturating_add(1);
                     stats.aliases_restored = stats.aliases_restored.saturating_add(1);
-                    restored += 1;
                     text.push_str(&value);
                 }
                 None => {
@@ -461,13 +464,11 @@ fn render(
     }
 
     if text.is_empty() {
-        return (None, restored);
+        return None;
     }
-    let Some(document) = template.document() else {
-        return (None, restored);
-    };
+    let document = template.document()?;
     let rewritten = frame::with_text(&document, slot, &text);
-    (Some(template.render(&rewritten.to_string())), restored)
+    Some(template.render(&rewritten.to_string()))
 }
 
 /// Whether an answer's headers say it is a server sent event stream.

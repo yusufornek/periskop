@@ -82,10 +82,27 @@ pub struct RawBatch {
     /// build's record layout. Folding them together would let a version mismatch
     /// present itself as a busy machine.
     pub undecodable: u64,
+    /// Calls the kernel program could not track, so no record was produced.
+    ///
+    /// The third loss, and the one that was invisible. It happens before a frame
+    /// exists, so `dropped` cannot see it: an entry probe whose in flight map is
+    /// full stashes nothing, the matching return probe finds nothing, and the
+    /// connection is never described. A run in that state reported
+    /// `dropped_events: 0`, which is what a run that lost nothing reports.
+    ///
+    /// A floor rather than a count, in both directions. One connection missed on
+    /// several calls increments it several times, and a kernel that will not read
+    /// the counter leaves it at zero with [`RawBatch::untracked_unknown`] set.
+    pub untracked_calls: u64,
+    /// Whether `untracked_calls` is a reading or a placeholder.
+    ///
+    /// The same distinction `dropped_unknown` carries, for the same reason, and
+    /// read through [`RawBatch::untracked`] rather than off the number.
+    pub untracked_unknown: bool,
 }
 
 impl RawBatch {
-    /// An empty batch carrying what the kernel said about its loss counter.
+    /// An empty batch carrying what the kernel said about its loss counters.
     ///
     /// The one place `Option<u64>` becomes the pair of fields above, and it is a
     /// constructor rather than three lines inside [`EbpfLoader::poll`] for a
@@ -96,16 +113,13 @@ impl RawBatch {
     /// defect coming back, survived every test the development machine can run,
     /// because there was nothing on that machine to compile. Out here it is
     /// checked on every platform.
-    pub fn from_loss_counter(dropped: Option<u64>) -> Self {
-        match dropped {
-            Some(dropped) => Self {
-                dropped,
-                ..Self::default()
-            },
-            None => Self {
-                dropped_unknown: true,
-                ..Self::default()
-            },
+    pub fn from_loss_counters(dropped: Option<u64>, untracked: Option<u64>) -> Self {
+        Self {
+            dropped: dropped.unwrap_or_default(),
+            dropped_unknown: dropped.is_none(),
+            untracked_calls: untracked.unwrap_or_default(),
+            untracked_unknown: untracked.is_none(),
+            ..Self::default()
         }
     }
 
@@ -117,6 +131,16 @@ impl RawBatch {
     /// statement to keep apart.
     pub fn losses(&self) -> Option<u64> {
         (!self.dropped_unknown).then_some(self.dropped)
+    }
+
+    /// Calls that produced no record at all, or nothing when the kernel would
+    /// not say.
+    ///
+    /// Read through here rather than off `untracked_calls`, for the reason
+    /// [`Self::losses`] exists: the number alone is zero both for a run that
+    /// tracked everything and for a run that could not find out.
+    pub fn untracked(&self) -> Option<u64> {
+        (!self.untracked_unknown).then_some(self.untracked_calls)
     }
 }
 
@@ -350,9 +374,14 @@ impl EbpfLoader {
             // An unreadable loss counter is carried as "unknown" rather than as
             // a zero, because the two would send a reader to opposite
             // conclusions about the same run. The decision itself is in
-            // `RawBatch::from_loss_counter`, which is compiled and tested
+            // `RawBatch::from_loss_counters`, which is compiled and tested
             // everywhere; this line is the only part of it that is not.
-            let mut batch = RawBatch::from_loss_counter(attached.dropped());
+            //
+            // Two counters, because the kernel object sees two losses. The
+            // second, a call it could not track at all, never becomes a frame,
+            // so the ring buffer's counter is structurally blind to it.
+            let mut batch =
+                RawBatch::from_loss_counters(attached.dropped(), attached.untracked_calls());
             for frame in attached.drain() {
                 match RawEvent::decode(&frame) {
                     Ok(event) => batch.events.push(event),
@@ -606,10 +635,11 @@ mod tests {
     fn a_loss_counter_the_kernel_would_not_read_does_not_report_zero_losses() {
         // Built through the constructor the kernel path uses, so this covers the
         // mapping and not just the accessor.
-        let quiet = RawBatch::from_loss_counter(Some(0));
+        let quiet = RawBatch::from_loss_counters(Some(0), Some(0));
         assert_eq!(quiet.losses(), Some(0));
+        assert_eq!(quiet.untracked(), Some(0));
 
-        let unreadable = RawBatch::from_loss_counter(None);
+        let unreadable = RawBatch::from_loss_counters(None, None);
         assert_eq!(
             unreadable.dropped, quiet.dropped,
             "the number cannot carry the difference, which is the whole reason for the flag"
@@ -620,9 +650,23 @@ mod tests {
             "an unreadable loss counter came back as a run that lost nothing"
         );
 
-        let busy = RawBatch::from_loss_counter(Some(17));
+        assert_eq!(
+            unreadable.untracked(),
+            None,
+            "an unreadable in flight counter came back as a run that tracked everything"
+        );
+
+        let busy = RawBatch::from_loss_counters(Some(17), Some(4));
         assert_eq!(busy.losses(), Some(17));
         assert_eq!(busy.dropped, 17);
+        assert_eq!(busy.untracked(), Some(4));
+
+        // The two counters move independently, which is the reason there are two
+        // of them: a full in flight map on a machine whose ring buffer never
+        // overran is exactly the run that used to report a clean capture.
+        let untracked_only = RawBatch::from_loss_counters(Some(0), Some(9));
+        assert_eq!(untracked_only.losses(), Some(0));
+        assert_eq!(untracked_only.untracked(), Some(9));
     }
 
     #[test]

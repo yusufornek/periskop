@@ -759,6 +759,12 @@ fn read_detection(document: &Map<String, Value>) -> Result<(), PolicyError> {
                 value: languages.to_string(),
                 expected: "an array of tr | en",
             })?;
+        // `minItems: 1` and `uniqueItems: true`, which the schema states and a
+        // loop over the entries cannot enforce: an empty array runs zero
+        // iterations and returns `Ok`. That made `npm run validate:schemas`
+        // reject a file `Policy::load` accepted, which is the divergence this
+        // module's own header says must not exist.
+        let mut seen = BTreeSet::new();
         for entry in entries {
             let tag = entry.as_str().unwrap_or_default();
             if !matches!(tag, "tr" | "en") {
@@ -768,6 +774,20 @@ fn read_detection(document: &Map<String, Value>) -> Result<(), PolicyError> {
                     expected: "tr | en",
                 });
             }
+            if !seen.insert(tag.to_owned()) {
+                return Err(PolicyError::UnknownValue {
+                    key: "detection.ner.languages".to_owned(),
+                    value: entry.to_string(),
+                    expected: "each language at most once",
+                });
+            }
+        }
+        if seen.is_empty() {
+            return Err(PolicyError::UnknownValue {
+                key: "detection.ner.languages".to_owned(),
+                value: languages.to_string(),
+                expected: "at least one of tr | en, or the key omitted entirely",
+            });
         }
     }
     if let Some(on_error) = ner.get("on_model_error") {
@@ -869,9 +889,26 @@ fn read_affix_languages(document: &Map<String, Value>) -> Result<Vec<String>, Po
                 expected: "tr",
             });
         }
-        if seen.insert(tag.to_owned()) {
-            out.push(tag.to_owned());
+        // `uniqueItems: true` in the schema. A repeat used to be absorbed here
+        // rather than refused, so ajv rejected a policy file this loader ran.
+        if !seen.insert(tag.to_owned()) {
+            return Err(PolicyError::UnknownValue {
+                key: "affix_rules.languages".to_owned(),
+                value: entry.to_string(),
+                expected: "each language at most once",
+            });
         }
+        out.push(tag.to_owned());
+    }
+    // `minItems: 1`. The block is optional and an absent one means no affix
+    // handling, but a present block declaring nothing is a file whose author
+    // meant to declare something.
+    if out.is_empty() {
+        return Err(PolicyError::UnknownValue {
+            key: "affix_rules.languages".to_owned(),
+            value: languages.to_string(),
+            expected: "at least one language tag, or the block omitted entirely",
+        });
     }
     Ok(out)
 }
@@ -1175,6 +1212,34 @@ mode = "mask"
         // directory is looked for.
         let unknown = load(&with("[affix_rules]\nlanguages = [\"de\"]")).unwrap_err();
         assert!(matches!(unknown, PolicyError::UnknownValue { .. }));
+    }
+
+    #[test]
+    fn the_two_list_constraints_the_schema_states_are_enforced_by_the_loader_too() {
+        // `minItems: 1` and `uniqueItems: true` on both language lists
+        // (`proxy-policy.schema.json`). Neither survives a bare loop over the
+        // entries: an empty array runs no iteration, and a repeat used to be
+        // absorbed by a `BTreeSet` rather than refused. Both files were then
+        // rejected by `npm run validate:schemas` and accepted by `Policy::load`,
+        // so the rule continuous integration checks and the rule the process
+        // applies were two different rules.
+        for document in [
+            "[affix_rules]\nlanguages = []",
+            "[affix_rules]\nlanguages = [\"tr\", \"tr\"]",
+            "[detection.ner]\nlanguages = []",
+            "[detection.ner]\nlanguages = [\"tr\", \"tr\"]",
+        ] {
+            let error = load(&with(document)).unwrap_err();
+            assert!(
+                matches!(error, PolicyError::UnknownValue { .. }),
+                "the loader accepted a document the schema rejects: {document}"
+            );
+        }
+
+        // The negative control: the shapes the schema admits still load, so the
+        // refusal above is about the two constraints and not about the key.
+        assert!(load(&with("[affix_rules]\nlanguages = [\"tr\"]")).is_ok());
+        assert!(load(&with("[detection.ner]\nlanguages = [\"tr\", \"en\"]")).is_ok());
     }
 
     #[test]

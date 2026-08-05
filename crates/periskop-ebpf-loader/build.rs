@@ -57,10 +57,25 @@ fn main() {
             return;
         }
     };
+    // The two ways this can go wrong are reported as two different sentences,
+    // because they send a reader to two different remedies. They used to share
+    // one arm, so a `metadata()` that failed on a permission change or on a
+    // deletion racing the build printed "points at an empty file", which is a
+    // false statement: the developer then checked the file's size, found it
+    // fine, and the real `io::Error` had been dropped on the floor. The
+    // `canonicalize()` arm four lines up already prints its `{error}`; this is
+    // the same pattern applied to the arm that was missing it.
     match object.metadata().map(|meta| meta.len()) {
-        Ok(0) | Err(_) => {
+        Ok(0) => {
             println!(
                 "cargo::error={OBJECT_PATH} points at an empty file: {}",
+                object.display()
+            );
+            return;
+        }
+        Err(error) => {
+            println!(
+                "cargo::error={OBJECT_PATH} resolved to {} and its size could not be read: {error}",
                 object.display()
             );
             return;
