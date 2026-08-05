@@ -101,9 +101,17 @@ pub(super) fn compact(file: &mut VaultFile, frames: &[Frame]) -> Result<Compacte
         drop(handle);
         return Err(match std::fs::remove_file(&candidate) {
             Ok(()) => refusal,
+            // Both facts, in that order. The reason the swap was refused is what
+            // an operator has to act on, and it used to be replaced by whatever
+            // the cleanup hit: a compaction refused because a second opener had
+            // committed a record reported a file permission problem instead, and
+            // the refusal it was actually protecting against went unsaid. The
+            // leftover candidate is the second fact and stays, because the next
+            // compaction clears it silently and this message is the only place
+            // it is ever visible.
             Err(cause) => VaultError::VaultFileUnavailable {
                 operation: "compacted, and its candidate could not be removed either",
-                cause: format!("{:?}", cause.kind()),
+                cause: format!("{:?}; the swap was refused first: {refusal}", cause.kind()),
             },
         });
     }

@@ -46,7 +46,15 @@ use crate::resolve::DnsObservation;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceCoverage {
     /// Events the transport lost before user space read them.
+    ///
+    /// A floor rather than a count while `dropped_events_unknown` is set.
     pub dropped_events: u64,
+    /// Whether any read of the transport left its losses uncounted.
+    ///
+    /// The kernel does not always answer for a ring buffer's loss counter, and
+    /// the number above is zero for that run exactly as it is for a run that
+    /// lost nothing. Carried separately so a report can say which it has.
+    pub dropped_events_unknown: bool,
     /// Events that named a connection the pass never saw open.
     pub unlinked_events: u64,
     pub dns_observation: DnsObservation,
@@ -188,7 +196,7 @@ impl<K: KernelEvents> FlowSource for EbpfFlowSource<K> {
         if !batch.observed() {
             return Vec::new();
         }
-        self.assembler.record_dropped(batch.dropped);
+        self.assembler.record_dropped(batch.losses());
         for event in batch.events {
             self.assembler.ingest(event);
         }
@@ -201,6 +209,7 @@ impl<K: KernelEvents> FlowSource for EbpfFlowSource<K> {
     fn coverage(&self) -> SourceCoverage {
         SourceCoverage {
             dropped_events: self.assembler.dropped_events(),
+            dropped_events_unknown: self.assembler.dropped_events_unknown(),
             unlinked_events: self.assembler.unlinked_events(),
             dns_observation: self.assembler.dns_observation(),
             // Read from the kernel object rather than the assembler: a sample
@@ -575,12 +584,41 @@ mod tests {
                 state: kernel::PollState::Attached,
                 events: Vec::new(),
                 dropped: 42,
+                dropped_unknown: false,
             }),
             "h_1",
         );
         source.attach(&grant()).unwrap();
         source.drain();
         assert_eq!(source.coverage().dropped_events, 42);
+        assert!(!source.coverage().dropped_events_unknown);
+    }
+
+    #[test]
+    fn a_transport_that_would_not_say_what_it_lost_does_not_report_a_clean_capture() {
+        // The seam this closes. The loader crate has always answered "unknown"
+        // for a loss counter the kernel would not read, and the sensor copied
+        // the number beside that answer straight through. A machine whose losses
+        // nobody could count therefore reported `dropped_events: 0`, which is
+        // what a run that lost nothing reports, and no field anywhere said which
+        // of the two this was.
+        let mut source = EbpfFlowSource::over(
+            ScriptedKernel::yielding(KernelBatch {
+                state: kernel::PollState::Attached,
+                events: Vec::new(),
+                dropped: 0,
+                dropped_unknown: true,
+            }),
+            "h_1",
+        );
+        source.attach(&grant()).unwrap();
+        source.drain();
+        let coverage = source.coverage();
+        assert_eq!(coverage.dropped_events, 0);
+        assert!(
+            coverage.dropped_events_unknown,
+            "an unreadable loss counter reached the coverage as a clean capture"
+        );
     }
 
     #[test]
@@ -624,6 +662,7 @@ mod tests {
                 state: kernel::PollState::NotAttached,
                 events: connect_batch().events,
                 dropped: 42,
+                dropped_unknown: false,
             }),
             "h_1",
         );

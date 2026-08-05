@@ -331,6 +331,20 @@ fn not_measured(
              no destination name: see rejected_payload_samples for the causes"
         ));
     }
+    // The one number in this status that reads as an all clear when it is not.
+    // `dropped_events` is zero both for a capture that lost nothing and for one
+    // whose ring buffer loss counter the kernel would not answer for, and the
+    // coverage contract has one integer field for it and no way to spell
+    // "unknown". Until the contract gains one, the difference is stated here,
+    // where a reader is already looking for what this pass could not establish.
+    if outcome.dropped_events_unknown() {
+        notes.push(format!(
+            "the capture transport would not report its loss counter on at least one read, so \
+             dropped_events ({}) is a floor rather than a count and this pass cannot say whether \
+             events were lost",
+            outcome.dropped_events()
+        ));
+    }
     notes
 }
 

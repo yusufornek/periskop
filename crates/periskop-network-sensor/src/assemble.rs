@@ -80,6 +80,9 @@ pub struct FlowAssembler {
     live: BTreeMap<FlowKey, Pending>,
     closed: Vec<(FlowKey, Pending)>,
     dropped_events: u64,
+    /// Whether any read of the ring buffer came back with its loss counter
+    /// unreadable, which makes `dropped_events` a floor rather than a count.
+    dropped_events_unknown: bool,
     unlinked_events: u64,
     encrypted_dns_transport: bool,
 }
@@ -93,6 +96,7 @@ impl FlowAssembler {
             live: BTreeMap::new(),
             closed: Vec::new(),
             dropped_events: 0,
+            dropped_events_unknown: false,
             unlinked_events: 0,
             encrypted_dns_transport: false,
         }
@@ -104,8 +108,22 @@ impl FlowAssembler {
     }
 
     /// Events the ring buffer lost before user space read it.
+    ///
+    /// A floor rather than a count once [`Self::dropped_events_unknown`] is
+    /// true: reads whose loss counter the kernel would not answer for
+    /// contributed nothing to this number, and nothing can be said about what
+    /// they lost.
     pub fn dropped_events(&self) -> u64 {
         self.dropped_events
+    }
+
+    /// Whether any read left its losses uncounted.
+    ///
+    /// Kept beside the number instead of folded into it, because a coverage
+    /// statement that reported "0 dropped" for a pass that could not read the
+    /// counter would be the one sentence this component must never write.
+    pub fn dropped_events_unknown(&self) -> bool {
+        self.dropped_events_unknown
     }
 
     /// Events that named a connection this pass never saw open.
@@ -134,8 +152,19 @@ impl FlowAssembler {
         self.dns.forgotten_evictions()
     }
 
-    pub fn record_dropped(&mut self, count: u64) {
-        self.dropped_events = self.dropped_events.saturating_add(count);
+    /// One read's losses, or `None` when the kernel would not read the counter.
+    ///
+    /// The option is the argument rather than a bare number, so the caller
+    /// cannot pass a zero it did not measure: the seam that used to do exactly
+    /// that is what made an unreadable counter indistinguishable from a clean
+    /// capture in every report downstream. Once one read comes back unknown the
+    /// whole pass is marked, because the reads cannot be told apart afterwards
+    /// and a total assembled from some of them is a floor.
+    pub fn record_dropped(&mut self, losses: Option<u64>) {
+        match losses {
+            Some(count) => self.dropped_events = self.dropped_events.saturating_add(count),
+            None => self.dropped_events_unknown = true,
+        }
     }
 
     /// Whether plaintext DNS could be watched at all.
@@ -680,9 +709,29 @@ mod tests {
     #[test]
     fn dropped_events_are_carried_rather_than_forgotten() {
         let mut assembler = assembler();
-        assembler.record_dropped(9);
-        assembler.record_dropped(4);
+        assembler.record_dropped(Some(9));
+        assembler.record_dropped(Some(4));
         assert_eq!(assembler.dropped_events(), 13);
+        assert!(!assembler.dropped_events_unknown());
+    }
+
+    #[test]
+    fn a_read_whose_loss_counter_was_unreadable_marks_the_whole_pass() {
+        // The number cannot carry this and must not be made to look as though it
+        // does: after an unreadable read the total is a floor, and a coverage
+        // statement that printed it as a count would tell a reader that a
+        // machine nobody could measure lost nothing.
+        let mut assembler = assembler();
+        assembler.record_dropped(Some(9));
+        assembler.record_dropped(None);
+        assert_eq!(assembler.dropped_events(), 9);
+        assert!(assembler.dropped_events_unknown());
+
+        // And a later readable poll does not clear it, because the reads that
+        // were not counted stay uncounted.
+        assembler.record_dropped(Some(1));
+        assert_eq!(assembler.dropped_events(), 10);
+        assert!(assembler.dropped_events_unknown());
     }
 
     #[test]

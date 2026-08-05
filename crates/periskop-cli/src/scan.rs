@@ -154,6 +154,22 @@ fn scan(request: ScanRequest<'_>, sources: ScanSources<'_>, policy: ScanPolicy) 
     let (rules, load_errors) = load_directory(request.rules_root);
     let mut rule_errors: Vec<String> = load_errors.iter().map(|e| e.to_string()).collect();
 
+    // A rule set with nothing in it is not a clean rule set. `load_directory`
+    // reports the files it could not read and has nothing to say about a
+    // directory that held no rule at all, so a scan pointed at an empty or wrong
+    // path walked the whole tree with no detector loaded, found nothing, and
+    // reported a pass with a full coverage claim behind it. That is the defect
+    // this product exists to report, produced by the product: a check that looks
+    // like it covers something and covers nothing. The path is deliberately not
+    // in the detail, because a report has to diff equal across machines.
+    if rules.is_empty() {
+        rule_errors.push(
+            "the rule set loaded no rule at all, so no detector ran and a clean report here \
+             would mean nothing was looked for"
+                .to_owned(),
+        );
+    }
+
     let discovery = discover(request.project_root, &DiscoveryOptions::default());
 
     let mut builder = ReportBuilder::new();

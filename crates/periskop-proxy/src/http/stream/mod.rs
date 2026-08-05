@@ -65,8 +65,15 @@ struct LaneState {
 pub struct Measured {
     pub stream: StreamStats,
     pub restore: RestoreStats,
-    /// Bytes were still held when the stream ended
+    /// Data was left over when the stream ended
     /// (`x-periskop-stream-truncated`).
+    ///
+    /// Two kinds of leftover, and `proxy-api.md`'s fifth streaming point does
+    /// not distinguish between them: bytes this relay was still holding back in
+    /// a lane, and bytes the frame reader could not complete into a frame. The
+    /// second used to be added on by the gateway after reading this field, which
+    /// meant every answer the gateway did not relay reported a stream that ended
+    /// cleanly whether or not it had.
     pub truncated: bool,
     /// Records that could not be opened: `vault_record_tamper`.
     pub record_tamper: u32,
@@ -123,6 +130,13 @@ pub struct Relay {
     restore: RestoreStats,
     tamper: u32,
     ended: bool,
+    /// The connection stopped part way through a frame.
+    ///
+    /// Held here rather than recomputed by a caller scanning the whole body,
+    /// because the reader is the only thing that knows: it is drained frame by
+    /// frame as the stream arrives, so by the time anybody asks it what is left
+    /// it is holding a tail and nothing that says a tail is what it is.
+    ended_mid_frame: bool,
 }
 
 /// `l_max_static` and `l_max_session` for one conversation.
@@ -178,6 +192,7 @@ impl Relay {
             restore: RestoreStats::default(),
             tamper: 0,
             ended: false,
+            ended_mid_frame: false,
         }
     }
 
@@ -211,6 +226,12 @@ impl Relay {
     pub fn finish(&mut self, lookup: &mut dyn Lookup, now_ms: u64) -> Vec<u8> {
         let mut out = Vec::new();
         if let Some(frame) = self.frames.finish() {
+            // The reader had bytes that never completed a frame, which is
+            // `proxy-api.md` point 5's other leftover: the provider stopped in
+            // the middle of an event rather than at the end of one. Recorded
+            // here, at the only place that can tell, so that the mark does not
+            // depend on a caller remembering to rescan the body.
+            self.ended_mid_frame = true;
             self.take(frame, lookup, now_ms, &mut out);
         }
         self.flush_all(Trigger::StreamEnd, lookup, now_ms, &mut out);
@@ -224,6 +245,9 @@ impl Relay {
     /// goes with it rather than behind it.
     pub fn fail(&mut self, lookup: &mut dyn Lookup, now_ms: u64) -> Vec<u8> {
         let mut out = Vec::new();
+        // Whatever the reader is still holding will never be completed now, so
+        // it is leftover data for the same reason it is in `finish`.
+        self.ended_mid_frame |= !self.frames.is_empty();
         self.flush_all(Trigger::StreamError, lookup, now_ms, &mut out);
         self.drain_deferred(&mut out);
         self.note_buffers();
@@ -236,7 +260,7 @@ impl Relay {
         Measured {
             stream: self.stats,
             restore: self.restore,
-            truncated: self.holding(),
+            truncated: self.holding() || self.ended_mid_frame,
             record_tamper: self.tamper,
         }
     }
@@ -479,6 +503,26 @@ pub fn is_readable_coding(content_encoding: Option<&str>) -> bool {
                 .trim()
                 .eq_ignore_ascii_case(super::headers::READABLE_CODING)
         })
+}
+
+/// Whether an answer no [`Relay`] ever ran over was cut off part way.
+///
+/// The same question [`Relay::measured`] answers for a stream it relayed, asked
+/// of one it did not. A conversation that masked nothing has nothing to put
+/// back, so its answer crosses untouched and no relay is built for it; the
+/// provider can still die in the middle of a frame, and `proxy-api.md`'s fifth
+/// streaming point makes leftover data at the end of a stream an error to be
+/// marked whether or not this proxy had any business rewriting the bytes. Until
+/// this existed, a prompt with nothing detectable in it produced a `200` with no
+/// `x-periskop-stream-truncated` and a `stream_reassembly_errors_total` that
+/// stayed at zero for the life of the process.
+///
+/// The content type is part of the question rather than the caller's to check
+/// first: [`frame::ends_mid_frame`] reads SSE terminators, and a `text/plain`
+/// body has none, so asking it about one would mark every buffered answer as a
+/// cut stream.
+pub fn untouched_answer_was_cut(content_type: Option<&str>, body: &[u8]) -> bool {
+    is_event_stream(content_type) && frame::ends_mid_frame(body)
 }
 
 /// Whether an answer's headers say it is JSON.

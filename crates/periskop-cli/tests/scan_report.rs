@@ -335,6 +335,60 @@ fn a_rule_set_that_does_not_load_is_reported_and_denied_a_pass() {
 }
 
 #[test]
+fn a_rule_set_that_loads_nothing_at_all_is_denied_a_pass() {
+    // The half of the test above that nothing covered, and the one that survived
+    // into a continuous integration gate. A broken rule file is reported because
+    // the loader has something to complain about; a rule directory that is empty,
+    // or misspelled, or points at a tree the checkout does not contain, gives the
+    // loader nothing to complain about at all. The scan then walked the project
+    // with no detector loaded, matched nothing, and reported zero findings, PASS
+    // and exit code zero. `.github/workflows/ci.yml` ran exactly that command
+    // against this repository, which means the step could not have failed no
+    // matter what happened to the rules.
+    let tree = TempTree::new("empty-rules");
+    tree.write(
+        "project/app.py",
+        "import openai\nclient = openai.OpenAI()\n",
+    );
+    std::fs::create_dir_all(tree.path("rules")).unwrap();
+
+    let outcome = run_in(
+        &tree.path("project"),
+        &tree.path("rules"),
+        "2026-08-04T09:00:00Z",
+    );
+
+    assert_eq!(
+        outcome.report.verdict,
+        Verdict::Fail,
+        "a scan with no detector loaded reported a verdict a pipeline reads as clean"
+    );
+    let rule_problems: Vec<&str> = outcome
+        .report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == DiagnosticCode::RuleLoadError)
+        .filter_map(|d| d.detail.as_deref())
+        .collect();
+    assert_eq!(
+        rule_problems.len(),
+        1,
+        "the empty rule set has to say so in the artefact, not only in the verdict: {:?}",
+        outcome.report.diagnostics
+    );
+    assert!(
+        rule_problems[0].contains("no rule at all"),
+        "{rule_problems:?}"
+    );
+    // The detail travels into a report that has to diff equal between machines,
+    // so it may not carry the absolute path of somebody's temporary directory.
+    assert!(
+        !rule_problems[0].contains(&tree.path("rules").display().to_string()),
+        "the diagnostic carries an absolute path: {rule_problems:?}"
+    );
+}
+
+#[test]
 fn files_of_a_language_with_no_rules_are_declared_unparsed_not_counted_as_scanned() {
     // The error class this test catches: coverage inflated by files nothing ever
     // looked at. A file used to be parsed, counted in parsed_files, and only then

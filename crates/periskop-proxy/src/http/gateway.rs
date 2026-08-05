@@ -714,10 +714,18 @@ impl Gateway {
         identity: &super::session::Identity,
         record: &mut RequestRecord,
     ) -> Result<Vec<u8>, Refusal> {
+        let content_type = answer.headers.get("content-type");
         if snapshot.is_empty() {
+            // Nothing to put back, so the provider's bytes cross as they are.
+            // The stream is still read for the one fact that is true of it
+            // whether or not this proxy rewrote a byte: whether it ended in the
+            // middle of a frame. Returning here without asking was how a
+            // conversation that masked nothing turned a provider dying mid frame
+            // into a clean `200`.
+            record.measured.truncated |=
+                super::stream::untouched_answer_was_cut(content_type, &answer.body);
             return Ok(answer.body.clone());
         }
-        let content_type = answer.headers.get("content-type");
         if !is_event_stream(content_type) && !is_json(content_type) {
             return Ok(answer.body.clone());
         }
@@ -794,15 +802,11 @@ impl Gateway {
                 out.extend(relay.push(piece, lookup, now_ms));
             }
             out.extend(relay.finish(lookup, now_ms));
+            // Both kinds of leftover come off the relay now: the bytes it was
+            // holding in a lane and the bytes the reader could not complete into
+            // a frame. They used to be `|=`d together here, which left every
+            // answer that never reached a relay reporting a clean ending.
             record.measured = relay.measured();
-            // The relay's own answer is about its **hold buffers**: bytes it was
-            // still holding back when the stream ended. A stream can also end
-            // inside a frame, which is data left in a buffer one layer lower, and
-            // `proxy-api.md`'s fifth streaming point does not distinguish: data
-            // left over when the connection ended is an error to be marked. Until
-            // this line the second kind was invisible, so a provider that died
-            // mid frame produced a `200` that looked complete.
-            record.measured.truncated |= super::stream::frame::ends_mid_frame(&answer.body);
             return out;
         }
 
@@ -1787,6 +1791,85 @@ mod tests {
                 .contains("periskop_proxy_stream_reassembly_errors_total 0"),
             "{}",
             whole.metrics_snapshot().render()
+        );
+    }
+
+    /// The same mark, on a conversation that masked nothing.
+    ///
+    /// The gap the test above could not see. `restore_answer` returns early for a
+    /// conversation with an empty snapshot, because there are no values to put
+    /// back, and the truncation mark used to be added after that return by the
+    /// branch that relays a stream. So a prompt containing nothing detectable
+    /// went out, the provider died in the middle of a frame, and the client got a
+    /// `200` with no `x-periskop-stream-truncated` and a reassembly counter that
+    /// stayed at zero. Whether this proxy had anything to rewrite is not what
+    /// decides whether the provider finished talking.
+    #[test]
+    fn a_cut_stream_is_marked_even_when_the_conversation_masked_nothing() {
+        let cut = gateway_over(Arc::new(super::super::upstream::Recorder::streaming(vec![
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"two\"}}]}\n\n".to_vec(),
+            // The provider died here.
+            b"event: content_block_".to_vec(),
+        ])) as Arc<dyn Upstream>);
+
+        let answer = blocking(&cut, ask("what is one plus one"));
+        assert_eq!(answer.status, 200);
+        // The premise: nothing in that prompt was masked, or this would be the
+        // case the test above already covers.
+        assert_eq!(
+            answer.headers.get("x-periskop-masked-entities"),
+            Some("0"),
+            "the prompt was supposed to carry nothing detectable"
+        );
+        assert_eq!(
+            answer.headers.get("x-periskop-stream-truncated"),
+            Some("true"),
+            "a cut stream was delivered as a complete one because nothing was masked"
+        );
+        assert!(
+            cut.metrics_snapshot()
+                .render()
+                .contains("periskop_proxy_stream_reassembly_errors_total 1"),
+            "{}",
+            cut.metrics_snapshot().render()
+        );
+
+        // The other direction on the same unmasked conversation, so the assertion
+        // above cannot pass on a build that marks every stream.
+        let whole = gateway_over(Arc::new(super::super::upstream::Recorder::streaming(vec![
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"two\"}}]}\n\n".to_vec(),
+            b"data: [DONE]\n\n".to_vec(),
+        ])) as Arc<dyn Upstream>);
+        let answer = blocking(&whole, ask("what is one plus one"));
+        assert_eq!(answer.headers.get("x-periskop-stream-truncated"), None);
+        assert!(
+            whole
+                .metrics_snapshot()
+                .render()
+                .contains("periskop_proxy_stream_reassembly_errors_total 0"),
+            "{}",
+            whole.metrics_snapshot().render()
+        );
+
+        // And a buffered answer of the same conversation is not a cut stream:
+        // a JSON body has no frame terminators, so a scan that ran over it would
+        // call every one of them truncated.
+        let buffered = gateway_over(Arc::new(super::super::upstream::Recorder::answering(
+            super::super::upstream::Answer::whole(
+                200,
+                HeaderList::new().with("content-type", "application/json"),
+                b"{\"choices\":[{\"message\":{\"content\":\"two\"}}]}".to_vec(),
+            ),
+        )) as Arc<dyn Upstream>);
+        let answer = blocking(&buffered, ask("what is one plus one"));
+        assert_eq!(answer.headers.get("x-periskop-stream-truncated"), None);
+        assert!(
+            buffered
+                .metrics_snapshot()
+                .render()
+                .contains("periskop_proxy_stream_reassembly_errors_total 0"),
+            "{}",
+            buffered.metrics_snapshot().render()
         );
     }
 

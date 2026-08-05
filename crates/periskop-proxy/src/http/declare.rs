@@ -85,7 +85,9 @@ impl Finding {
     /// source, primary ref and the rule identifier) and over nothing else, so the
     /// same gap in the same conversation is the same finding on every run. There
     /// is no wall clock in the inputs, which is what keeps a re-run byte
-    /// identical.
+    /// identical. The primary ref carries the whole of the condition: see
+    /// `Subject::exchange` for the one session origin under which a conversation
+    /// cannot be the same one twice.
     pub fn id(&self) -> String {
         format!(
             "fnd_{}",
@@ -199,11 +201,24 @@ impl Subject<'_> {
 
     /// `px_` and sixteen hex characters, derived rather than counted.
     ///
-    /// Derived from the alias scope and the rule, so it is stable across a re-run
-    /// of the same request, which `proxy-events.md`'s determinism rule requires of
-    /// everything this component writes. The cost is that two exchanges in one
-    /// conversation that hit the same rule share a reference; the alternative is a
-    /// counter or a clock, and both make a re-run produce different bytes.
+    /// Derived from the alias scope and the rule, never from a counter or a
+    /// clock: both of those make a re-run produce different bytes, which
+    /// `proxy-events.md`'s determinism rule forbids of everything this component
+    /// writes. The cost is that two exchanges in one conversation that hit the
+    /// same rule share a reference.
+    ///
+    /// **The stability is exactly as good as the alias scope's, and the scope has
+    /// a case where it is fresh every time.** `session::Binding::identify` derives the
+    /// scope from the client's session header, or failing that from a
+    /// conversation fingerprint in the body, or failing both from
+    /// `Origin::Ephemeral`, which is random per request. A re-run therefore
+    /// reproduces this reference byte for byte for the first two origins and
+    /// cannot for the third, because under it there is no "same conversation" to
+    /// reproduce: two identical requests with no session header and no anchor are
+    /// two conversations by construction. Saying "stable across a re-run of the
+    /// same request" without that condition was an overclaim, and an auditor who
+    /// diffed two runs of an unanchored request would have found the difference
+    /// and had nothing to read that predicted it.
     fn exchange(&self, rule_id: &str) -> String {
         format!("px_{}", short_hash(&[self.scope, self.provider, rule_id]))
     }

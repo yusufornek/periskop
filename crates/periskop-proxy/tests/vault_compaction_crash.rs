@@ -26,9 +26,33 @@
 //! invariant. A separate assertion then confirms that at least one run really was
 //! killed between the start and the end of a compaction, because a suite where
 //! every child finished first would be green while proving nothing.
+//!
+//! # How the child's ending is decided, and why it used to be a race
+//!
+//! The killer thread and the compaction run at the same time on purpose, so
+//! "which of the two got there first" is the one question this file may not
+//! answer by looking at wall clock leftovers. It used to: the parent read the
+//! exit status beside two marker files and matched on the triple. Three
+//! combinations were listed and a fourth was reachable, because the killer could
+//! fire **after** the `finished` mark was written and before the process left
+//! `main`. That child exited 70 with both marks present, the match arm for it did
+//! not exist, and the parent panicked with "a state this test does not model".
+//! It happened on continuous integration and never on the development machine,
+//! which is the worst shape a gate can have: green means proved, red means look
+//! at the harness, and nobody looks at the code either way.
+//!
+//! The race is gone rather than modelled. The two threads now claim the ending
+//! through one [`AtomicBool`]: whoever swaps it wins, and the loser does nothing
+//! at all. A killer that loses never calls `exit`, so the process ends `0` with
+//! both marks; a compaction that loses writes no mark and parks, so the process
+//! ends `70` with `finished` absent. Every exit status therefore has exactly one
+//! meaning, the classification below is a total function of it, and no arm of it
+//! depends on which thread the scheduler happened to favour.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use periskop_proxy::vault::{
     AliasSeed, Backing, CounterFloor, OpenRequest, Passphrase, ProfileName, Restored, SessionId,
@@ -106,11 +130,26 @@ fn compaction_child_terminates_itself_mid_run() {
     let mut vault = open_vault(&directory).expect("the parent wrote a vault this can open");
     let at = prune_at(&vault);
 
-    // Started only now, so the delay is measured from just before the compaction
-    // rather than from before the key derivation, which would swamp it.
     let marks = PathBuf::from(std::env::var_os(CHILD_MARKS).expect("the parent sets this"));
     std::fs::create_dir_all(&marks).expect("marks");
+
+    // Two flags, and the order between them is the whole timing contract of this
+    // file. `window` says the compaction is about to begin; `ending` is the single
+    // claim on how this process exits, and whichever thread swaps it decides,
+    // while the other is required to do nothing at all.
+    let window = Arc::new(AtomicBool::new(false));
+    let ending = Arc::new(AtomicBool::new(true));
+    let (killer_window, killer_ending) = (Arc::clone(&window), Arc::clone(&ending));
     std::thread::spawn(move || {
+        // The delay is measured from the instant the compaction is about to
+        // begin, not from whenever the scheduler got round to starting this
+        // thread. Starting the clock at thread startup shifted every sample by
+        // however long the spawn took, which on a loaded runner is longer than
+        // the compaction itself, so the sweep stopped covering the window it was
+        // written to cover.
+        while !killer_window.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
         // Spun rather than slept. `thread::sleep` rounds up to the scheduler's
         // granularity, which on the machines this runs on is around a
         // millisecond, so every "short" delay would land at the same instant and
@@ -123,13 +162,36 @@ fn compaction_child_terminates_itself_mid_run() {
         while started.elapsed() < until {
             std::hint::spin_loop();
         }
+        // The claim, taken before the kill rather than after it. A killer that
+        // wakes up once the compaction has already returned finds the claim gone
+        // and leaves the process alone, which is the whole of the fix: it used to
+        // terminate a child that had finished its work, and the parent had no
+        // arm for the state that produced.
+        if !killer_ending.swap(false, Ordering::SeqCst) {
+            return;
+        }
         // No unwinding, no destructors, no cleanup, no rename: the closest thing
         // to a kill that a portable test can produce from inside the process.
         std::process::exit(KILLED);
     });
 
+    // Written before the window opens, so a child that was killed always carries
+    // this mark and "killed before the compaction was reached" is not a state the
+    // parent has to tell apart from a mark that lost a race with `exit`.
     std::fs::write(marks.join("started"), b"1").expect("started");
+    window.store(true, Ordering::Release);
     let outcome = vault.compact(at);
+    if !ending.swap(false, Ordering::SeqCst) {
+        // The killer took the claim while the compaction was still running and is
+        // about to end this process. Nothing more may be written from here: a
+        // `finished` mark laid down now would describe a run that was interrupted
+        // as one that completed, which is the misreading this whole arrangement
+        // exists to prevent. Parking is what lets the killer's `exit` be the only
+        // way out.
+        loop {
+            std::thread::park();
+        }
+    }
     std::fs::write(marks.join("finished"), b"1").expect("finished");
     outcome.expect("the compaction itself must not fail");
 }
@@ -206,14 +268,17 @@ fn seed(scratch: &Scratch) -> Vec<u8> {
 }
 
 /// What one child run left behind.
+///
+/// Two endings, and the child can produce exactly two, because the claim it takes
+/// on its own ending decides which. There is no third state to model and no
+/// combination left over, which is the difference between this and the match that
+/// broke a continuous integration run.
 #[derive(Debug, PartialEq, Eq)]
 enum Ending {
-    /// The child was terminated before it reached the compaction.
-    KilledBeforeStart,
     /// The child was terminated between the start and the end of the compaction:
     /// the window this whole test is about.
     KilledDuring,
-    /// The compaction finished first.
+    /// The compaction finished first, and the killer found the claim gone.
     Finished,
 }
 
@@ -237,14 +302,24 @@ fn run_child(scratch: &Scratch, delay_us: u64) -> Ending {
 
     let started = scratch.marks().join("started").exists();
     let finished = scratch.marks().join("finished").exists();
-    match (child.status.code(), started, finished) {
-        (Some(KILLED), false, _) => Ending::KilledBeforeStart,
-        (Some(KILLED), true, false) => Ending::KilledDuring,
-        (Some(0), true, true) => Ending::Finished,
-        // A child that exited for any other reason is a broken test rather than a
-        // result, and saying so beats letting the invariant below pass over it.
+    // Both arms are decided by the exit status, and the marks are asserted rather
+    // than consulted. The child cannot exit `KILLED` without `started`, because
+    // that mark is written before the killer's window opens; and it cannot exit
+    // `KILLED` with `finished`, because the thread that writes `finished` has by
+    // then taken the claim the killer needs. So no arm here has to guess which of
+    // two threads ran first, and a build where either of those stops holding
+    // fails loudly instead of being classified anyway.
+    match child.status.code() {
+        Some(KILLED) if started && !finished => Ending::KilledDuring,
+        Some(0) if started && finished => Ending::Finished,
+        // Anything else is a broken test rather than a result: a child that
+        // exited zero without recording both marks, one that recorded a
+        // completed compaction and was killed anyway, or one that died of
+        // something other than its own killer. Saying so beats letting the
+        // invariant below pass over it.
         other => panic!(
-            "the child ended in a state this test does not model: {other:?}\n{}",
+            "the child exited {other:?} with started={started} finished={finished}, which is \
+             not an ending it can produce\n{}",
             String::from_utf8_lossy(&child.stderr)
         ),
     }

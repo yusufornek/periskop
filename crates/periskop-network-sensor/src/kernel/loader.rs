@@ -168,6 +168,12 @@ impl KernelEvents for PlatformKernel {
                 .entry("record_undecodable")
                 .or_insert(0) += batch.undecodable;
         }
+        // Read before the events are consumed, and through the accessor rather
+        // than off the number. The loader crate answers `None` when the kernel
+        // would not read its loss counter, and copying `batch.dropped` across
+        // turned that into a zero here: every layer above then saw a run that
+        // lost nothing on a machine where nobody could count the losses.
+        let losses = batch.losses();
         let mut events = Vec::with_capacity(batch.events.len());
         for raw in batch.events {
             match kernel_event_from(raw) {
@@ -181,11 +187,10 @@ impl KernelEvents for PlatformKernel {
                 }
             }
         }
-        KernelBatch {
-            state: super::event::PollState::Attached,
-            events,
-            dropped: batch.dropped,
-        }
+        // Through the constructor, so the decision this line used to get wrong is
+        // made in a function every platform compiles and tests rather than in a
+        // struct literal only one continuous integration job ever sees.
+        KernelBatch::attached_with(events, losses)
     }
 }
 

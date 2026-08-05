@@ -121,9 +121,20 @@ impl SensorOutcome {
     /// Events the capture transport lost under load.
     ///
     /// Zero on a sensor that never started, which is true rather than a
-    /// default: nothing was dropped because nothing was read.
+    /// default: nothing was dropped because nothing was read. A floor rather
+    /// than a count while [`Self::dropped_events_unknown`] is true.
     pub fn dropped_events(&self) -> u64 {
         self.coverage.dropped_events
+    }
+
+    /// Whether the transport left any of its losses uncounted.
+    ///
+    /// The kernel does not always answer for a ring buffer's loss counter. When
+    /// it does not, the number above is zero for the same reason a clean run's
+    /// is, and a pass that reported it without this beside it would tell an
+    /// operator that a machine nobody could measure lost nothing.
+    pub fn dropped_events_unknown(&self) -> bool {
+        self.coverage.dropped_events_unknown
     }
 
     /// Events that named a connection the pass never saw open.

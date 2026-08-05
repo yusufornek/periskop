@@ -172,16 +172,55 @@ pub struct KernelBatch {
     pub state: PollState,
     pub events: Vec<KernelEvent>,
     pub dropped: u64,
+    /// Whether `dropped` is a reading or a placeholder.
+    ///
+    /// True when the kernel would not answer for the ring buffer's loss counter
+    /// at all. The number beside it is then zero because a `u64` has no other
+    /// empty value, and zero is precisely the wrong thing for a reader to
+    /// believe: it is what a healthy run reports. The loader crate has carried
+    /// this distinction since its own `RawBatch` was written, and it was thrown
+    /// away one line into this crate, which put "the kernel would not say" back
+    /// on the same footing as "nothing was lost" everywhere downstream.
+    /// Anything deciding what a coverage statement says has to consult
+    /// [`KernelBatch::losses`] rather than the number.
+    pub dropped_unknown: bool,
 }
 
 impl KernelBatch {
     /// A read from attached programs that had these events.
     pub fn of(events: Vec<KernelEvent>) -> Self {
+        Self::attached_with(events, Some(0))
+    }
+
+    /// A read from attached programs carrying what the kernel said about its
+    /// loss counter.
+    ///
+    /// The one place an `Option<u64>` becomes the number and the flag beside it,
+    /// and it is a constructor rather than four lines inside the seam's `poll`
+    /// for the reason `RawBatch::from_loss_counter` gives one layer down: that
+    /// `poll` is behind `cfg(feature = "ebpf-loader")` and compiles in exactly
+    /// one continuous integration job. Replacing `batch.losses()` with
+    /// `batch.dropped` there is precisely the defect this pair of fields exists
+    /// to prevent, and it survived every test the development machine can run,
+    /// because there was nothing on that machine to compile. Out here it is
+    /// checked on every platform.
+    pub fn attached_with(events: Vec<KernelEvent>, losses: Option<u64>) -> Self {
         Self {
             state: PollState::Attached,
             events,
-            dropped: 0,
+            dropped: losses.unwrap_or(0),
+            dropped_unknown: losses.is_none(),
         }
+    }
+
+    /// What the ring buffer lost, or nothing when the kernel would not say.
+    ///
+    /// The reading that cannot be misread, and the mirror of the loader crate's
+    /// accessor of the same name. `dropped` on its own is zero both for a run
+    /// that lost nothing and for a run that could not find out, and the
+    /// component spec requires a coverage statement to keep those apart.
+    pub fn losses(&self) -> Option<u64> {
+        (!self.dropped_unknown).then_some(self.dropped)
     }
 
     /// A read from attached programs that had nothing.
@@ -251,9 +290,42 @@ mod tests {
             state: PollState::Attached,
             events: Vec::new(),
             dropped: 17,
+            dropped_unknown: false,
         };
         assert_eq!(batch.dropped, 17);
+        assert_eq!(batch.losses(), Some(17));
         assert_eq!(KernelBatch::of(Vec::new()).dropped, 0);
+    }
+
+    /// The seam, built through the constructor the seam uses.
+    ///
+    /// Not through a struct literal: the mapping from the loader crate's
+    /// `Option<u64>` into these two fields lives inside a `poll` that only one
+    /// continuous integration job compiles, and a mutation there that read
+    /// `batch.dropped` instead of `batch.losses()` passed every test on the
+    /// machine this repository is developed on. The constructor is what brings
+    /// that decision out where every platform runs it.
+    #[test]
+    fn a_loss_counter_the_kernel_would_not_read_is_not_a_run_that_lost_nothing() {
+        let quiet = KernelBatch::attached_with(Vec::new(), Some(0));
+        assert_eq!(quiet.losses(), Some(0));
+        assert_eq!(quiet.state, PollState::Attached);
+
+        let busy = KernelBatch::attached_with(Vec::new(), Some(17));
+        assert_eq!(busy.losses(), Some(17));
+        assert_eq!(busy.dropped, 17);
+
+        let unreadable = KernelBatch::attached_with(Vec::new(), None);
+        assert_eq!(
+            unreadable.dropped, quiet.dropped,
+            "the number cannot carry the difference, which is the whole reason for the flag"
+        );
+        assert_eq!(
+            unreadable.losses(),
+            None,
+            "an unreadable loss counter came back as a run that lost nothing"
+        );
+        assert_eq!(unreadable.state, PollState::Attached);
     }
 
     #[test]

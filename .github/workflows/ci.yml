@@ -33,6 +33,11 @@ jobs:
       # Validates every example, and for negative examples also checks that the
       # rejection came from the rule it was written to exercise. An example that
       # fails for the wrong reason is a bug the exit code alone would hide.
+      #
+      # The runner also fails when it finds no example at all. Its counts come
+      # from a directory walk, so a moved examples tree would have printed
+      # "0 example(s) checked, 0 failure(s)" and exited zero, which is the shape
+      # CLAUDE.md O6b forbids: a gate that cannot find its work must fail.
       - name: Validate examples against schemas
         run: npm run validate:schemas
 
@@ -86,22 +91,72 @@ jobs:
 
       # periskop scans its own repository. If the tool cannot run on the codebase
       # that produces it, that is worth finding out here rather than from a user.
+      #
+      # The exit code alone used to close less than it looked like it did. A
+      # broken rule file and an uncompilable query both reach it, because they
+      # become a failing `engine.rule-set-loaded` hit; a rule set that loads
+      # nothing at all did not, because the loader has nothing to complain about,
+      # and `scan.rs` now records that case for the same reason. The report is
+      # read here as well as the status, so that a run which walked no file and
+      # loaded no rule cannot report a clean repository (CLAUDE.md O6b).
       - name: Scan this repository
-        run: cargo run --quiet -p periskop-cli -- scan . --rules rules
+        run: |
+          cargo run --quiet -p periskop-cli -- scan . --rules rules --json > /tmp/self-scan.json
+          python3 - <<'CHECK'
+          import json, sys
+          report = json.load(open("/tmp/self-scan.json"))
+          coverage = report["coverage"]
+          if coverage["parsed_files"] < 1:
+              sys.exit("the self scan parsed no file, so nothing here was examined")
+          rules = [hit for hit in report["policy_ref"]["rule_hits"]
+                   if hit["rule_id"] == "engine.rule-set-loaded"]
+          if rules:
+              sys.exit(f"the rule set did not load cleanly: {rules!r}")
+          print(f"parsed {coverage['parsed_files']} files, {len(report['findings'])} findings")
+          CHECK
 
       # The emitted report is validated against the shipped contract. A schema
       # that only ever sees hand written examples drifts from what the tool
       # actually writes.
+      #
+      # Every fixture tree, not one. `rules/` carries four languages and this gate
+      # ran on the Python fixtures alone, so the report shape produced for Go,
+      # Java and TypeScript was validated nowhere: a coverage entry or a finding
+      # field that only one of those grammars can produce would have shipped
+      # unchecked. The loop is guarded because a glob that matches nothing is the
+      # shape O6b is about, and the language list is derived from `rules/` so that
+      # a fifth language cannot be added with no fixtures behind it.
+      #
+      # `--max-unparsed-ratio 0` is the coverage exit code, which had no caller
+      # anywhere in this file. It belongs on the fixtures rather than on the
+      # repository above: these trees are all source in a language with a grammar,
+      # so zero is the true answer and any drift from it means a grammar stopped
+      # reading a file it used to read. Over the repository the same number would
+      # be dominated by documents and manifests no grammar reads, and the gate
+      # would be a threshold nobody could justify.
       - name: Report conforms to the contract
         run: |
-          cargo run --quiet -p periskop-cli -- scan \
-            crates/periskop-static-scanner/fixtures/python \
-            --rules rules --json > /tmp/report.json
-          npx --no-install ajv validate --spec=draft2020 -c ajv-formats --strict=false \
-            -s schemas/report.schema.json \
-            -r schemas/finding.schema.json \
-            -r schemas/coverage-statement.schema.json \
-            -d /tmp/report.json
+          FIXTURES=crates/periskop-static-scanner/fixtures
+          for RULE_DIR in rules/*/; do
+            LANGUAGE="$(basename "$RULE_DIR")"
+            # The proxy's masking rules are not a scanner language.
+            if [ "$LANGUAGE" = masking ]; then continue; fi
+            test -d "$FIXTURES/$LANGUAGE"
+          done
+          COVERED=0
+          for FIXTURE in "$FIXTURES"/*/; do
+            LANGUAGE="$(basename "$FIXTURE")"
+            cargo run --quiet -p periskop-cli -- scan "$FIXTURE" \
+              --rules rules --max-unparsed-ratio 0 --json > "/tmp/report-$LANGUAGE.json"
+            npx --no-install ajv validate --spec=draft2020 -c ajv-formats --strict=false \
+              -s schemas/report.schema.json \
+              -r schemas/finding.schema.json \
+              -r schemas/coverage-statement.schema.json \
+              -d "/tmp/report-$LANGUAGE.json"
+            COVERED=$((COVERED + 1))
+          done
+          echo "validated $COVERED fixture trees"
+          test "$COVERED" -ge 4
 
       # Surfaces the detection numbers in the job log. The test itself already
       # fails on an uncatalogued miss; this is so a reviewer can see the score
@@ -154,13 +209,36 @@ jobs:
           cargo test -p periskop-cli --test proof_f3
           cat target/f3-proof.json
 
-      # Two builds of the same tree must agree byte for byte.
+      # Two builds of the same tree must agree byte for byte, in every language
+      # the rule set carries. This ran on the Python fixtures alone, so a
+      # nondeterminism that only a Go, Java or TypeScript rule family could
+      # produce (an unordered map in a query walk, a hash seeded per process) had
+      # nothing looking for it. Compared as bytes rather than as parsed documents
+      # too: two files that parse to the same object can still differ in key
+      # order, and a report is promised diffable.
       - name: Report is reproducible
         run: |
-          FIX=crates/periskop-static-scanner/fixtures/python
-          cargo run --quiet -p periskop-cli -- scan "$FIX" --rules rules --json > /tmp/a.json
-          cargo run --quiet -p periskop-cli -- scan "$FIX" --rules rules --json > /tmp/b.json
-          python3 -c "import json,sys; a=json.load(open('/tmp/a.json')); b=json.load(open('/tmp/b.json')); a.pop('envelope'); b.pop('envelope'); sys.exit(0 if a==b else 'two scans of the same tree disagreed')"
+          COMPARED=0
+          for FIXTURE in crates/periskop-static-scanner/fixtures/*/; do
+            LANGUAGE="$(basename "$FIXTURE")"
+            cargo run --quiet -p periskop-cli -- scan "$FIXTURE" --rules rules --json > /tmp/a.json
+            cargo run --quiet -p periskop-cli -- scan "$FIXTURE" --rules rules --json > /tmp/b.json
+            python3 - "$LANGUAGE" <<'CHECK'
+          import json, sys
+          language = sys.argv[1]
+          first, second = open("/tmp/a.json").read(), open("/tmp/b.json").read()
+          if first == second:
+              sys.exit(0)
+          # The envelope carries the wall clock, which is the one field two runs
+          # are allowed to disagree on. Everything else is the report.
+          a, b = json.loads(first), json.loads(second)
+          a.pop("envelope"), b.pop("envelope")
+          sys.exit(0 if a == b else f"two scans of the {language} fixtures disagreed")
+          CHECK
+            COMPARED=$((COMPARED + 1))
+          done
+          echo "compared $COMPARED fixture trees"
+          test "$COMPARED" -ge 4
 
   # F4 exit criterion 1, and the only job in this file that can close it.
   #
@@ -239,12 +317,37 @@ jobs:
       # Both packages, because the sensor carries one of these too: it has been
       # marked and unrunnable through three milestones waiting for a loader, and
       # this is the first job that can run it.
+      #
+      # The count is asserted because `-- --ignored` exits zero when it finds
+      # nothing to run, and these are the only tests in the repository that can
+      # only run here: a rename, a moved `#[ignore]` or a filter that stopped
+      # matching would leave this step green while the privileged path went
+      # unexercised for as long as anybody cared to look (CLAUDE.md O6b).
+      # pipefail is set because the assertion reads a teed log and bash would
+      # otherwise report the exit code of `tee`.
       - name: Loader tests that need a real kernel
         run: |
+          set -o pipefail
           sudo -E env "PATH=$PATH" cargo test -p periskop-ebpf-loader --all-features \
-            -- --ignored --test-threads=1
+            -- --ignored --test-threads=1 | tee /tmp/ignored-loader.txt
           sudo -E env "PATH=$PATH" cargo test -p periskop-network-sensor --all-features \
-            -- --ignored --test-threads=1
+            -- --ignored --test-threads=1 | tee /tmp/ignored-sensor.txt
+          python3 - <<'CHECK'
+          import re, sys
+          for path, package in (("/tmp/ignored-loader.txt", "periskop-ebpf-loader"),
+                                ("/tmp/ignored-sensor.txt", "periskop-network-sensor")):
+              log = open(path).read()
+              results = re.findall(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored", log)
+              if not results:
+                  sys.exit(f"{package}: no test result line, so nothing here reported a run")
+              passed = sum(int(row[0]) for row in results)
+              skipped = sum(int(row[2]) for row in results)
+              if passed == 0:
+                  sys.exit(f"{package}: --ignored matched no test, so this step proved nothing")
+              if skipped:
+                  sys.exit(f"{package}: {skipped} tests were still skipped under --ignored")
+              print(f"{package}: {passed} privileged tests ran, skipped 0")
+          CHECK
         env:
           RUSTFLAGS: -D warnings
 
@@ -461,9 +564,29 @@ jobs:
       - name: Show interpreter
         run: python3 --version
 
+      # `unittest discover` exits zero when it discovers nothing, so a moved test
+      # directory or a renamed file would leave this job green with the hook's
+      # whole suite unrun (CLAUDE.md O6b). `-v` puts the count on stderr and the
+      # floor below is what makes it load bearing.
       - name: Tests
         working-directory: hooks/python
-        run: python3 -m unittest discover
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -v 2>&1 | tee /tmp/hook-python-tests.txt
+          python3 - <<'CHECK'
+          import re, sys
+          log = open("/tmp/hook-python-tests.txt").read()
+          match = re.search(r"^Ran (\d+) tests? in ", log, re.MULTILINE)
+          if not match:
+              sys.exit("unittest printed no run count, so nothing here reported a run")
+          ran = int(match.group(1))
+          if ran == 0:
+              sys.exit("unittest discovered no test, so this step proved nothing")
+          skipped = len(re.findall(r"\.\.\. skipped", log))
+          if skipped:
+              sys.exit(f"{skipped} tests were skipped; this suite is pure standard library and skips nothing")
+          print(f"{ran} hook tests ran, skipped 0")
+          CHECK
 
   hooks-node:
     name: Node runtime hook

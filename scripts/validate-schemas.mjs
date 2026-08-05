@@ -166,4 +166,20 @@ for (const [file] of expectedByFile) {
 }
 
 console.log(`\n${checked} example(s) checked, ${failures} failure(s)`);
+
+// A run that found nothing to check is not a run that passed. Every count above
+// is derived from a directory walk, so a moved examples tree, a renamed suffix or
+// a glob that stopped matching would have left this script printing
+// "0 example(s) checked, 0 failure(s)" and exiting zero, which is the shape
+// CLAUDE.md O6b forbids: a gate that cannot find its work must fail, not succeed
+// quietly. There is no configuration in which this repository legitimately ships
+// zero examples, so the floor is one rather than a number to be tuned.
+if (checked === 0) {
+  console.error(
+    'FAIL no example was checked at all, so this gate validated nothing. ' +
+      'Either the examples were moved or the walk stopped finding them.'
+  );
+  process.exit(1);
+}
+
 process.exit(failures > 0 ? 1 : 0);
