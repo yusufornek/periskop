@@ -415,6 +415,26 @@ fn run_serve_rpc(rules: Option<PathBuf>) -> ExitCode {
         Ok(source) => source,
         Err(given) => return report_missing_rule_directory(given),
     };
+    // Announced once at startup rather than once per request, and on stderr
+    // rather than in the answer. Three constraints decide both halves.
+    //
+    // Why it is said at all: `scan` says it and this command resolves its rules
+    // through the same function, so the bridge was the one caller that could not
+    // tell a downloaded binary's own detectors from a directory somebody edited.
+    //
+    // Why not in the JSON-RPC result: the result is the report, and the report
+    // already carries the class of the answer as `coverage.rule_set_source`
+    // (`embedded` or `directory`, contract 1.2). What it deliberately cannot
+    // carry is the path, because an absolute path in the body would make two
+    // machines produce different bytes for one tree. Adding a field beside the
+    // report would break the same promise from the other end. So stdout stays
+    // byte for byte what it was and the path goes where a path can go.
+    //
+    // Why once: this process serves many requests off one rule set. Repeating
+    // the line per request would say nothing new and would bury the engine's
+    // real diagnostics in the bridge's rolling stderr buffer.
+    eprintln!("periskop: rules {rule_source}");
+
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
 

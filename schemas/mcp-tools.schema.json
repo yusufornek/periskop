@@ -339,13 +339,18 @@
             "files_unread",
             "libraries_without_rules",
             "runtime_hooks",
-            "network_sensor"
+            "network_sensor",
+            "rule_set_source"
           ],
           "additionalProperties": false,
           "properties": {
             "files_read": { "$ref": "#/$defs/count" },
             "files_unread": { "$ref": "#/$defs/count" },
             "libraries_without_rules": { "type": "array", "items": { "type": "string" } },
+            "rule_set_source": {
+              "enum": ["embedded", "directory"],
+              "description": "Where the detectors that decided this run came from, passed through from the report's coverage statement (coverage-statement.schema.json, contract 1.2). Required on the summary and not left to the full report, because the summary is what this reader usually reads and the answer changes what every count beside it means: a narrow local rule set produces a cleaner summary than the shipped detectors do, and a caller shown zero confirmed findings without this field cannot tell the two apart. Closed at the same two values as the field it mirrors rather than a free string like reconciliation_mode above: that field is free because an unrecognised mode is passed through rather than flattened, whereas a third rule set source would be a value the coverage statement itself rejects, so passing it through would carry an invalid report to the reader as if it were valid. No path, for the reason the report carries none: an absolute path differs between machines and would break byte identical reproducibility. The path is announced on the engine's stderr at startup instead."
+            },
             "runtime_hooks": {
               "enum": ["instrumented", "degraded", "not_instrumented", "unknown"],
               "description": "A one line reduction of the per language list, four valued and never a boolean. Unknown is the answer when the report named no language or named a status this server has not been taught: false there was published as the hooks were not attached, a claim about the user's machine built from a list the server never received. Degraded keeps its own word, because folding it into instrumented claims coverage the report did not and folding it into not_instrumented drops observations that exist. Spelled snake_case under ADR-006 K-09, which allows two documented exceptions and no third; not_instrumented also matches the sibling status this value is reduced from."

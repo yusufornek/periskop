@@ -75,6 +75,13 @@ const coverage = z.object({
   // gives; declaring it keeps that trap visible and lets a test prove the answer
   // does not come from it.
   sensor_platform_class: z.string().optional(),
+  // Which detector set decided the run (coverage-statement.schema.json 1.2).
+  // Optional here and required in the tool surface: an engine older than the
+  // field sends nothing, and a boundary that rejected the whole report over it
+  // would turn a missing field into no answer at all. The tool response is
+  // where it becomes mandatory, because that is a document this server writes
+  // rather than one it receives.
+  rule_set_source: z.enum(["embedded", "directory"]).optional(),
   in_scope_flows: z.number().optional(),
   out_of_scope_flows: z.number().optional(),
   known_benign_flows: z.number().optional(),

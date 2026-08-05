@@ -149,6 +149,11 @@ export function referenceReport(): Record<string, unknown> {
       ],
       reconciliation_mode: "full",
       sensor_platform_class: "linux_ebpf",
+      // The reference report carries every field the surface has to describe.
+      // A field the engine sends and this document omits vanishes from the
+      // derived surface, which is how a shape check passes over something it was
+      // written to cover.
+      rule_set_source: "embedded",
       in_scope_flows: 30,
       out_of_scope_flows: 9,
       known_benign_flows: 4,

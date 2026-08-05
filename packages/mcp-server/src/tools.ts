@@ -246,6 +246,12 @@ export async function runScan(
       // until the third source arrived, which was the wrong answer for every run
       // that had a sensor and an unprovable one for every run that did not.
       network_sensor: networkSensor(report.coverage),
+      // Which detectors decided this run: the set built into the binary, or a
+      // directory somebody named. It belongs in the summary rather than only in
+      // the full report because the summary is what most readers stop at, and a
+      // narrower rule set produces a cleaner answer. Passed through from the
+      // coverage statement; the path is deliberately not carried, there or here.
+      rule_set_source: report.coverage.rule_set_source,
     },
     findings: page.map(condense),
     page: {

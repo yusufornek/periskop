@@ -224,6 +224,37 @@ test("the flow buckets and their denominator cross the boundary as numbers", { s
   }
 });
 
+test("the engine names the rule set it used", { skip: !available }, async () => {
+  // Same half a recorded report cannot check. The contract gate derives the
+  // surface from a reference document, so it proves this server passes the
+  // field through and proves nothing about whether the engine sends one.
+  //
+  // Both branches are driven, because one value is not evidence that the field
+  // tracks anything. The bridge above names a rules directory, so it has to
+  // answer "directory"; a bridge that names none reaches the set built into the
+  // binary. A field stuck on either value passes one of these and fails the
+  // other.
+  const named = bridge();
+  try {
+    const result = (await runScan(named, { path: fixtures })) as {
+      coverage: { rule_set_source?: string };
+    };
+    assert.equal(result.coverage.rule_set_source, "directory");
+  } finally {
+    await named.close();
+  }
+
+  const builtIn = new EngineBridge({ binary, timeoutMs: 60_000 });
+  try {
+    const result = (await runScan(builtIn, { path: fixtures })) as {
+      coverage: { rule_set_source?: string };
+    };
+    assert.equal(result.coverage.rule_set_source, "embedded");
+  } finally {
+    await builtIn.close();
+  }
+});
+
 test("one process serves many requests", { skip: !available }, async () => {
   // Restarting per call would pay rule compilation every time, which dominates
   // the cost of a small scan.

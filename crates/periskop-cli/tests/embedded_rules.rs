@@ -15,8 +15,9 @@
 //! was broken. A test calling the scan library would pass with the rule set the
 //! library was handed.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// A directory outside the repository, holding nothing but what the test puts in
 /// it.
@@ -123,6 +124,95 @@ fn the_run_says_which_rule_set_decided_it() {
     assert!(
         stderr.contains("periskop: rules built into this binary"),
         "{stderr}"
+    );
+}
+
+/// Runs `serve-rpc`, feeds it the given lines and closes the input.
+///
+/// The real executable rather than the `rpc::serve` library entry point, because
+/// what is under test here is the split between the two output streams and a
+/// library call has only one caller supplied writer.
+fn serve_rpc(
+    binary: &Path,
+    working_directory: &Path,
+    extra: &[&str],
+    requests: &str,
+) -> (i32, String, String) {
+    let mut child = Command::new(binary)
+        .arg("serve-rpc")
+        .args(extra)
+        .current_dir(working_directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the bridge started");
+    child
+        .stdin
+        .take()
+        .expect("a pipe to the bridge")
+        .write_all(requests.as_bytes())
+        .expect("the request was sent");
+    let output = child.wait_with_output().expect("the bridge exited");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+const PING: &str = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
+
+#[test]
+fn the_rpc_bridge_says_which_rule_set_decided_it() {
+    // The gap this closes: `scan` printed the declaration and `serve-rpc`, which
+    // resolves its rules through the same function, printed nothing. An editor
+    // driving the bridge could not tell the detectors shipped in the binary from
+    // a directory somebody edited, and the two produce different verdicts on one
+    // tree.
+    let elsewhere = Elsewhere::new("rpc-announce");
+    let binary = elsewhere.install_binary();
+
+    let (code, _, stderr) = serve_rpc(&binary, &elsewhere.root, &[], PING);
+
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("periskop: rules built into this binary"),
+        "the bridge did not say which rule set decided it: {stderr}"
+    );
+}
+
+#[test]
+fn the_rpc_bridge_names_the_directory_and_keeps_the_answer_byte_identical() {
+    // Two claims in one run, because they constrain each other. The path has to
+    // reach the reader, and it can only reach them on stderr: the report body
+    // carries the source as a closed enum on purpose, and an absolute path in
+    // the answer would make two machines produce different bytes for one tree.
+    // So the second assertion is the price of the first, and it is checked
+    // against the embedded run rather than against a literal, which is what
+    // makes it fail if the declaration ever moves to stdout.
+    let elsewhere = Elsewhere::new("rpc-directory");
+    let binary = elsewhere.install_binary();
+    let rules = elsewhere.root.join("own-rules");
+    std::fs::create_dir_all(rules.join("python")).expect("a rule directory");
+
+    let (embedded_code, embedded_stdout, _) = serve_rpc(&binary, &elsewhere.root, &[], PING);
+    let (code, stdout, stderr) = serve_rpc(
+        &binary,
+        &elsewhere.root,
+        &["--rules", &rules.to_string_lossy()],
+        PING,
+    );
+
+    assert_eq!(embedded_code, 0);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("periskop: rules read from") && stderr.contains(&*rules.to_string_lossy()),
+        "the bridge did not name the directory it was given: {stderr}"
+    );
+    assert_eq!(
+        stdout, embedded_stdout,
+        "the declaration reached the JSON-RPC stream and changed the answer's bytes"
     );
 }
 

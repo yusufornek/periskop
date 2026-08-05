@@ -177,6 +177,60 @@ fn a_whole_vault_lifetime_leaves_the_filesystem_as_it_found_it() {
     );
 }
 
+/// The positive control for the `$TMPDIR` half of the watch above.
+///
+/// The other two roots are listed whole, so a broken listing there shows up as a
+/// missing entry the moment anything exists under them. `$TMPDIR` is not: it is
+/// shared with the machine, so it is screened by name, and a screen that matched
+/// nothing would leave the watch passing because it **saw** nothing rather than
+/// because nothing was written. From the outside those two are the same green
+/// line, and that ambiguity survived two rounds of review: one round read this
+/// file looking for exactly this control, did not find it, and could not tell
+/// whether the surface was covered.
+///
+/// So the file the vault must never leave behind is written here on purpose and
+/// the screen is required to notice it. This is the same device the temporary
+/// file surface in `vault_no_plaintext.rs` uses, where a compaction candidate
+/// holding only its header is rejected as a surface that proves nothing.
+#[test]
+fn the_temporary_file_screen_notices_a_file_it_exists_to_catch() {
+    // Deliberately not named after this product. The watch above screens the whole
+    // of `$TMPDIR` by name and the two tests run in parallel, so a scratch
+    // directory called `periskop-...` would appear in that test's listing as a file
+    // the vault wrote. What carries the name is the file inside, which is the thing
+    // being screened for.
+    let scratch = std::env::temp_dir().join(format!("watch-control-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).unwrap();
+
+    // A root that is not there, so the whole-directory listing contributes nothing
+    // and the only thing under test is the name screen.
+    let absent = scratch.join("no-such-working-directory");
+    let watched = Watched {
+        working: &absent,
+        home_vault: None,
+        temporary: &scratch,
+    };
+
+    let before = listing(&watched);
+    let planted = scratch.join("periskop-vault.psk");
+    std::fs::write(&planted, b"the mapping this product may never write down").unwrap();
+    let after = listing(&watched);
+
+    let appeared: Vec<PathBuf> = after
+        .difference(&before)
+        .map(|(path, _)| path.clone())
+        .collect();
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    assert!(
+        appeared.contains(&planted),
+        "the screen did not notice {}, so the watch above passes by seeing nothing \
+         rather than by nothing being written: {appeared:?}",
+        planted.display()
+    );
+}
+
 #[test]
 fn no_module_of_this_crate_names_a_filesystem_api_without_an_allowance() {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
