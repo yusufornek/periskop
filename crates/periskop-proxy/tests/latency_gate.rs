@@ -52,22 +52,33 @@
 //! environment variable is a claim, and a claim nothing checks is how a two core
 //! runner ends up owning the number a release note quotes.
 //!
-//! # Where the two numbers come from
+//! # Where the two numbers come from, and why they are here at all
 //!
-//! Neither the threshold nor the environment is written down in this file.
+//! The threshold is `docs/05-quality/performance-budgets.md`'s, which
+//! `perf-budgets.md` names as the document that wins on what a budget is. The
+//! environment is `perf-budgets.md` section 4's, which owns where a budget is
+//! measured. Neither document is published: `.gitignore` excludes `docs/`, so a
+//! clone and every CI checkout carry none of it, and a gate that could only read
+//! its threshold from there could not run in the one place it has to run. That
+//! is not hypothetical, it is the state this file was audited in.
 //!
-//! - The **150 ms** is read at run time from
-//!   `docs/05-quality/performance-budgets.md`, which `perf-budgets.md` names as the
-//!   document that wins on what a budget is.
-//! - The **environment** is read from `perf-budgets.md` section 4, which owns where
-//!   a budget is measured.
+//! So both numbers are carried here as well, and the copies are held to their
+//! owners rather than left to drift. On every tree that has the documents, which
+//! is every developer machine and every orchestrator run and therefore every tree
+//! where a budget is ever edited, `the_carried_numbers_agree_with_the_documents_that_own_them`
+//! parses both rows and fails if they disagree. On a tree that has none, it does
+//! not skip quietly: it asserts that `docs/` is absent altogether, so a moved
+//! document and a published tree cannot be mistaken for each other, and the
+//! artefact records which of the two this run was in
+//! `budget_source.agreement_with_document_checked`.
 //!
-//! A constant here would be a second source. Relaxing a budget takes a document
-//! edit and an ADR reference (`performance-budgets.md`, "CI'da bütçe aşımı kuralı"
-//! item 4); a copy in this file would keep gating on the old number while the
-//! document said otherwise, and nothing would report the disagreement. Both
-//! readers fail loudly rather than falling back to a default: a gate that invents
-//! its own threshold when the document moves is a gate nobody is maintaining.
+//! The remaining gap is named rather than papered over: a published tree has no
+//! normative statement of the threshold at all. What closes it is committing
+//! `perf-budgets.json`'s `budgets[]` and `reference_environments[]`, which
+//! `perf-budgets.md` section 1 already declares and whose schema is published.
+//! Until then, relaxing this budget still takes a document edit and an ADR
+//! reference (`performance-budgets.md`, "CI'da bütçe aşımı kuralı" item 4), and
+//! this file turns red at the moment somebody does one without the other.
 //!
 //! # The budget rows
 //!
