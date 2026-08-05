@@ -32,7 +32,7 @@ use crate::policy::{Policy, ToolCallPolicy};
 use crate::vault::{SessionId, Vault, VaultError};
 
 use super::admin::{Metrics, PolicyProjection};
-use super::declare::{rejected, Declared, Gap};
+use super::declare::{rejected, Declared, Gap, Subject};
 use super::errors::{ProxyError, Refusal};
 use super::event::{Measurement, Parts, ProxyEvent};
 use super::headers::{HeaderList, Marks, SESSION_HEADER};
@@ -175,6 +175,14 @@ pub struct Gateway {
     /// per request is a leak that grows at the rate the organisation talks to its
     /// models.
     events: Mutex<Vec<ProxyEvent>>,
+    /// The `unmasked_passthrough` findings this process has produced, newest last.
+    ///
+    /// The third leg of `proxy-api.md`'s three legged declaration, and it is a
+    /// field here because a leg nothing keeps is a leg nothing made: the
+    /// declaration type built a finding and handed it back through an accessor no
+    /// source file called, so the contract's "declared in three places at once"
+    /// was true in two of them. Bounded like [`Self::events`], for the same reason.
+    findings: Mutex<Vec<Value>>,
     upstream: Arc<dyn Upstream>,
     clock: Clock,
 }
@@ -184,6 +192,13 @@ pub struct Gateway {
 /// The oldest are dropped first. Losing an old measurement costs a data point in
 /// a local benchmark; keeping every one of them costs the process.
 const EVENTS_KEPT: usize = 4096;
+
+/// How many declared gaps stay in memory, oldest dropped first.
+///
+/// Smaller than [`EVENTS_KEPT`] because a finding is only written when a request
+/// actually crossed unmasked, so a process producing four thousand of them has a
+/// policy problem rather than a memory problem.
+const FINDINGS_KEPT: usize = 1024;
 
 impl Gateway {
     /// Builds a gateway around a loaded policy and an open vault.
@@ -225,6 +240,7 @@ impl Gateway {
             metrics: Mutex::new(Metrics::default()),
             log: Mutex::new(Vec::new()),
             events: Mutex::new(Vec::new()),
+            findings: Mutex::new(Vec::new()),
             upstream,
             clock,
         })
@@ -274,6 +290,26 @@ impl Gateway {
     /// in `src/` learns the type's name.
     pub fn events(&self) -> Vec<ProxyEvent> {
         lock(&self.events).clone()
+    }
+
+    /// Every `unmasked_passthrough` finding this gateway has produced, oldest
+    /// first, as the documents `finding.schema.json` describes.
+    ///
+    /// The reader of the declaration's third leg. It exists so the leg is
+    /// **produced** rather than merely constructible: what a caller cannot read is
+    /// indistinguishable from what was never written, and that is exactly the
+    /// state this was in.
+    pub fn findings(&self) -> Vec<Value> {
+        lock(&self.findings).clone()
+    }
+
+    /// Files one finding, dropping the oldest once the bound is reached.
+    fn file_finding(&self, document: Value) {
+        let mut findings = lock(&self.findings);
+        while findings.len() >= FINDINGS_KEPT {
+            findings.remove(0);
+        }
+        findings.push(document);
     }
 
     /// Handles one request.
@@ -510,7 +546,7 @@ impl Gateway {
         record.session_origin = identity.origin();
         record.alias_scope = identity.scope();
 
-        let prepared = self.prepare_body(treatment, parsed, &identity, &mut record);
+        let prepared = self.prepare_body(treatment, parsed, &identity, provider, &mut record);
         let (body, snapshot) = match prepared {
             Ok(prepared) => prepared,
             Err(refusal) => {
@@ -696,6 +732,17 @@ impl Gateway {
         record: &mut RequestRecord,
         now_ms: u64,
     ) -> Result<Vec<u8>, Refusal> {
+        // Before anything is read, whether it **can** be read. A conversation with
+        // no aliases has nothing to put back, so a coded answer is the provider's
+        // business and crosses untouched; one with aliases is an answer whose
+        // words this proxy owes the user, and it cannot owe them out of bytes it
+        // cannot open.
+        if !snapshot.is_empty() {
+            if let Some(refusal) = Self::coding_refusal(answer.headers.get("content-encoding")) {
+                return Err(refusal);
+            }
+        }
+
         let content_type = answer.headers.get("content-type");
         let body = self.restored_bytes(answer, snapshot, lookup, record, now_ms, content_type);
 
@@ -786,6 +833,48 @@ impl Gateway {
         })
     }
 
+    /// The refusal an answer owes when it arrives in a coding this build cannot
+    /// read.
+    ///
+    /// `None` for every ordinary answer, because [`super::headers::to_upstream`]
+    /// asks the provider for `identity` and a provider that honours RFC 9110
+    /// answers in it. This is the second lock: a provider is free to ignore the
+    /// negotiation, and what happened when one did was the failure this whole
+    /// component is built to make impossible. The coded bytes parsed as no JSON,
+    /// the branch for "a body that does not parse is the provider's, not ours to
+    /// rewrite" forwarded them whole, the user read `PSK_EMAIL_1` off the screen
+    /// and `restore_stats.aliases_leaked` said `0`. Restoration had not run and
+    /// nothing in the record said so.
+    ///
+    /// **The value is the closest one the vocabulary holds, and it is not exact.**
+    /// `proxy-api.md` fixes ten values and none of them names a representation
+    /// this build cannot decode; `endpoint_unsupported` is the entry for "an
+    /// endpoint or a field this build does not implement", and a content coding
+    /// with no decoder here is a field of the exchange this build does not
+    /// implement. Its 400 reads as a client error and this is nearer the
+    /// provider's, which is the inexactness: it is recorded rather than papered
+    /// over, and the request for a dedicated value is filed in
+    /// `hub/memory/interfaces.md`. Inventing an eleventh value here would put a
+    /// word on the wire that no contract defines, which the closed vocabulary
+    /// exists to prevent.
+    fn coding_refusal(content_encoding: Option<&str>) -> Option<Refusal> {
+        if super::stream::is_readable_coding(content_encoding) {
+            return None;
+        }
+        // The declared coding is a token from a registry, not content, so it can
+        // travel in the detail the way a field name does.
+        let declared = content_encoding.unwrap_or_default();
+        Some(Refusal::new(
+            ProxyError::EndpointUnsupported,
+            format!(
+                "the provider answered in the content coding \"{declared}\", which this build \
+                 cannot read, so this conversation's values could not be put back into the \
+                 answer. The answer is not delivered rather than delivered with its aliases \
+                 still in it."
+            ),
+        ))
+    }
+
     /// The refusal a restored answer owes when a vault record did not verify.
     ///
     /// `None` when nothing was tampered with, which is every ordinary request.
@@ -816,6 +905,7 @@ impl Gateway {
         treatment: Treatment,
         parsed: Option<Value>,
         identity: &super::session::Identity,
+        provider: Provider,
         record: &mut RequestRecord,
     ) -> Result<(Vec<u8>, Arc<Snapshot>), Refusal> {
         let session = &identity.id();
@@ -824,10 +914,15 @@ impl Gateway {
             // No body: a model list. Nothing to scan and nothing to declare.
             return Ok((Vec::new(), empty()));
         };
+        let subject = Subject {
+            scope: &record.alias_scope,
+            provider: provider.as_str(),
+        };
 
         if treatment == Treatment::UnmaskedAndDeclared {
-            let declared = Declared::make(Gap::UnsupportedEndpoint, true, true)?;
+            let declared = Declared::make(Gap::UnsupportedEndpoint, true, true, subject)?;
             record.degraded.push(declared.reason());
+            self.file_finding(declared.finding().to_value());
             return Ok((parsed.to_string().into_bytes(), empty()));
         }
         if treatment == Treatment::NoUserText {
@@ -838,8 +933,13 @@ impl Gateway {
             match self.policy.tool_call_policy() {
                 ToolCallPolicy::Reject => return Err(rejected()),
                 ToolCallPolicy::PassThrough => {
-                    let declared = Declared::make(Gap::ToolArguments, true, true)?;
+                    let declared = Declared::make(Gap::ToolArguments, true, true, subject)?;
                     record.degraded.push(declared.reason());
+                    // The third leg, written where a caller can read it. Filed
+                    // beside the reason rather than after the request completes,
+                    // so that the leg exists before the unmasked body is handed to
+                    // the upstream and not after it has already crossed.
+                    self.file_finding(declared.finding().to_value());
                 }
             }
         }
@@ -1164,6 +1264,104 @@ mod tests {
         assert_eq!(record.measured.record_tamper, 1);
     }
 
+    /// A coded answer is bytes the restore walk cannot read, and reading is the
+    /// whole job.
+    ///
+    /// What happened before this test: `restore_body` parsed the gzip bytes as
+    /// JSON, `serde_json::from_slice(...).ok()?` said `None`, and the branch that
+    /// handles a body "the provider's, not ours to rewrite" forwarded it whole.
+    /// The user saw `PSK_EMAIL_1` and the event record said `aliases_leaked: 0`,
+    /// so the one counter that exists to report an unrestored alias reported a
+    /// clean run. The answer is refused instead: a body this proxy cannot read is
+    /// a body it cannot vouch for, and section 10's rule is that it refuses rather
+    /// than delivering what it did not check.
+    #[test]
+    fn an_answer_in_a_coding_this_build_cannot_read_is_refused_instead_of_forwarded() {
+        let gateway = tamper_gateway();
+        let mut book = minter();
+        let alias = book
+            .mint(EntityType::Email, "ali@ornek.com")
+            .expect("an address is minted")
+            .alias;
+        let snapshot = refreshed(&Arc::new(Snapshot::empty()), &book);
+
+        // The bytes are irrelevant: what decides is the declared coding, because
+        // deciding on the bytes would mean guessing at a format.
+        let answer = Answer {
+            status: 200,
+            headers: HeaderList::new()
+                .with("content-type", "application/json")
+                .with("content-encoding", "gzip"),
+            body: b"\x1f\x8b\x08\x00\x00\x00\x00\x00".to_vec(),
+            chunks: Vec::new(),
+        };
+        let mut record = gateway.blank_record();
+        let mut lookup = Table::of(&[(alias.as_str(), "ali@ornek.com")]);
+        let refusal = gateway
+            .restore_with(&answer, &snapshot, &mut lookup, &mut record, 0)
+            .expect_err("a coded answer was delivered with its aliases unrestored");
+        assert_eq!(refusal.error(), ProxyError::EndpointUnsupported);
+        assert!(refusal.detail().contains("gzip"), "{}", refusal.detail());
+
+        // The two codings that mean "no coding" are read, or every ordinary
+        // answer would be refused and the rule would be a denial of service.
+        for readable in [None, Some("identity"), Some("")] {
+            let mut headers = HeaderList::new().with("content-type", "application/json");
+            if let Some(coding) = readable {
+                headers.push("content-encoding", coding);
+            }
+            let plain = Answer {
+                status: 200,
+                headers,
+                body: serde_json::json!({ "content": alias })
+                    .to_string()
+                    .into_bytes(),
+                chunks: Vec::new(),
+            };
+            let mut record = gateway.blank_record();
+            let body = gateway
+                .restore_with(&plain, &snapshot, &mut lookup, &mut record, 0)
+                .unwrap_or_else(|refusal| panic!("{}", refusal.detail()));
+            assert!(
+                String::from_utf8_lossy(&body).contains("ali@ornek.com"),
+                "{readable:?} was treated as unreadable"
+            );
+        }
+
+        // A conversation that minted nothing has nothing to put back, so a coded
+        // answer is the provider's business and crosses untouched. Without this
+        // half the rule would refuse every compressed answer to a prompt that
+        // held no entity, which is most of them.
+        let empty = Arc::new(Snapshot::empty());
+        let mut record = gateway.blank_record();
+        assert!(gateway
+            .restore_with(&answer, &empty, &mut lookup, &mut record, 0)
+            .is_ok());
+    }
+
+    /// A stand-in table, so the assertions above are about the coding rule rather
+    /// than about Argon2id.
+    struct Table {
+        rows: BTreeMap<String, String>,
+    }
+
+    impl Table {
+        fn of(rows: &[(&str, &str)]) -> Self {
+            Self {
+                rows: rows
+                    .iter()
+                    .map(|(alias, value)| ((*alias).to_owned(), (*value).to_owned()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Lookup for Table {
+        fn value_for(&mut self, alias: &str) -> Option<String> {
+            self.rows.get(alias).cloned()
+        }
+    }
+
     /// Ö-5: layer A failing to load stops the proxy instead of masking nothing.
     #[test]
     fn a_detection_layer_that_did_not_load_refuses_to_start_rather_than_running_empty() {
@@ -1181,8 +1379,181 @@ mod tests {
         assert!(crate::detect::pattern::shapes_are_loadable());
     }
 
+    /// `proxy-api.md`, "Tool-call argümanları": "geçiş vardır ama sessiz geçiş
+    /// yoktur", declared in three places **at once**.
+    ///
+    /// What was true before this test: two of the three. The header carried
+    /// `tool_arguments_unmasked`, the event record carried it in
+    /// `degraded_reasons[]`, and the finding was built by `Declared::make` and
+    /// handed back through an accessor that no file under `src/` ever called. So
+    /// the type looked like it enforced the contract's "üçünden biri
+    /// üretilemiyorsa istek reddedilir" while the third leg was produced by
+    /// nothing and refused by nothing.
+    ///
+    /// Driven through `handle` rather than through `prepare_body`, because the
+    /// claim is about what a running proxy emits and a unit test on the builder is
+    /// what was already passing.
+    #[tokio::test]
+    async fn a_tool_call_that_crosses_unmasked_is_declared_in_all_three_places() {
+        let gateway = tamper_gateway();
+        let outgoing = gateway.handle(tool_call_request()).await;
+
+        // 1. the response header. It carries every reason this request raised, so
+        // the assertion is that this one is among them rather than that it is the
+        // only one: `ner_disabled` is on every request by construction.
+        let declared_header = outgoing
+            .headers
+            .get("x-periskop-degraded")
+            .unwrap_or_default();
+        assert!(
+            declared_header
+                .split(',')
+                .any(|reason| reason == "tool_arguments_unmasked"),
+            "{declared_header}"
+        );
+
+        // 2. the event record.
+        let event = gateway
+            .events()
+            .pop()
+            .expect("a masked round trip produced no event record");
+        let reasons = event.to_value()["degraded_reasons"].clone();
+        assert!(
+            reasons
+                .as_array()
+                .is_some_and(|list| list.iter().any(|r| r == "tool_arguments_unmasked")),
+            "{reasons}"
+        );
+
+        // 3. the finding, which is the leg that was missing.
+        let findings = gateway.findings();
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        let finding = &findings[0];
+        assert_eq!(finding["kind"], "unmasked_passthrough");
+        assert_eq!(finding["detector"]["component"], "proxy");
+        assert_eq!(
+            finding["detector"]["rule_id"],
+            "proxy.tool-call.unmasked-arguments"
+        );
+        assert_eq!(finding["provider_ref"], "openai");
+        assert!(!outgoing
+            .headers
+            .get("x-periskop-alias-scope")
+            .unwrap_or_default()
+            .is_empty());
+
+        // The exchange reference names the **conversation**, so the same gap in
+        // the same conversation is one reference and a different conversation is a
+        // different one. Without the second half a report would fold two
+        // organisations' gaps into one row.
+        gateway.handle(tool_call_request()).await;
+        let again = gateway.findings();
+        assert_eq!(again.len(), 2);
+        assert_eq!(again[0], again[1]);
+
+        let elsewhere = Incoming {
+            headers: HeaderList::new()
+                .with("content-type", "application/json")
+                .with(SESSION_HEADER, "a-different-conversation"),
+            ..tool_call_request()
+        };
+        gateway.handle(elsewhere).await;
+        let third = gateway.findings();
+        assert_ne!(
+            third[2]["refs"][0]["ref_id"], third[0]["refs"][0]["ref_id"],
+            "two conversations produced one exchange reference"
+        );
+
+        // And a request with no structured arguments declares nothing, or the
+        // three legs above would be noise rather than a signal.
+        let quiet = tamper_gateway();
+        let plain = quiet
+            .handle(Incoming {
+                body: serde_json::json!({
+                    "model": "gpt-4o",
+                    "messages": [{ "role": "user", "content": "merhaba" }],
+                })
+                .to_string()
+                .into_bytes(),
+                ..tool_call_request()
+            })
+            .await;
+        let quiet_header = plain
+            .headers
+            .get("x-periskop-degraded")
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            !quiet_header
+                .split(',')
+                .any(|reason| reason == "tool_arguments_unmasked"),
+            "{quiet_header}"
+        );
+        assert!(quiet.findings().is_empty(), "{:#?}", quiet.findings());
+    }
+
+    /// The other half of the same rule: a leg that cannot be produced refuses the
+    /// request instead of forwarding it.
+    #[tokio::test]
+    async fn a_gap_that_cannot_be_declared_is_refused_and_nothing_reaches_the_provider() {
+        let recorder = Arc::new(super::super::upstream::Recorder::ok());
+        let gateway =
+            gateway_over(Arc::clone(&recorder) as Arc<dyn super::super::upstream::Upstream>);
+
+        // A provider name the finding schema cannot hold is the reachable shape
+        // of "the third leg could not be produced": `Subject::is_nameable` is
+        // what decides, and it asks the schema's own question.
+        let refusal = Declared::make(
+            Gap::ToolArguments,
+            true,
+            true,
+            Subject {
+                scope: "9f2c",
+                provider: "OpenAI",
+            },
+        )
+        .expect_err("a gap with no nameable provider was declared");
+        assert_eq!(refusal.error(), ProxyError::ToolArgumentsRejected);
+        assert_eq!(refusal.status(), 400);
+
+        // And the policy that refuses outright still refuses through the running
+        // path, so the two roads to a 400 are both walked.
+        let outgoing = gateway.handle(tool_call_request()).await;
+        assert_eq!(
+            outgoing.status, 200,
+            "the shipped policy passes and declares"
+        );
+        assert_eq!(recorder.calls().len(), 1);
+    }
+
+    fn tool_call_request() -> Incoming {
+        Incoming {
+            method: "POST".to_owned(),
+            path: "/v1/chat/completions".to_owned(),
+            query: None,
+            headers: HeaderList::new()
+                .with("content-type", "application/json")
+                .with(SESSION_HEADER, "the-user-s-conversation"),
+            body: serde_json::json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "faturayi olustur" }],
+                "tools": [{
+                    "type": "function",
+                    "function": { "name": "create_invoice" },
+                }],
+            })
+            .to_string()
+            .into_bytes(),
+        }
+    }
+
     /// A gateway with nothing behind it, for the rule above.
     fn tamper_gateway() -> Gateway {
+        gateway_over(Arc::new(super::super::upstream::Recorder::ok())
+            as Arc<dyn super::super::upstream::Upstream>)
+    }
+
+    fn gateway_over(upstream: Arc<dyn super::super::upstream::Upstream>) -> Gateway {
         use crate::vault::{Backing, OpenRequest, Passphrase, ProfileName, Vault};
         let vault = Vault::open(&OpenRequest {
             passphrase: &Passphrase::new(b"an operator's passphrase".to_vec()),
@@ -1199,8 +1570,7 @@ mod tests {
         Gateway::new(
             policy,
             vault,
-            Arc::new(super::super::upstream::Recorder::ok())
-                as Arc<dyn super::super::upstream::Upstream>,
+            upstream,
             crate::http::AllowList::shipped(),
             Clock::Fixed(1_700_000_000_000),
         )

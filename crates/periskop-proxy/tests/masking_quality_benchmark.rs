@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
-//! **Milestone 96, F4 exit criterion 6 (partial).** The masking quality
-//! benchmark's **runner**, section (b) of `docs/05-quality/benchmarks.md`.
+//! **Milestone 96, F4 exit criterion 6 (deferred out of F4).** The masking
+//! quality benchmark's **runner**, section (b) of `docs/05-quality/benchmarks.md`.
 //!
 //! # This file produces a runner, not a number
 //!
@@ -9,9 +9,11 @@
 //! the same prompt: one **masked** through periskop, and one **raw**, which sends
 //! unmasked personal data to a real model provider. That second run is the exact
 //! thing this product exists to prevent, it costs money at a provider, and
-//! CLAUDE.md forbids periskop from being an egress source. So it never runs in
-//! continuous integration, and the numbers in a release note come from an
-//! operator's own recorded session with a funded key.
+//! CLAUDE.md forbids periskop from being an egress source. KG-032 records the
+//! consequence as a permanent constraint rather than as a to do item: the scored
+//! half is not written here, cannot be gated here, and criterion 6 is deferred
+//! out of F4 on that ground (`roadmap.md`, F4 criterion 6). The numbers in a
+//! release note come from an operator's own recorded session with their own key.
 //!
 //! What runs here is everything around the number:
 //!
@@ -19,9 +21,31 @@
 //! |---|---|
 //! | the consent gate, the funded key check, the sample floor, the corpus rule | everywhere, as ordinary tests over a total function |
 //! | the mechanical half: masking, alias generation, restoration, the counters | everywhere, against a stub upstream, offline |
-//! | the scored half: raw run, masked run, degradation | an operator's machine, with a key and a pinned model snapshot, and nowhere else |
+//! | the scored half: raw run, masked run, degradation | nowhere in this repository, in any configuration of this binary |
 //!
-//! # The three ways this runner refuses
+//! # What a fully provisioned run gets
+//!
+//! Six nulls, a reason beside each one, `n: 0`, and a status that says only the
+//! mechanical half ran. The same as a run with nothing set at all, and that is
+//! the point.
+//!
+//! It is also the defect this file was corrected for. It used to answer consent
+//! plus a funded key plus a pinned snapshot plus `n >= 5` with
+//! `status: "live_run_ready"` beside six `null` scores and no reason anywhere,
+//! while the assertions that catch an unearned field ran **only** on the refused
+//! path. An operator who followed the documented procedure would have produced a
+//! finished looking, empty artefact. Honesty that holds only on the path nobody
+//! takes is not honesty, so the reason for the absent scores is computed once, by
+//! `why_no_scores`, for every configuration, and the assertions run
+//! unconditionally.
+//!
+//! What a provisioned run does earn is a record of the operator's declaration:
+//! which snapshot they pinned, how many repetitions they asked for, whether a
+//! corpus was supplied and whether it declared itself synthetic. That is KG-032's
+//! closing path, which is not moving the measurement into this repository but
+//! writing a record shape an operator's own run can be entered into.
+//!
+//! # The four ways this runner declines to score
 //!
 //! Each one exists because the alternative is worse than not measuring.
 //!
@@ -37,6 +61,10 @@
 //!    rule 3, and the reason is in rule 3 of the same section: language models are
 //!    not deterministic at `temperature = 0`, so a mean over four runs is a
 //!    number about scheduling. The cell reports "insufficient sample" instead.
+//! 4. **Everything supplied, and still no score.** There is no provider client in
+//!    this binary and no scorer behind it, so the four preconditions above gate a
+//!    half that is absent by design. A runner that said "ready" here would be
+//!    describing a capability the repository does not have.
 //!
 //! # What is deliberately not a field
 //!
@@ -54,7 +82,9 @@
 //! `benchmarks.md` section (b) fixes it, and F3's `target/reconcile-benchmark.json`
 //! fixes the honesty conventions: every unearned field is `null`, every `null` has
 //! a reason in `not_measured`, and numbers a regression net may read but a release
-//! note may not live under a name that says so.
+//! note may not live under a name that says so. The document's own `status` obeys
+//! the same rule: it reports what ran, never what could have run, and
+//! `scored_half.ran` is `false` in every artefact this binary can write.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -99,7 +129,10 @@ const SYNTHETIC_ONLY_WARNING: &str = "\
   measure what masking costs. Run it with synthetic data and with nothing else.\n  \
   Running it against real organisational data is forbidden (benchmarks.md, data\n  \
   rule). Set PERISKOP_I_UNDERSTAND_SYNTHETIC_ONLY=1 to say that the data in this\n  \
-  run is invented.";
+  run is invented.\n  \
+  THIS BINARY PERFORMS NO RAW RUN AND HOLDS NO PROVIDER CLIENT. Setting the flag\n  \
+  does not produce a score here: it records that the corpus is synthetic, and the\n  \
+  scored half is an operator's own session (KG-032, roadmap F4 criterion 6).";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -130,11 +163,65 @@ struct Corpus {
     declares_synthetic_only: bool,
 }
 
-/// Why a live run did not happen, or that it can.
+/// What the operator supplied, which is not the same question as what ran.
+///
+/// `Provisioned` used to be called `Ready`, and the name was the defect: it read
+/// as "a live run is about to happen" when all it ever meant was "the operator
+/// left nothing out". Nothing is about to happen in either variant, so the type
+/// no longer has a word in it that promises one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Readiness {
+    /// A precondition `benchmarks.md` requires is missing.
     Refused { code: &'static str, reason: String },
-    Ready { model_snapshot: String, n: usize },
+    /// Every precondition an operator can supply is present. There is still
+    /// nothing to score, for the reason in `NO_SCORED_HALF`.
+    Provisioned { model_snapshot: String, n: usize },
+}
+
+/// Why a fully provisioned run still publishes no score.
+///
+/// The distinction this keeps alive: the six score fields are absent because
+/// nothing in this repository can produce them, not because the operator forgot
+/// a variable. Consent, a funded key, a pinned snapshot and `n >= 5` buy exactly
+/// the same six nulls, and the artefact has to say which of the two absences it
+/// is, or a reader will assume the fixable one.
+const NO_SCORED_HALF: &str = "\
+     this binary has no provider client and no scorer behind it. The raw half of the comparison \
+     sends unmasked personal data to a real provider, which is the thing this product exists to \
+     prevent and which CLAUDE.md forbids periskop from doing, so that code is not in this \
+     repository and no configuration of this runner brings it back. KG-032 records the constraint \
+     as permanent and roadmap.md defers F4 exit criterion 6 on it: the scores come from an \
+     operator's own recorded session, and what this artefact carries is their declaration rather \
+     than a measurement";
+
+/// Why the scored half did not run, in the one place both configurations read.
+///
+/// One function rather than one branch each. The branch is what failed: the
+/// refused path named its reason under `not_measured` and the provisioned path
+/// published `status: "live_run_ready"` beside six nulls with nothing beside
+/// them. A caller cannot now produce a null score without also producing the
+/// sentence that says why it is null.
+fn why_no_scores(readiness: &Readiness) -> (&'static str, String) {
+    match readiness {
+        Readiness::Refused { code, reason } => (code, reason.clone()),
+        Readiness::Provisioned { model_snapshot, n } => (
+            "no_scored_half_in_this_build",
+            format!(
+                "{NO_SCORED_HALF}. The operator pinned snapshot {model_snapshot} and asked for {n} \
+                 repetitions; this run scored none of them"
+            ),
+        ),
+    }
+}
+
+/// How many repetitions this runner scored, which is none, in every
+/// configuration.
+///
+/// Bound once and read twice rather than written as a literal into both `n` and
+/// `meets_minimum_sample`, so that the count the artefact publishes and the floor
+/// verdict beside it cannot drift apart.
+fn scored_repetitions() -> usize {
+    0
 }
 
 /// The decision, in the order the reasons matter.
@@ -205,7 +292,7 @@ fn readiness(requested: &Requested) -> Readiness {
             ),
         };
     }
-    Readiness::Ready {
+    Readiness::Provisioned {
         model_snapshot: snapshot.to_owned(),
         n: requested.repetitions,
     }
@@ -545,13 +632,15 @@ fn the_masking_quality_benchmark_runs_what_it_can_and_declares_what_it_cannot() 
 
     let requested = requested_from_environment();
     let readiness = readiness(&requested);
-    if let Readiness::Refused { code, reason } = &readiness {
-        println!(
-            "  NO LIVE RUN: {code}\n  {reason}\n  The mechanical half below still runs offline \
-             against a stub provider. It measures the pipeline, not the model, and it closes no \
-             part of F4 exit criterion 6.\n"
-        );
-    }
+    // Printed in both states, and it used to be printed in one. The operator who
+    // supplied everything is precisely the reader who would otherwise watch a
+    // green run go by and file its artefact as a measurement.
+    let (code, reason) = why_no_scores(&readiness);
+    println!(
+        "  NO SCORED RUN: {code}\n  {reason}\n  The mechanical half below still runs offline \
+         against a stub provider. It measures the pipeline, not the model, and it closes no part \
+         of F4 exit criterion 6.\n"
+    );
 
     let classes = task_classes();
     let cells: Vec<Value> = classes
@@ -582,64 +671,140 @@ fn the_masking_quality_benchmark_runs_what_it_can_and_declares_what_it_cannot() 
         );
     }
 
-    // And the refusals, which are the rest of what it is entitled to say.
-    if matches!(readiness, Readiness::Refused { .. }) {
-        for cell in &cells {
-            for unearned in [
-                "raw_score_mean",
-                "raw_score_ci95",
-                "masked_score_mean",
-                "masked_score_ci95",
-                "degradation_pct",
-                "degradation_ci95",
-                "model_snapshot",
-            ] {
-                assert!(
-                    cell[unearned].is_null(),
-                    "{unearned} was published by a run that never reached a provider: {cell}"
-                );
-                assert!(
-                    cell["not_measured"][unearned].is_string(),
-                    "{unearned} is null with no reason beside it, which reads as an omission \
-                     rather than as a refusal: {cell}"
-                );
-            }
-            assert_eq!(cell["n"], 0);
-        }
+    // And the absences, which are the rest of what it is entitled to say.
+    //
+    // Outside the `if` that used to hold them. These ran only when the runner had
+    // already refused, so the configuration they were written to protect, an
+    // operator with consent and a funded key and a pinned snapshot, was the one
+    // configuration nothing checked.
+    for cell in &cells {
+        assert_unearned_fields_are_null_with_reasons(cell);
     }
+    assert_the_document_claims_only_what_ran(&document);
+}
+
+/// The seven fields of `benchmarks.md` section (b)'s reporting format that no run
+/// of this binary earns.
+///
+/// Named once because the writer that leaves them null and the assertion that
+/// catches a published one have to be looking at the same list.
+const UNEARNED_FIELDS: &[&str] = &[
+    "raw_score_mean",
+    "raw_score_ci95",
+    "masked_score_mean",
+    "masked_score_ci95",
+    "degradation_pct",
+    "degradation_ci95",
+    "model_snapshot",
+];
+
+/// Every unearned field is absent, and every absence carries its reason.
+fn assert_unearned_fields_are_null_with_reasons(cell: &Value) {
+    for unearned in UNEARNED_FIELDS {
+        assert!(
+            cell[unearned].is_null(),
+            "{unearned} was published by a run that never reached a provider: {cell}"
+        );
+        assert!(
+            cell["not_measured"][unearned].is_string(),
+            "{unearned} is null with no reason beside it, which reads as an omission rather than \
+             as a refusal: {cell}"
+        );
+    }
+    assert_eq!(
+        cell["n"], 0,
+        "a repetition count was published by a run that scored no repetition: {cell}"
+    );
+    assert!(
+        cell["not_measured"]["n"].is_string(),
+        "the empty sample has no reason beside it: {cell}"
+    );
+    assert_eq!(
+        cell["meets_minimum_sample"], false,
+        "an empty sample was reported as meeting the floor of {MINIMUM_REPETITIONS}: {cell}"
+    );
+}
+
+/// The document does not describe a run that did not happen.
+///
+/// This is the assertion the defect needed and did not have. The artefact used to
+/// answer a complete environment with `status: "live_run_ready"` beside six null
+/// scores, so an operator who followed the documented procedure got a finished
+/// looking, empty file. A status may report what ran; it may not report what was
+/// provisioned.
+fn assert_the_document_claims_only_what_ran(document: &Value) {
+    assert_eq!(
+        document["status"], "mechanical_only",
+        "the artefact's status describes something other than the half that ran: {document}"
+    );
+    assert_eq!(
+        document["scored_half"]["ran"], false,
+        "the artefact claims a scored half, and there is no provider client in this binary to \
+         have produced one: {document}"
+    );
+    assert!(
+        document["scored_half"]["reason"].is_string()
+            && document["scored_half"]["code"].is_string(),
+        "the scored half is absent with no reason beside it: {document}"
+    );
+    assert_eq!(
+        document["scored_half"]["closes_criterion_6"], false,
+        "an artefact with no scores claims to close the criterion the scores are for: {document}"
+    );
+    // A rendered scan rather than a field comparison, because the failure being
+    // prevented is the word coming back anywhere in the document: a status, a
+    // note, a cell.
+    let rendered = serde_json::to_string(document).unwrap();
+    assert!(
+        !rendered.contains("live_run_ready"),
+        "the artefact says a live run is ready, which is a sentence about the operator's \
+         environment. Nothing in this repository can perform one (KG-032): {document}"
+    );
 }
 
 /// One task class's row, in `benchmarks.md` section (b)'s field names.
 fn cell(class: &TaskClass, measured: &Mechanical, readiness: &Readiness) -> Value {
     let mut not_measured = serde_json::Map::new();
-    let (n, model_snapshot) = match readiness {
-        Readiness::Ready { model_snapshot, n } => (*n, Some(model_snapshot.clone())),
-        Readiness::Refused { code, reason } => {
-            for unearned in [
-                "raw_score_mean",
-                "raw_score_ci95",
-                "masked_score_mean",
-                "masked_score_ci95",
-            ] {
-                not_measured.insert(unearned.to_owned(), json!(format!("{code}: {reason}")));
-            }
-            not_measured.insert(
-                "degradation_pct".to_owned(),
-                json!("derived from the two scores, neither of which was measured"),
-            );
-            not_measured.insert(
-                "degradation_ci95".to_owned(),
-                json!("derived from the two scores, neither of which was measured"),
-            );
-            not_measured.insert(
-                "model_snapshot".to_owned(),
-                json!(format!(
-                    "no provider was called, so no snapshot answered. {code}: {reason}"
-                )),
-            );
-            (0, None)
-        }
-    };
+    // Unconditional, and that is the whole correction. Whatever the operator
+    // supplied, the six scores and the snapshot are absent, and each one leaves
+    // with the sentence that says why.
+    let (code, reason) = why_no_scores(readiness);
+    for unearned in [
+        "raw_score_mean",
+        "raw_score_ci95",
+        "masked_score_mean",
+        "masked_score_ci95",
+    ] {
+        not_measured.insert(unearned.to_owned(), json!(format!("{code}: {reason}")));
+    }
+    for derived in ["degradation_pct", "degradation_ci95"] {
+        not_measured.insert(
+            derived.to_owned(),
+            json!(format!(
+                "derived from the two scores, neither of which was measured. {code}: {reason}"
+            )),
+        );
+    }
+    not_measured.insert(
+        "model_snapshot".to_owned(),
+        json!(format!(
+            "no provider was called, so no snapshot answered. {code}: {reason}"
+        )),
+    );
+    // `n` is the number of repetitions the means above average over, and there
+    // are no means. A provisioned run used to publish the operator's requested
+    // count here, which reads in a table as a sample that produced no
+    // degradation. What they asked for is under `operator_declaration`, one
+    // level up, where it cannot be mistaken for a result.
+    let n = scored_repetitions();
+    not_measured.insert(
+        "n".to_owned(),
+        json!(format!(
+            "no repetition was scored, so the sample is empty rather than small. What the \
+             operator asked for is in operator_declaration.declared_repetitions and is a request, \
+             not a count. {code}: {reason}"
+        )),
+    );
     not_measured.insert(
         "restore_recovery_rate.recovered_by_normalised_match".to_owned(),
         json!(
@@ -665,7 +830,9 @@ fn cell(class: &TaskClass, measured: &Mechanical, readiness: &Readiness) -> Valu
         "masked_score_ci95": Value::Null,
         "degradation_pct": Value::Null,
         "degradation_ci95": Value::Null,
-        "model_snapshot": model_snapshot,
+        // Null even when the operator pinned one: this field names the snapshot
+        // that answered the two runs, and nothing answered anything.
+        "model_snapshot": Value::Null,
         // Measured, because it can be: entities masked per input, and the split
         // by type that says which type moves the quality number.
         "masked_entity_density": ratio(measured.masked_entities, measured.inputs as u64),
@@ -708,25 +875,48 @@ fn ratio(numerator: u64, denominator: u64) -> f64 {
 }
 
 fn artefact(cells: &[Value], readiness: &Readiness, requested: &Requested) -> Value {
-    let (status, refusal) = match readiness {
-        Readiness::Ready { .. } => ("live_run_ready", Value::Null),
-        Readiness::Refused { code, reason } => {
-            ("mechanical_only", json!({"code": code, "reason": reason}))
-        }
-    };
+    let (code, reason) = why_no_scores(readiness);
 
     json!({
         "benchmark": "masking quality, benchmarks.md section (b) (milestone 96)",
-        "criterion": "roadmap.md F4 exit criterion 6, partial",
-        "status": status,
-        "live_run_refusal": refusal,
+        "criterion": "roadmap.md F4 exit criterion 6, deferred out of F4: the mechanical half runs \
+                      here, the scored half is recorded from an operator's own session (KG-032)",
+        // One value, because there is one outcome. The status used to become
+        // `live_run_ready` as soon as the environment was complete, which
+        // described the operator's provisioning rather than this document's
+        // contents, and the document's contents were six nulls.
+        "status": "mechanical_only",
+        "scored_half": {
+            "ran": false,
+            "code": code,
+            "reason": reason,
+            "closes_criterion_6": false,
+        },
+        // What an operator's own scored run has to carry back, recorded here so
+        // that a later record and this artefact line up field for field. It says
+        // what was declared to this runner and is not evidence that anything ran;
+        // `scored_half.ran` immediately above is the field that answers that.
+        "operator_declaration": {
+            "consent_flag": CONSENT,
+            "consent_given": requested.consent,
+            "declared_model_snapshot": requested
+                .model_snapshot
+                .as_deref()
+                .filter(|snapshot| !snapshot.is_empty()),
+            "declared_repetitions": requested.repetitions,
+            // Whether, not where: an absolute path from the operator's machine
+            // would put a filesystem layout in a diffable artefact.
+            "corpus_supplied": requested.corpus.is_some(),
+            "corpus_declares_synthetic_only": requested
+                .corpus
+                .as_ref()
+                .is_some_and(|corpus| corpus.declares_synthetic_only),
+        },
         "masking_profile": "pattern+dictionary",
         "profile_note": "the gate run of this benchmark measures the core profile only. NER is \
                          off by default (K-11) and F4 has no code path for it, so free text \
                          personal names outside the organisation's word list are not masked here \
                          and these results do not generalise to a build with layer C",
-        "consent_flag": CONSENT,
-        "consent_given": requested.consent,
         "synthetic_only_warning": SYNTHETIC_ONLY_WARNING,
         "cells": cells,
         "what_ran": "the mechanical half: real masking, real alias generation, a real vault \
@@ -734,10 +924,11 @@ fn artefact(cells: &[Value], readiness: &Readiness, requested: &Requested) -> Va
                      provider that echoes what it was sent",
         "what_did_not_run": "the scored half: the raw run that sends unmasked data to a real \
                              provider, the masked run beside it, and the degradation between \
-                             them. It needs a funded key and a pinned model snapshot, it costs \
-                             money, and CLAUDE.md forbids periskop from being an egress source, \
-                             so it never runs in continuous integration. The numbers in a release \
-                             note come from an operator's recorded session",
+                             them. It is absent from this repository rather than switched off in \
+                             it, because CLAUDE.md forbids periskop from being an egress source \
+                             and KG-032 records that as permanent. A complete environment does not \
+                             turn it on: the six scores stay null and say so. The numbers in a \
+                             release note come from an operator's recorded session",
         "not_a_metric": "checksum and validator pass rates. P-0 (K-16) forbids any generator from \
                          producing a value that could be allocated to a real person, so a format \
                          preserving alias is parseable and deliberately invalid. A pass rate \
@@ -810,7 +1001,7 @@ fn a_corpus_that_does_not_declare_itself_synthetic_is_refused() {
             model_snapshot: Some("gpt-4o-2026-05-01".to_owned()),
             repetitions: 20,
         }),
-        Readiness::Ready { .. }
+        Readiness::Provisioned { .. }
     ));
 }
 
@@ -883,7 +1074,7 @@ fn fewer_than_five_repetitions_reports_insufficient_sample_and_not_a_score() {
             repetitions: MINIMUM_REPETITIONS,
             corpus: None,
         }),
-        Readiness::Ready { .. }
+        Readiness::Provisioned { .. }
     ));
 }
 
@@ -900,17 +1091,73 @@ fn a_refused_run_reports_every_score_as_null_with_its_reason() {
     let class = &classes[0];
     let produced = cell(class, &Mechanical::default(), &refused);
 
-    for unearned in [
-        "raw_score_mean",
-        "masked_score_mean",
-        "degradation_pct",
-        "model_snapshot",
-    ] {
-        assert!(produced[unearned].is_null(), "{produced}");
-        assert!(produced["not_measured"][unearned].is_string(), "{produced}");
+    assert_unearned_fields_are_null_with_reasons(&produced);
+    assert!(
+        produced["not_measured"]["raw_score_mean"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("funded_key_absent")),
+        "the reason does not name the precondition that was missing: {produced}"
+    );
+}
+
+#[test]
+fn a_fully_provisioned_run_still_says_it_measured_nothing() {
+    // The sibling of the test above, and the one that was missing. Consent, a
+    // funded key, a pinned snapshot and four times the sample floor: everything
+    // the documented procedure asks an operator for. What comes back is the same
+    // six nulls, because the half that would fill them is not in this repository.
+    //
+    // What this test holds is the sentence beside them. The artefact used to
+    // answer this exact configuration with `status: "live_run_ready"`, six null
+    // scores, `n: 20` and no `not_measured` entry at all, and an operator who ran
+    // the procedure would have filed it as a completed measurement.
+    let provisioned = Readiness::Provisioned {
+        model_snapshot: "gpt-4o-2026-05-01".to_owned(),
+        n: 20,
+    };
+    let requested = Requested {
+        consent: true,
+        has_funded_key: true,
+        model_snapshot: Some("gpt-4o-2026-05-01".to_owned()),
+        repetitions: 20,
+        corpus: None,
+    };
+    // The gate agrees this is the provisioned state, so the two halves of the
+    // test cannot drift into describing different configurations.
+    assert_eq!(readiness(&requested), provisioned);
+
+    let classes = task_classes();
+    let cells: Vec<Value> = classes
+        .iter()
+        .map(|class| cell(class, &Mechanical::default(), &provisioned))
+        .collect();
+    for produced in &cells {
+        assert_unearned_fields_are_null_with_reasons(produced);
+        let reason = produced["not_measured"]["raw_score_mean"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            reason.contains("no_scored_half_in_this_build"),
+            "a provisioned run blames a missing precondition for an absence that is not about \
+             preconditions: {produced}"
+        );
+        // The operator gave a number, and the cell publishes zero. Both are true
+        // and only one of them is a sample.
+        assert!(
+            reason.contains("asked for 20 repetitions"),
+            "the artefact drops what the operator asked for, so a later record of their own run \
+             cannot be matched against this one: {produced}"
+        );
     }
-    assert_eq!(produced["n"], 0);
-    assert_eq!(produced["meets_minimum_sample"], false);
+
+    let document = artefact(&cells, &provisioned, &requested);
+    assert_the_document_claims_only_what_ran(&document);
+    assert_eq!(
+        document["operator_declaration"]["declared_model_snapshot"],
+        "gpt-4o-2026-05-01"
+    );
+    assert_eq!(document["operator_declaration"]["declared_repetitions"], 20);
+    assert_eq!(document["operator_declaration"]["consent_given"], true);
 }
 
 #[test]
@@ -936,14 +1183,14 @@ fn no_field_measures_whether_an_alias_passes_a_validator() {
                 cell(
                     class,
                     &Mechanical::default(),
-                    &Readiness::Ready {
+                    &Readiness::Provisioned {
                         model_snapshot: "gpt-4o-2026-05-01".to_owned(),
                         n: 20,
                     },
                 )
             })
             .collect::<Vec<Value>>(),
-        &Readiness::Ready {
+        &Readiness::Provisioned {
             model_snapshot: "gpt-4o-2026-05-01".to_owned(),
             n: 20,
         },

@@ -69,9 +69,17 @@ fn detectors() -> &'static [Detector] {
         Detector {
             entity: EntityType::Iban,
             // Two letters, two check digits, then groups of up to four
-            // alphanumerics with optional single spaces, which is how an IBAN is
-            // printed. The gate compacts and applies mod 97.
-            expression: r"\b[A-Z]{2}[0-9]{2}(?: ?[A-Z0-9]{1,4}){2,8}\b",
+            // alphanumerics with an optional single space **or hyphen**, which is
+            // how an IBAN is printed. The gate compacts and applies mod 97.
+            //
+            // The hyphen is here because `checksum::compact_iban` already strips
+            // one, so `TR33-0006-...` is a valid IBAN by every rule in this crate
+            // and the shape was the only thing that never offered it. A format the
+            // validator accepts and the detector never sees is an account number
+            // reaching the provider with nothing to say so, and the two halves
+            // disagreeing is worse than either choice: whoever reads the validator
+            // concludes the format is covered.
+            expression: r"\b[A-Z]{2}[0-9]{2}(?:[ -]?[A-Z0-9]{1,4}){2,8}\b",
             admit: admit_iban,
         },
         Detector {
@@ -95,8 +103,20 @@ fn detectors() -> &'static [Detector] {
         Detector {
             entity: EntityType::Email,
             // The RFC 5322 subset spec section 3.1 asks for: an unquoted local
-            // part, a dotted domain, an alphabetic top level label.
-            expression: r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?)*\.[A-Za-z]{2,24}",
+            // part, a dotted domain, an alphabetic top level label. The letter
+            // classes are Unicode rather than ASCII, which is KG-030: RFC 6531
+            // allows UTF-8 in the local part and an internationalised domain is
+            // written in its own script, so both are legitimate addresses. The
+            // ASCII classes did not miss them cleanly. `ünal@ornek.com` matched
+            // from the `n`, so `nal@ornek.com` was replaced and the `ü` stayed in
+            // the prompt: a partial mask, counted as a success, which is a leak
+            // wearing the report of one.
+            //
+            // Opening the classes costs almost nothing in the other direction
+            // because the skeleton still decides: an `@`, a dotted domain and an
+            // alphabetic final label. A Turkish word beside an `@` acquires none
+            // of those by being spelled with a `ş`.
+            expression: r"[\p{L}\p{N}._%+\-]+@[\p{L}\p{N}](?:[\p{L}\p{N}\-]*[\p{L}\p{N}])?(?:\.[\p{L}\p{N}](?:[\p{L}\p{N}\-]*[\p{L}\p{N}])?)*\.\p{L}{2,24}",
             admit: admit_email,
         },
         Detector {
@@ -450,7 +470,13 @@ fn admit_email(text: &str) -> Option<(usize, usize)> {
     let (local, domain) = candidate.split_once('@')?;
     // RFC 5321 section 4.5.3.1 length limits, which is the only part of the
     // grammar cheap enough to check and useful enough to matter.
-    if local.is_empty() || local.len() > 64 || domain.len() > 255 {
+    //
+    // Counted in **characters**, not bytes. The limits are stated in octets for an
+    // ASCII local part, and measuring a UTF-8 local part the same way makes the
+    // ceiling arrive early: `ö` is two bytes, so a thirty-three letter Turkish
+    // address would be refused at a limit it is nowhere near. Refusing here means
+    // not masking, so the wrong unit is a leak rather than a rounding error.
+    if local.is_empty() || local.chars().count() > 64 || domain.chars().count() > 255 {
         return None;
     }
     Some((0, end))
@@ -664,6 +690,97 @@ mod tests {
         }
     }
 
+    /// The detector and the validator have to agree on what an IBAN looks like.
+    ///
+    /// `checksum::compact_iban` strips a hyphen as readily as a space, so
+    /// `TR33-0006-...` is a **valid** IBAN as far as every rule in this crate is
+    /// concerned; the shape allowed only a single space, so no candidate was ever
+    /// offered and the gate that would have admitted it was never asked. A format
+    /// the validator accepts and the detector never sees is an account number
+    /// crossing to the provider with nothing to say so.
+    #[test]
+    fn positive_an_iban_printed_with_hyphens_is_detected_because_the_rule_accepts_one() {
+        for printed in [
+            "TR33-0006-1005-1978-6457-8413-26",
+            "GB82-WEST-1234-5698-7654-32",
+            // Mixed separators, which is what a value pasted out of two places
+            // looks like.
+            "TR33 0006-1005 1978-6457 8413-26",
+        ] {
+            assert!(
+                checksum::iban_is_valid(printed),
+                "the fixture {printed} is not a valid IBAN, so the test proves nothing"
+            );
+            assert_eq!(
+                spans_of(&format!("Hesap: {printed} lütfen"), EntityType::Iban),
+                vec![printed],
+                "{printed} passes mod 97 and was never offered as a candidate"
+            );
+        }
+    }
+
+    /// The other direction: a hyphenated string that is not an account is still
+    /// not an account. The mod 97 gate is what does this, and widening the shape
+    /// must not turn every hyphenated upper case token into a candidate that
+    /// passes.
+    #[test]
+    fn negative_a_hyphenated_string_that_fails_mod_97_is_not_an_iban() {
+        // Chosen so that no shorter reading inside them passes either, which is a
+        // separate escape (KG-031, below) and would otherwise make this test pass
+        // or fail for the wrong reason.
+        for impostor in [
+            "GB83-WEST-1234-5698-7654-32",
+            "PO12-3456-7890",
+            "XX00-AAAA-BBBB-CCCC",
+            "ZZ11-1111-1111-1111",
+        ] {
+            assert!(!checksum::iban_is_valid(impostor), "{impostor}");
+            assert!(
+                !types_in(&format!("kod {impostor} burada")).contains("IBAN"),
+                "{impostor} was masked as an IBAN"
+            );
+        }
+    }
+
+    /// KG-031, and it is older than the hyphen: a **truncation** of a printed
+    /// IBAN can satisfy mod 97 on its own.
+    ///
+    /// `TR34 0006 1005 1978 6457 8413 26` fails the rule, so the whole match is
+    /// refused and the retry walk looks for the longest shorter reading that is
+    /// both the shape and an entity. `TR34 0006 1005 1978 6457` is one: twenty
+    /// characters, `iban_shape_is_plausible` allows five to thirty-four, and one
+    /// prefix in ninety-seven passes mod 97 by arithmetic. So a prefix is masked
+    /// and the last two groups stay in the prompt.
+    ///
+    /// Written as a test of the **current** behaviour rather than of the wanted
+    /// one, with both separators, so that whoever closes it sees it go red here
+    /// first. It is a false detection and not a leak: a real IBAN is admitted
+    /// whole on the first try and never reaches the retry, and the longest reading
+    /// wins, so no valid account is truncated. Closing it needs ISO 13616's per
+    /// country length register, which is published data this build does not carry
+    /// and does not guess at.
+    #[test]
+    fn escape_a_truncation_of_an_invalid_iban_can_pass_mod_97_and_be_masked() {
+        for (printed, truncated) in [
+            (
+                "TR34-0006-1005-1978-6457-8413-26",
+                "TR34-0006-1005-1978-6457",
+            ),
+            (
+                "TR34 0006 1005 1978 6457 8413 26",
+                "TR34 0006 1005 1978 6457",
+            ),
+        ] {
+            assert!(!checksum::iban_is_valid(printed), "{printed}");
+            assert!(checksum::iban_is_valid(truncated), "{truncated}");
+            assert_eq!(
+                spans_of(&format!("kod {printed} burada"), EntityType::Iban),
+                vec![truncated],
+                "the truncation behaviour changed and KG-031 needs rewriting"
+            );
+        }
+    }
+
     #[test]
     fn escape_a_lower_case_iban_is_not_detected() {
         // ISO 13616 prints an IBAN in upper case and this layer follows it.
@@ -747,6 +864,75 @@ mod tests {
     fn negative_a_string_with_an_at_sign_but_no_domain_is_not_an_email() {
         assert!(!types_in("@kullanici bir mention").contains("EMAIL"));
         assert!(!types_in("fiyat 5@kg").contains("EMAIL"));
+    }
+
+    /// KG-030, and the half of it that is worse than a miss.
+    ///
+    /// With an ASCII-only local part the match starts **after** the accented
+    /// letter: `nal@ornek.com` is replaced and `ü` stays in the prompt, so the
+    /// address is reassembled by whoever reads it and the request is counted as
+    /// one more masked entity. A partial mask is a leak wearing the report of a
+    /// success, which is why this is asserted as a whole-span equality rather than
+    /// as "something was found".
+    #[test]
+    fn positive_an_accented_local_part_is_masked_whole_and_leaves_no_letter_behind() {
+        for address in [
+            "ünal@ornek.com",
+            "ömer.çelik@ornek.com.tr",
+            "işıl_gür@ornek.com",
+        ] {
+            assert_eq!(
+                spans_of(&format!("Bana {address} yaz."), EntityType::Email),
+                vec![address],
+                "the local part of {address} was only partly detected"
+            );
+        }
+    }
+
+    /// The other half of KG-030: an internationalised domain produced no
+    /// candidate at all, so the whole address crossed to the provider.
+    #[test]
+    fn positive_an_internationalised_domain_is_detected() {
+        for address in ["bilgi@örnek.com", "info@şirket.com.tr", "a@ornek.köy"] {
+            assert_eq!(
+                spans_of(&format!("adres {address} burada"), EntityType::Email),
+                vec![address],
+                "{address} produced no candidate"
+            );
+        }
+    }
+
+    /// The false positive cost of opening the classes above, measured rather than
+    /// asserted to be small.
+    ///
+    /// The skeleton still decides: an `@` with a dotted domain and an alphabetic
+    /// final label. Turkish prose is full of `@` in mentions and of accented words
+    /// beside punctuation, and none of it acquires a domain by being spelled with
+    /// a `ş`.
+    #[test]
+    fn negative_opening_the_classes_to_unicode_letters_finds_no_address_in_prose() {
+        const PROSE: &[&str] = &[
+            "@kullanıcı bir mention",
+            "fiyat 5@kg",
+            "Şirket@ ile ilgili değil",
+            "ödeme@ yapıldı",
+            "toplantı @ 14:00",
+            "e-posta: (yok)",
+            "ürün@depo raf 3",
+            "çalışan@ izinli",
+            "@öğrenci listesi güncellendi",
+            "birim@ müdürlüğü",
+        ];
+        let found: Vec<&str> = PROSE
+            .iter()
+            .filter(|line| types_in(line).contains("EMAIL"))
+            .copied()
+            .collect();
+        assert!(
+            found.is_empty(),
+            "opening the local part to Unicode letters cost {} false positives: {found:?}",
+            found.len()
+        );
     }
 
     #[test]

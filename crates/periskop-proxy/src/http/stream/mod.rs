@@ -458,6 +458,29 @@ pub fn is_event_stream(content_type: Option<&str>) -> bool {
     })
 }
 
+/// Whether an answer's declared content coding is one this build can read.
+///
+/// Decided on the **declaration**, never on the bytes: sniffing a magic number
+/// would be this proxy guessing at a format, and a guess that comes out wrong here
+/// means either refusing an answer that was fine or reading one that was not.
+///
+/// Absent and empty are `identity` by RFC 9110 section 8.4.1, and `identity` is
+/// the only coding [`super::headers::READABLE_CODING`] asks for. Everything else
+/// is a coding with no decoder in this crate, so the alias walk would run over
+/// bytes with no aliases visible in them and report a clean run.
+pub fn is_readable_coding(content_encoding: Option<&str>) -> bool {
+    let Some(declared) = content_encoding else {
+        return true;
+    };
+    let declared = declared.trim();
+    declared.is_empty()
+        || declared.split(',').all(|coding| {
+            coding
+                .trim()
+                .eq_ignore_ascii_case(super::headers::READABLE_CODING)
+        })
+}
+
 /// Whether an answer's headers say it is JSON.
 pub fn is_json(content_type: Option<&str>) -> bool {
     content_type.is_some_and(|value| {
@@ -670,6 +693,30 @@ mod tests {
         assert!(is_json(Some("application/json; charset=utf-8")));
         assert!(is_json(Some("application/vnd.api+json")));
         assert!(!is_json(Some("text/event-stream")));
+    }
+
+    #[test]
+    fn only_the_coding_that_means_no_coding_is_readable() {
+        // The permissive side, or every ordinary answer would be refused.
+        assert!(is_readable_coding(None));
+        assert!(is_readable_coding(Some("")));
+        assert!(is_readable_coding(Some(" identity ")));
+        assert!(is_readable_coding(Some("IDENTITY")));
+        // And the side that matters: a coding with no decoder here is not read,
+        // including one hidden at the end of a chain.
+        for coded in [
+            "gzip",
+            "br",
+            "deflate",
+            "zstd",
+            "identity, gzip",
+            "gzip, identity",
+        ] {
+            assert!(
+                !is_readable_coding(Some(coded)),
+                "{coded} was called readable"
+            );
+        }
     }
 
     #[test]

@@ -167,7 +167,32 @@ fn wrong_check_digits(stream: &mut SeedStream, correct: u8) -> u8 {
     let offset = stream.below(96) + 1;
     let shifted = (u32::from(correct.saturating_sub(2)) + offset) % 97;
     // The arithmetic stays under 99, so the conversion cannot lose anything.
-    u8::try_from(shifted + 2).unwrap_or(2)
+    // The fallback is still one that holds the invariant rather than a constant
+    // that happens to be in range: see [`a_pair_other_than`].
+    u8::try_from(shifted + 2).unwrap_or_else(|_| a_pair_other_than(correct))
+}
+
+/// A check digit pair inside ISO 13616's 02 to 98 range that is not `correct`.
+///
+/// **Why this exists when the branch above cannot be taken.** `shifted + 2` is at
+/// most 98, so the conversion in [`wrong_check_digits`] never fails and a reader
+/// can prove it from the modulus on the line above. `unwrap_or(2)` was written on
+/// that proof and it is the wrong thing to lean on: the proof holds until somebody
+/// edits the modulus, and what it protects is ADR-010's P-0, which says every rung
+/// `I` alias is **provably** not a real value. A constant `2` is not provably
+/// different from `correct`, so the one edit that broke the reachability argument
+/// would also have handed out an alias with the right check digits on it, silently
+/// and only sometimes. The value is what the invariant needs and the argument is
+/// no longer load bearing.
+///
+/// Total for every `u8`, including the ones `iban_check_digits` cannot return, so
+/// the test below can be exhaustive rather than representative.
+const fn a_pair_other_than(correct: u8) -> u8 {
+    if correct == 2 {
+        3
+    } else {
+        2
+    }
 }
 
 /// Eleven digits with a leading digit that is not zero, and both check digits
@@ -216,7 +241,26 @@ pub fn vkn(stream: &mut SeedStream) -> String {
 fn wrong_digit(stream: &mut SeedStream, correct: u8) -> u8 {
     let offset = stream.below(9) + 1;
     // Offsets run one to nine, so the result is never the correct digit.
-    u8::try_from((u32::from(correct) + offset) % 10).unwrap_or(0)
+    // `% 10` bounds the conversion's input to nine and the branch below cannot be
+    // taken; it returns a digit that holds the invariant anyway, for the reason
+    // [`a_pair_other_than`] gives.
+    u8::try_from((u32::from(correct) + offset) % 10).unwrap_or_else(|_| a_digit_other_than(correct))
+}
+
+/// A decimal digit that is not `correct`.
+///
+/// The counterpart of [`a_pair_other_than`] for the TCKN and VKN check digits, and
+/// it is here for the same reason: `unwrap_or(0)` returned a fixed digit that
+/// nothing proved differs from the correct one, so a build whose modulus had been
+/// edited would mint a TCKN alias carrying a **valid** check digit one time in ten
+/// and P-0's "provably not a real value" would be false with no test able to see
+/// it.
+const fn a_digit_other_than(correct: u8) -> u8 {
+    if correct == 0 {
+        1
+    } else {
+        0
+    }
 }
 
 /// What a key alias came out as, and whether its length class had to be cut.
@@ -586,6 +630,34 @@ mod tests {
         assert_eq!(carried_prefix("github_pat_abcdef"), "github_");
         assert_eq!(carried_prefix("abcdefgh_abcdef"), "");
         assert_eq!(carried_prefix("xoxb-abcdef"), "");
+    }
+
+    /// The branch the arithmetic cannot reach, held to the invariant anyway.
+    ///
+    /// P-0 says a rung `I` alias is provably not a real value, and before this the
+    /// proof had a hole with an argument in it: `unwrap_or(2)` and `unwrap_or(0)`
+    /// returned a fixed digit, nothing showed that digit differs from the correct
+    /// one, and the only thing keeping it out of an alias was that `% 97` and
+    /// `% 10` bound their conversions. That is a proof about **today's** modulus.
+    /// Tested exhaustively over every `u8` rather than over the range the
+    /// checksums actually produce, because the point is that the fallback is total
+    /// and not that it happens to be safe on the inputs it sees.
+    #[test]
+    fn the_fallback_check_digit_is_never_the_correct_one() {
+        for correct in 0u8..=u8::MAX {
+            let pair = a_pair_other_than(correct);
+            assert_ne!(pair, correct, "the pair fallback returned the correct pair");
+            // ISO 13616's range, or the alias would be refused by shape before mod
+            // 97 is reached and would fail for the wrong reason.
+            assert!((2..=98).contains(&pair), "{pair} is outside 02..=98");
+
+            let digit = a_digit_other_than(correct);
+            assert_ne!(
+                digit, correct,
+                "the digit fallback returned the correct one"
+            );
+            assert!(digit <= 9, "{digit} is not a decimal digit");
+        }
     }
 
     #[test]

@@ -125,7 +125,31 @@ impl Lookup for SessionLookup<'_> {
             return None;
         }
         match self.vault.restore(&self.session, alias, self.now_ms) {
-            Ok(Restored::Value(value)) => String::from_utf8(value.expose().to_vec()).ok(),
+            Ok(Restored::Value(value)) => {
+                // Borrowed, not copied. The bytes are a decrypted value inside a
+                // `Zeroizing` buffer that clears itself on drop, and a `to_vec`
+                // here would put a second, plain copy of them on the heap for the
+                // conversion to read and leave behind. `str::from_utf8` looks at
+                // the borrowed bytes and only the reading that succeeds allocates.
+                match std::str::from_utf8(value.expose()) {
+                    Ok(text) => Some(text.to_owned()),
+                    // Not a miss. Everything the request path files is a JSON
+                    // string's bytes (`request_path.rs`, `original.as_bytes()`),
+                    // so a record that opens into something that is not UTF-8 did
+                    // not come out the way it went in. Answering `None` alone put
+                    // it in the same bucket as an expired session: the alias went
+                    // back raw and `masking_unresolved` counted it, so "I cannot
+                    // read this record" was reported as "this conversation never
+                    // had one". It is counted where a record that disagrees with
+                    // what was sealed belongs, and `vault_record_tamper` ends the
+                    // answer with a 503 rather than delivering a message written
+                    // about a value this vault can no longer vouch for.
+                    Err(_) => {
+                        self.tampered = self.tampered.saturating_add(1);
+                        None
+                    }
+                }
+            }
             // Expired, unknown session, unknown alias: `masking_unresolved`. No
             // value, and no guess.
             Ok(Restored::Unresolved(_)) => None,
@@ -405,6 +429,58 @@ mod tests {
             lookup.value_for("PSK_PERSON_1"),
             Some("Ahmet Yilmaz".to_owned())
         );
+    }
+
+    /// "I cannot read this record" is not "this conversation never had one".
+    ///
+    /// Everything the request path files is a JSON string's bytes
+    /// (`request_path.rs`: `original.as_bytes()`), so a record that opens into
+    /// something that is not UTF-8 did not come out the way it went in. Answering
+    /// that with `None` put it in the same bucket as an expired session: the alias
+    /// went back raw, `masking_unresolved` counted it, and a record whose
+    /// plaintext disagrees with everything that can be written into it was
+    /// reported as an ordinary miss.
+    #[test]
+    fn a_record_that_opens_into_something_that_is_not_text_is_not_counted_as_a_miss() {
+        use crate::vault::{AliasSeed, Backing, OpenRequest, Passphrase, ProfileName, Vault};
+
+        const NOW: u64 = 1_700_000_000_000;
+        let session = SessionId::from_bytes([0x5c; 16]);
+        let mut vault = Vault::open(&OpenRequest {
+            passphrase: &Passphrase::new(b"an operator's passphrase".to_vec()),
+            profile: ProfileName::Ci,
+            backing: Backing::Memory,
+        })
+        .unwrap_or_else(|refusal| panic!("{refusal}"));
+        // A lone continuation byte: no encoder produces it and no JSON string can
+        // hold it, which is what makes it a record that cannot have been filed by
+        // the request path.
+        vault
+            .store_alias(
+                &session,
+                AliasSeed::from_bytes([0x33; 32]),
+                "PSK_PERSON_1",
+                &[0xff, 0xfe, 0x80],
+                NOW,
+            )
+            .unwrap_or_else(|refusal| panic!("{refusal}"));
+
+        let snapshot = snapshot(&["PSK_PERSON_1"]);
+        let mut lookup = SessionLookup::new(&mut vault, &snapshot, session, NOW);
+        assert_eq!(lookup.value_for("PSK_PERSON_1"), None);
+        assert_eq!(
+            lookup.tampered(),
+            1,
+            "a record whose plaintext is not the text that was filed was reported as \
+             an ordinary unresolved alias"
+        );
+
+        // The control, on the same vault: an ordinary miss stays a miss and does
+        // not raise the security counter, or the distinction would be lost the
+        // other way round.
+        let mut lookup = SessionLookup::new(&mut vault, &snapshot, session, NOW + 1);
+        assert_eq!(lookup.value_for("PSK_PERSON_2"), None);
+        assert_eq!(lookup.tampered(), 0);
     }
 
     #[test]

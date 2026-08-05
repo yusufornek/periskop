@@ -17,12 +17,18 @@
 //! | `authorization`, `x-api-key` | **unchanged** (`proxy/spec.md` section 2.3) | dropped |
 //! | `x-periskop-*` from the other side | dropped | dropped, then written by us |
 //! | `x-periskop-alias-scope` | never | always (`proxy-api.md` header table) |
+//! | `accept-encoding` | **replaced** by `identity` | the client's own, untouched |
 //!
 //! The credential going up unchanged is not an oversight either: authentication is
 //! explicitly not periskop's business, and a proxy that rewrote the header would be
 //! a proxy that has to hold a key. It goes up untouched and is dropped on the way
 //! back, because a provider that echoed it would be reflecting a credential into a
 //! response body's neighbourhood for no reason anybody wants.
+//!
+//! The fourth row is the one thing here that is neither a redaction nor a
+//! forwarding, and [`CONTENT_CODING_NEGOTIATION`] says why: this proxy has to read
+//! the answer to put the conversation's values back into it, so the coding of that
+//! answer is not the client's to negotiate.
 
 use std::collections::BTreeSet;
 
@@ -66,6 +72,30 @@ const CREDENTIAL_BEARING: &[&str] = &[
 
 /// periskop's own header namespace.
 const OURS: &str = "x-periskop-";
+
+/// The content coding negotiation, which this proxy does on its own behalf.
+///
+/// It is not the client's to conduct, and that is a consequence of what the
+/// response path is for. Putting a conversation's values back into an answer means
+/// **reading** the answer, and a `gzip` body is bytes with no aliases visible in
+/// them: the walk finds nothing, forwards the coded bytes whole, and the user
+/// reads `PSK_EMAIL_1` while `restore_stats.aliases_leaked` says zero. The one
+/// counter that exists to report an unrestored alias reports a clean run, which is
+/// the silent failure this component exists to make impossible.
+///
+/// Deleting the header would be worse than leaving it: RFC 9110 section 12.5.3
+/// says an absent `Accept-Encoding` means **any** coding is acceptable, so
+/// stripping it invites exactly the answer it was meant to prevent. It is replaced
+/// by [`READABLE_CODING`] instead, which is the same section's way of saying "no
+/// coding".
+const CONTENT_CODING_NEGOTIATION: &str = "accept-encoding";
+
+/// The only content coding this build can read.
+///
+/// `identity` rather than a list, because every entry in such a list would be a
+/// decoder this crate does not have and a promise the response path could not
+/// keep.
+pub const READABLE_CODING: &str = "identity";
 
 /// The client header that names the conversation (`proxy/spec.md` section 2.4
 /// step 1).
@@ -167,9 +197,20 @@ pub fn to_upstream(client: &HeaderList, upstream_host: &str) -> HeaderList {
     // Recomputed, never copied: this is a different connection to a different
     // host, and after masking it is a different body length.
     out.push("host", upstream_host);
+    // Stated once, whatever the client wrote, because the client is negotiating a
+    // representation for a hop it is not the far end of: this proxy has to read
+    // the answer to put the conversation's values back into it.
+    out.push(CONTENT_CODING_NEGOTIATION, READABLE_CODING);
 
     for (name, value) in client.iter() {
         if CONNECTION_SCOPED.contains(&name) || nominated.contains(name) {
+            continue;
+        }
+        // Dropped here so the declaration above is the only one on the wire. Two
+        // `Accept-Encoding` fields are one comma separated list per RFC 9110
+        // section 5.2, so keeping the client's would put `gzip` back into the
+        // value periskop just narrowed.
+        if name == CONTENT_CODING_NEGOTIATION {
             continue;
         }
         // periskop's own namespace never crosses GS-0. `x-periskop-session` is the
@@ -501,6 +542,49 @@ mod tests {
         };
         let rendered = to_downstream(&HeaderList::new(), &marks);
         assert_eq!(rendered.get("x-periskop-masked-entities").unwrap(), "0");
+    }
+
+    /// The response path can only put values back into bytes it can read.
+    ///
+    /// A client that asks for `gzip` gets a coded answer, the restore walk cannot
+    /// parse it, and `PSK_EMAIL_1` reaches the screen while the record says
+    /// `aliases_leaked: 0`. Removing the header is **not** the fix and is worse
+    /// than doing nothing: RFC 9110 section 12.5.3 says an absent
+    /// `Accept-Encoding` means every coding is acceptable, so a stripped header
+    /// invites the coding it was meant to prevent. The negotiation is replaced
+    /// rather than dropped.
+    #[test]
+    fn the_provider_is_asked_for_a_coding_this_proxy_can_read() {
+        for asked in ["gzip, deflate, br", "gzip;q=1.0, *;q=0.5", "br"] {
+            let sent = to_upstream(
+                &HeaderList::new().with("Accept-Encoding", asked),
+                "api.x.com",
+            );
+            assert_eq!(
+                sent.get("accept-encoding"),
+                Some("identity"),
+                "the client asked for `{asked}` and the provider was allowed to answer with it"
+            );
+        }
+        // And a client that asked for nothing still gets the declaration, because
+        // silence is the permissive answer here rather than the safe one.
+        let sent = to_upstream(&HeaderList::new(), "api.x.com");
+        assert_eq!(sent.get("accept-encoding"), Some("identity"));
+        // Exactly one, whatever the client wrote: two of these is a contradiction
+        // the provider resolves however it likes.
+        assert_eq!(
+            to_upstream(
+                &HeaderList::new()
+                    .with("Accept-Encoding", "gzip")
+                    .with("accept-encoding", "br"),
+                "api.x.com"
+            )
+            .names()
+            .iter()
+            .filter(|name| **name == "accept-encoding")
+            .count(),
+            1
+        );
     }
 
     #[test]
