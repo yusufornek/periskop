@@ -15,6 +15,22 @@ workspace = true
 name = "periskop"
 path = "src/main.rs"
 
+# The one switch that puts a kernel side program object into the shipped binary.
+#
+# It forwards and decides nothing: `periskop-network-sensor` owns the feature and
+# ADR-014 §4 owns the reason the loader sits behind one. What this line buys is a
+# name at the level somebody actually builds. `[[bin]]` lives here (ADR-001), so
+# without it there was no way to ask for a `periskop` that can load anything, and
+# `-p periskop-cli --all-features` quietly meant "no loader" while
+# `--workspace --all-features` meant the opposite.
+#
+# That gap was not theoretical. The F4 kernel gate ran under `-p periskop-cli`
+# with no feature named, so it exercised the no-loader build on a machine that
+# had a kernel, a verified object and root, and reported `loader_not_built`. The
+# gate was right and the command was wrong.
+[features]
+ebpf-loader = ["periskop-network-sensor/ebpf-loader"]
+
 [dependencies]
 periskop-core = { workspace = true }
 blake3 = { workspace = true }

@@ -251,10 +251,16 @@ jobs:
       # The gate itself. PERISKOP_REQUIRE_KERNEL_PROOF is set only here, and it
       # turns every path in proof_f4_kernel.rs that would record a skip into a
       # failure.
+      #
+      # `--all-features` is load bearing and was missing for one run. Without it
+      # cargo rebuilds `periskop-network-sensor` with `ebpf-loader` off, the test
+      # binary carries no loader, and the gate reports `loader_not_built` on a
+      # machine that has BTF, root and an object the kernel would have accepted.
+      # The failure looked like a kernel problem and was a command line one.
       - name: F4 kernel gate
         run: |
           sudo -E env "PATH=$PATH" PERISKOP_REQUIRE_KERNEL_PROOF=1 \
-            cargo test -p periskop-cli --test proof_f4_kernel
+            cargo test -p periskop-cli --all-features --test proof_f4_kernel
           cat target/f4-kernel-proof.json
 
       # A passing test is not the claim; the artefact is. This is the line that

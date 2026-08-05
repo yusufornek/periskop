@@ -164,11 +164,17 @@ impl<K: KernelEvents> FlowSource for EbpfFlowSource<K> {
         };
         match self.kernel.attach(&kernel::plan(&reduced)) {
             Ok(()) => Ok(reduced),
-            // The first refusal and not the second. Without the helper the plan
-            // is a subset, so a second failure has the same cause as the first
-            // and reporting the retry's would describe the retry rather than the
-            // problem.
-            Err(_) => Err(refusal),
+            // The second refusal, because the reduced plan is the one this
+            // sensor would actually have run. The first only explains why the
+            // helper was dropped, and when the helper is the thing that was
+            // refused, repeating that cause names a remedy nobody can act on.
+            //
+            // This was not hypothetical. A build carrying a kernel object but no
+            // `clsact` classifier refuses the full plan with `loader_not_built`;
+            // if the reduced plan then failed for a kernel reason, the operator
+            // was told to build a loader that was already built. A subset plan
+            // fails for a subset of reasons, not for the same one.
+            Err(second) => Err(second),
         }
     }
 
@@ -322,6 +328,22 @@ impl ScriptedKernel {
 #[derive(Default)]
 pub(crate) struct HelperlessKernel {
     pub(crate) plans: Vec<kernel::AttachPlan>,
+    /// What this kernel says to a plan it has every program for.
+    ///
+    /// `None` is the ordinary machine: drop the classifier and the rest loads.
+    /// Set it to script the one arrangement where the two refusals disagree, a
+    /// build with no classifier on a kernel that will not host the kprobes
+    /// either. That is the case where reporting the first refusal sends an
+    /// operator to build something that is already built.
+    rest: Option<SensorUnavailable>,
+}
+
+#[cfg(test)]
+impl HelperlessKernel {
+    fn also_refusing_the_rest(mut self, cause: SensorUnavailable) -> Self {
+        self.rest = Some(cause);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -335,7 +357,10 @@ impl KernelEvents for HelperlessKernel {
         {
             return Err(SensorUnavailable::LoaderNotBuilt);
         }
-        Ok(())
+        match self.rest {
+            Some(cause) => Err(cause),
+            None => Ok(()),
+        }
     }
 
     fn poll(&mut self) -> kernel::KernelBatch {
@@ -422,10 +447,31 @@ mod tests {
     }
 
     #[test]
+    fn a_reduced_plan_that_fails_reports_its_own_cause_and_not_the_helper_s() {
+        // The remedy is the whole point of the vocabulary. A build with no
+        // classifier refuses the full plan with `loader_not_built`; if the
+        // reduced plan then fails because the kernel will not host it, an
+        // operator told `loader_not_built` goes and builds a loader that is
+        // already built, and the machine that actually needs a newer kernel
+        // never gets one. The first refusal describes the program that was
+        // dropped, and the second describes the sensor that did not run.
+        let mut source = EbpfFlowSource::over(
+            HelperlessKernel::default()
+                .also_refusing_the_rest(SensorUnavailable::KernelUnsupported),
+            "h_1",
+        );
+        assert_eq!(
+            source.attach(&grant()),
+            Err(SensorUnavailable::KernelUnsupported)
+        );
+    }
+
+    #[test]
     fn a_refusal_that_is_not_about_the_helper_is_reported_and_not_retried_away() {
         // The retry must not turn a permission problem into a quiet sensor with
         // one fewer program. A kernel that refuses everything refuses the
-        // reduced plan too, and the cause the caller sees is the first one.
+        // reduced plan too, with the same cause, so dropping the helper changes
+        // what is attached and never what the caller is told.
         let mut source = EbpfFlowSource::over(
             ScriptedKernel::refusing(SensorUnavailable::MissingCapability),
             "h_1",
