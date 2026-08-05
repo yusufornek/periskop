@@ -16,8 +16,12 @@
 //! wave after the vault and answers a different question: how to name a value
 //! without naming somebody else in the process (ADR-010's P-0).
 //!
-//! The detection layers and the request path follow. Nothing here reads a
-//! request yet.
+//! [`detect`] is the wave after that: which bytes of a prompt stand for
+//! somebody, decided by two deterministic layers and by nothing statistical.
+//! [`policy`] is what an operator writes down, loaded fail closed, because a
+//! rule that is silently dropped is a value the operator believes is masked.
+//!
+//! The request path follows. Nothing here reads an HTTP request yet.
 //!
 //! # Binary targets
 //!
@@ -34,4 +38,6 @@
 #![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
 pub mod alias;
+pub mod detect;
+pub mod policy;
 pub mod vault;

@@ -12,9 +12,15 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+# Detection layer B: one automaton over the organization word list, scanned in a
+# single pass (proxy/spec.md section 3.2, ADR-004).
+aho-corasick = { workspace = true }
 # Vault key derivation and record encryption. Both are decided in ADR-007 and
 # neither is written by hand (CLAUDE.md: crypto is not hand written).
 argon2 = { workspace = true }
+# `policy_hash`: blake3-256 over the canonical policy body (proxy-policy.md
+# section 6). `data-model.md` section 2 fixes the algorithm; sha256 is not used.
+blake3 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 # Nonces and session identifiers come from the operating system's entropy source
 # and from nowhere else. There is no counter and no seed of our own to roll back.
@@ -24,8 +30,19 @@ hkdf = { workspace = true }
 # one record; this protects the set of them, which is what makes deleting,
 # reordering and restoring an older file detectable.
 hmac = { workspace = true }
+# Detection layer A's pattern engine (ADR-016 section 1): linear time, no
+# backtracking, over text an attacker chooses.
+regex = { workspace = true }
+# The policy file's canonical JSON projection. The loader validates the same
+# projection `npm run validate:schemas` validates in CI, so the rule CI sees and
+# the rule the process enforces come out of one file (proxy-policy.md preamble).
+serde = { workspace = true }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+# `policy.toml` itself. Parsing is separated from validation on purpose: TOML
+# decides what the bytes say, the loader decides whether this build implements it.
+toml = { workspace = true }
 # Key material and decrypted values live in buffers that clear themselves. This
 # is half of the memory discipline in proxy/spec.md section 9; the other half
 # (mlock, core dump) needs an operating system call and is quarantined in its own

@@ -510,6 +510,14 @@ fn every_rule_family_has_a_benchmark_cell() {
         .flatten()
         .filter(|entry| entry.path().is_dir())
         .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        // `rules/masking/` is not a detector rule family. It holds the proxy's
+        // affix rules for detection layer B, in a different rule language read
+        // by a different loader (`proxy-policy.md` section 11), and it has no
+        // corpus, no recall and nothing this benchmark could score. The name is
+        // written out rather than inferred, for the same reason the loader
+        // writes it out: a directory skipped because it "looked wrong" is how a
+        // real language stops being measured.
+        .filter(|name| name != "masking")
         .collect();
     families.sort();
 

@@ -1,0 +1,82 @@
+# Turkish affix rules for detection layer B.
+#
+# Contract: docs/04-contracts/proxy-policy.md section 11. This directory is
+# rules/masking/<natural-language>/ and NOT rules/<language>/, which holds the
+# static scanner's detector rules in a completely different rule language with a
+# different loader. Two rule languages in one directory ends, one day, with a
+# file handed to the wrong loader.
+#
+# WHY THIS FILE EXISTS
+#
+# Turkish is agglutinative. A dictionary entry "Ahmet" appears in real prompts as
+# Ahmet'in, Ahmet'e, Ahmetler, Ahmetlerden. A word-boundary matcher with no affix
+# knowledge finds none of them, and every one it misses is a person's name
+# reaching the provider. That is a silent, irreversible leak, which is the more
+# expensive of the two errors this component can make.
+#
+# The opposite error is real too and is bounded here rather than ignored: a
+# suffix rule that is too generous starts matching inside unrelated words
+# (Ali -> Alice) and rewrites text that should have been left alone. So the
+# no-apostrophe path is closed on three sides: the tail must parse as a sequence
+# of the INFLECTIONAL suffixes below, vowel harmony must hold, and the base must
+# be at least `min_base_chars` characters.
+#
+# WHAT IS DELIBERATELY NOT HERE
+#
+# Derivational suffixes (-ce/-ca, -li/-lı, -siz, -lik, -ci). They attach to a
+# stem to make a new word, and admitting them is what turns "Ali" into a match
+# inside "Alice" and "Türkçe". A proper noun that takes one of them has become a
+# different word; the dictionary should carry that word.
+
+schema_version = "1.0"
+language = "tr"
+
+# The apostrophe forms Turkish orthography uses to separate a proper noun from
+# its suffix (TDK). A match followed by one of these is accepted whatever the
+# tail parses to: the apostrophe IS the boundary, and the base before it is an
+# exact dictionary term. Erring toward the match here is deliberate and cheap,
+# because the base was already an exact hit.
+apostrophes = ["'", "’", "ʼ"]
+
+# Shortest base that may take a suffix with no apostrophe. Two-character entries
+# would match inside far too many ordinary words; three is what keeps "Ali" +
+# "-ler" working, and the residual risk of a short entry is KG-025.
+min_base_chars = 3
+
+# How many suffixes may be chained. "Ahmet'lerinden" is plural + possessive +
+# ablative, which is three. A longer chain is not Turkish, it is a coincidence.
+max_affix_chain = 3
+
+# Inflectional suffixes, in all their harmony variants. Every entry is a suffix
+# that attaches to a nominal, which is what a PERSON, ORG, LOC, ADDRESS or HOST
+# entry is.
+suffixes = [
+  # Plural.
+  "ler", "lar",
+  # Possessive.
+  "im", "ım", "um", "üm",
+  "in", "ın", "un", "ün",
+  "imiz", "ımız", "umuz", "ümüz",
+  "iniz", "ınız", "unuz", "ünüz",
+  "leri", "ları",
+  # Possessive after a vowel-final base.
+  "si", "sı", "su", "sü",
+  # Genitive after a vowel-final base.
+  "nin", "nın", "nun", "nün",
+  # Dative.
+  "e", "a", "ye", "ya",
+  # Accusative.
+  "i", "ı", "u", "ü", "yi", "yı", "yu", "yü",
+  # Locative. Both the voiced and the voiceless form: consonant harmony is NOT
+  # enforced, because a reader who writes "Ahmetde" instead of "Ahmette" would
+  # otherwise be a miss, and a miss is a leak.
+  "de", "da", "te", "ta",
+  # Ablative.
+  "den", "dan", "ten", "tan",
+  # Instrumental / comitative.
+  "le", "la", "yle", "yla",
+  # Relational.
+  "ki",
+  # Copula.
+  "dir", "dır", "dur", "dür", "tir", "tır", "tur", "tür",
+]

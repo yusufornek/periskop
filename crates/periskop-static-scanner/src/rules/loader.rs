@@ -290,6 +290,32 @@ fn collect_toml_files(dir: &Path, out: &mut Vec<PathBuf>, errors: &mut Vec<RuleL
     collect_toml_files_at(dir, 0, out, errors);
 }
 
+/// Directories under `rules/` that hold a **different** rule language, owned by a
+/// different component and read by a different loader.
+///
+/// One entry today: `rules/masking/<natural-language>/`, the proxy's affix rules
+/// for detection layer B (`docs/04-contracts/proxy-policy.md` section 11). That
+/// contract picked the `masking/` prefix precisely so the two rule languages
+/// would not share a directory, and this is the other half of the same decision:
+/// the static scanner's walk has to know not to descend, or every affix file
+/// becomes a malformed detector rule and the rule set fails to load.
+///
+/// Named rather than inferred. Skipping "anything that does not parse" would
+/// turn a genuinely broken detector rule into a silent omission, which is the
+/// failure mode this whole loader is written against.
+const FOREIGN_RULE_DIRECTORIES: &[&str] = &["masking"];
+
+/// Whether this directory belongs to another component's rule language.
+///
+/// Only checked at the top level of the tree; a `masking` directory nested
+/// inside a language family is not this contract's directory and is still read,
+/// because pretending otherwise would give somebody a way to hide a rule file.
+fn is_foreign_rule_language(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| FOREIGN_RULE_DIRECTORIES.contains(&name))
+}
+
 fn collect_toml_files_at(
     dir: &Path,
     depth: usize,
@@ -339,6 +365,9 @@ fn collect_toml_files_at(
         // walk terminate on any tree, including one that points at itself.
         let is_directory = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir());
         if is_directory {
+            if is_foreign_rule_language(&path) {
+                continue;
+            }
             collect_toml_files_at(&path, depth + 1, out, errors);
         } else if path.extension().is_some_and(|e| e == "toml") {
             out.push(path);
@@ -516,6 +545,32 @@ default_confidence = "confirmed"
             assert_eq!(rules.len(), 1, "{rules:?}");
             assert!(errors.is_empty(), "{errors:?}");
         }
+    }
+
+    #[test]
+    fn the_proxy_masking_rules_are_not_read_as_detector_rules() {
+        // `rules/masking/<lang>/` is the proxy's affix rule language
+        // (`proxy-policy.md` section 11). Descending into it makes every affix
+        // file a malformed detector rule, and because `load_directory`'s errors
+        // are fatal to the caller, the whole rule set stops loading: a scanner
+        // that finds nothing because a *different* component shipped a file.
+        let root =
+            std::env::temp_dir().join(format!("periskop-rule-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("python")).unwrap();
+        std::fs::create_dir_all(root.join("masking/tr")).unwrap();
+        std::fs::write(root.join("python/openai.toml"), MINIMAL).unwrap();
+        std::fs::write(
+            root.join("masking/tr/affixes.toml"),
+            "schema_version = \"1.0\"\nlanguage = \"tr\"\nsuffixes = [\"ler\"]\n",
+        )
+        .unwrap();
+
+        let (rules, errors) = load_directory(&root);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(rules.len(), 1, "{rules:?}");
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]
