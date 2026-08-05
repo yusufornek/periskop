@@ -10,6 +10,14 @@
 //! checked too, because `src/main.rs` and `src/bin/` produce a binary target with
 //! nothing written in a manifest to notice.
 //!
+//! There is one directory under `crates/` that declares a binary and is not a
+//! second executable: `periskop-ebpf-object`, whose target is a kernel and whose
+//! output is an ELF object the loader hands to `bpf(2)` (ADR-014 §8). It is not
+//! a workspace member, so `cargo build --workspace` never produces it and no
+//! release ever ships it as a program. That exemption is not a hole in the check:
+//! it is asserted, and the three things that make it true are asserted with it,
+//! so a host binary cannot arrive by being placed outside the members list.
+//!
 //! **The documented command tree is the real one.** `cli/spec.md` section 2 opens
 //! with "the surface the binary offers today (identical to `periskop --help`)".
 //! That sentence was true when it was written and had no way of staying true. Now
@@ -42,6 +50,15 @@ fn exactly_one_crate_in_the_workspace_produces_an_executable() {
     // this repository keeps having to design against.
     assert!(members.len() >= 8, "only {} crates found", members.len());
 
+    let in_workspace = workspace_members();
+    // A members list that could not be read would turn the filter below into an
+    // exemption for every crate, which is the opposite of what this test is for.
+    assert!(
+        in_workspace.len() >= 8,
+        "the root manifest lists only {} members",
+        in_workspace.len()
+    );
+
     for member in &members {
         let name = member
             .file_name()
@@ -53,6 +70,14 @@ fn exactly_one_crate_in_the_workspace_produces_an_executable() {
             &std::fs::read_to_string(member.join("Cargo.toml")).expect("a crate manifest"),
         )
         .expect("a parseable crate manifest");
+
+        if !in_workspace.contains(&name) {
+            // Everything outside the workspace has to justify itself here, and
+            // there is exactly one thing that can.
+            assert_kernel_object_rather_than_a_second_program(&name, member, &manifest);
+            continue;
+        }
+
         if let Some(bins) = manifest.get("bin").and_then(toml::Value::as_array) {
             for bin in bins {
                 let target = bin
@@ -82,6 +107,58 @@ fn exactly_one_crate_in_the_workspace_produces_an_executable() {
         discovered,
         vec!["periskop-cli has src/main.rs".to_owned()],
         "a binary target arrived through cargo's auto discovery rather than a manifest"
+    );
+}
+
+/// The crate directories the root manifest lists as members.
+///
+/// Read from the manifest rather than from the directory listing, because the
+/// question this test asks is what `cargo build --workspace` produces, and that
+/// is decided by the list and not by what is on disk.
+fn workspace_members() -> BTreeSet<String> {
+    let root: toml::Value =
+        toml::from_str(&std::fs::read_to_string(repo_root().join("Cargo.toml")).expect("the root"))
+            .expect("a parseable root manifest");
+    root.get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(toml::Value::as_array)
+        .map(|members| {
+            members
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .filter_map(|path| path.rsplit('/').next())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The one crate allowed to sit outside the workspace, and the three facts that
+/// make it something other than a second program.
+///
+/// Checked rather than trusted, because "it is not a real binary" is a sentence
+/// anybody could write in a comment above a real binary.
+fn assert_kernel_object_rather_than_a_second_program(
+    name: &str,
+    directory: &Path,
+    manifest: &toml::Value,
+) {
+    assert_eq!(
+        name, "periskop-ebpf-object",
+        "a crate outside the workspace members list appeared; ADR-001 and ADR-002 both have \
+         something to say about that and neither has said it yet"
+    );
+    assert!(
+        manifest.get("workspace").is_some(),
+        "{name} is not in the root members list and does not declare its own workspace, so cargo \
+         resolves it against the root and its toolchain constraints leak into every other crate"
+    );
+    let cargo_config = std::fs::read_to_string(directory.join(".cargo/config.toml"))
+        .expect("the kernel object pins its own build target");
+    assert!(
+        cargo_config.contains("bpfel-unknown-none"),
+        "{name} declares a binary and does not build for a kernel target, which makes it a second \
+         executable whatever its documentation says"
     );
 }
 

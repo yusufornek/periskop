@@ -75,7 +75,18 @@ pub trait FlowSource {
     /// cannot decide for itself that it has permission it was not given. An
     /// implementation that finds it needs something the grant lacks says so
     /// here instead of failing later with a record already half written.
-    fn attach(&mut self, grant: &Grant) -> Result<(), SensorUnavailable>;
+    ///
+    /// **What comes back is the grant that was actually attached**, which may be
+    /// smaller than the one that went in. The permission to attach the payload
+    /// helper and the existence of a program to attach are two different
+    /// conditions, and a machine can satisfy the first without the build
+    /// satisfying the second. Returning the effective grant is what keeps that
+    /// difference visible: the caller stamps `tc_unavailable` on every flow from
+    /// the pass, so the loss is declared per record rather than being a silently
+    /// shorter plan. A `Result<(), _>` here made that impossible to express, and
+    /// the consequence was a sensor that refused to start on the one kind of
+    /// machine it is for.
+    fn attach(&mut self, grant: &Grant) -> Result<Grant, SensorUnavailable>;
 
     /// Hands over what has been observed since the last call.
     ///
@@ -125,10 +136,40 @@ impl<K: KernelEvents> EbpfFlowSource<K> {
 }
 
 impl<K: KernelEvents> FlowSource for EbpfFlowSource<K> {
-    fn attach(&mut self, grant: &Grant) -> Result<(), SensorUnavailable> {
+    fn attach(&mut self, grant: &Grant) -> Result<Grant, SensorUnavailable> {
         // The plan is derived from the grant here and handed down, so the
         // loader cannot attach a program the privilege check did not allow.
-        self.kernel.attach(&kernel::plan(grant))
+        let refusal = match self.kernel.attach(&kernel::plan(grant)) {
+            Ok(()) => {
+                return Ok(Grant {
+                    tc_available: grant.tc_available,
+                    elevated_as_root: grant.elevated_as_root,
+                })
+            }
+            Err(refusal) => refusal,
+        };
+        if !grant.tc_available {
+            return Err(refusal);
+        }
+
+        // The machine allowed the payload helper and the kernel side would not
+        // take it. Asked once more without it, because the helper is resolution
+        // and never correctness (ADR-008): losing it costs server names, and
+        // refusing the whole sensor over it would cost every flow. The reduced
+        // grant is what comes back, so the caller marks the loss on every record
+        // instead of a shorter plan disappearing into a successful attach.
+        let reduced = Grant {
+            tc_available: false,
+            elevated_as_root: grant.elevated_as_root,
+        };
+        match self.kernel.attach(&kernel::plan(&reduced)) {
+            Ok(()) => Ok(reduced),
+            // The first refusal and not the second. Without the helper the plan
+            // is a subset, so a second failure has the same cause as the first
+            // and reporting the retry's would describe the retry rather than the
+            // problem.
+            Err(_) => Err(refusal),
+        }
     }
 
     fn drain(&mut self) -> Vec<Observation> {
@@ -207,9 +248,12 @@ impl StubFlowSource {
 
 #[cfg(test)]
 impl FlowSource for StubFlowSource {
-    fn attach(&mut self, grant: &Grant) -> Result<(), SensorUnavailable> {
+    fn attach(&mut self, grant: &Grant) -> Result<Grant, SensorUnavailable> {
         self.attached_with = Some(*grant);
-        self.attach
+        // Hands back exactly what it was given. A stub that reduced the grant
+        // would be testing this file's retry rather than the caller's handling
+        // of a reduction, and the retry belongs to the real source.
+        self.attach.map(|()| *grant)
     }
 
     fn drain(&mut self) -> Vec<Observation> {
@@ -241,6 +285,20 @@ impl ScriptedKernel {
         }
     }
 
+    /// A kernel that refuses every plan, whatever is in it.
+    ///
+    /// The counterpart to [`HelperlessKernel`]: one refuses only what it has no
+    /// program for, this refuses everything. The difference is what separates a
+    /// loss the sensor can work around from one it must report.
+    pub(crate) fn refusing(reason: SensorUnavailable) -> Self {
+        Self {
+            attach: Err(reason),
+            batches: Vec::new(),
+            rejected: BTreeMap::new(),
+            planned: None,
+        }
+    }
+
     /// A kernel that also handed up samples no parser could read.
     ///
     /// Scriptable because the real path to this state needs the loader feature
@@ -250,6 +308,42 @@ impl ScriptedKernel {
     pub(crate) fn refusing_samples(mut self, cause: &'static str, count: u64) -> Self {
         self.rejected.insert(cause, count);
         self
+    }
+}
+
+/// A kernel that has no program for the payload helper, which is what every
+/// build of the loader crate is today.
+///
+/// Scripted because the real condition needs the loader feature, a kernel side
+/// object and a machine that can hold programs; what is under test is on this
+/// side of the seam, and it is the thing that decides whether the sensor runs at
+/// all on a privileged host.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct HelperlessKernel {
+    pub(crate) plans: Vec<kernel::AttachPlan>,
+}
+
+#[cfg(test)]
+impl KernelEvents for HelperlessKernel {
+    fn attach(&mut self, plan: &kernel::AttachPlan) -> Result<(), SensorUnavailable> {
+        self.plans.push(plan.clone());
+        if plan
+            .programs()
+            .iter()
+            .any(|program| !program.carries_process_context())
+        {
+            return Err(SensorUnavailable::LoaderNotBuilt);
+        }
+        Ok(())
+    }
+
+    fn poll(&mut self) -> kernel::KernelBatch {
+        kernel::KernelBatch::quiet()
+    }
+
+    fn rejected_samples(&self) -> BTreeMap<&'static str, u64> {
+        BTreeMap::new()
     }
 }
 
@@ -291,6 +385,55 @@ mod tests {
             tc_available: true,
             elevated_as_root: false,
         }
+    }
+
+    #[test]
+    fn a_kernel_with_no_payload_helper_still_attaches_and_says_it_lost_the_helper() {
+        // The defect this prevents, which is not hypothetical: a privileged host
+        // grants `CAP_NET_ADMIN`, so the grant asks for the `tc` programs, and a
+        // loader with no classifier refuses the whole plan. The sensor then
+        // observes nothing on exactly the machine it exists for, and the report
+        // says `loader_not_built` on a machine where the loader was built.
+        let mut source = EbpfFlowSource::over(HelperlessKernel::default(), "h_1");
+        // Unwrapped rather than matched: a refusal here is the defect, and the
+        // panic names the line that produced it.
+        let effective = source.attach(&grant()).unwrap();
+        assert!(
+            !effective.tc_available,
+            "the helper was not attached and the grant that came back still claims it was"
+        );
+        assert_eq!(
+            source.kernel.plans.len(),
+            2,
+            "the reduction has to be a second attempt, not a plan built smaller in the first place"
+        );
+    }
+
+    #[test]
+    fn the_grant_that_comes_back_is_the_one_that_was_attached_when_nothing_was_reduced() {
+        // The other direction. A source that always reported the helper missing
+        // would put `tc_unavailable` on every record of every run, and a reader
+        // counting degraded flows would stop being able to tell a machine that
+        // lost SNI from one that never had it.
+        let mut source =
+            EbpfFlowSource::over(ScriptedKernel::yielding(KernelBatch::quiet()), "h_1");
+        let effective = source.attach(&grant()).unwrap();
+        assert!(effective.tc_available);
+    }
+
+    #[test]
+    fn a_refusal_that_is_not_about_the_helper_is_reported_and_not_retried_away() {
+        // The retry must not turn a permission problem into a quiet sensor with
+        // one fewer program. A kernel that refuses everything refuses the
+        // reduced plan too, and the cause the caller sees is the first one.
+        let mut source = EbpfFlowSource::over(
+            ScriptedKernel::refusing(SensorUnavailable::MissingCapability),
+            "h_1",
+        );
+        assert_eq!(
+            source.attach(&grant()),
+            Err(SensorUnavailable::MissingCapability)
+        );
     }
 
     fn connect_batch() -> KernelBatch {

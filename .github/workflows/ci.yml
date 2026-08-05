@@ -162,6 +162,146 @@ jobs:
           cargo run --quiet -p periskop-cli -- scan "$FIX" --rules rules --json > /tmp/b.json
           python3 -c "import json,sys; a=json.load(open('/tmp/a.json')); b=json.load(open('/tmp/b.json')); a.pop('envelope'); b.pop('envelope'); sys.exit(0 if a==b else 'two scans of the same tree disagreed')"
 
+  # F4 exit criterion 1, and the only job in this file that can close it.
+  #
+  # Everything else here runs unprivileged, and the eBPF capture path cannot be
+  # observed from there: it needs a kernel with BTF, a process holding CAP_BPF
+  # and CAP_PERFMON, and a kernel side object that no macOS development machine
+  # can build. ADR-014 deferred the loader three times partly on the belief that
+  # no gate could ever see the code; K-28 measured a hosted runner and found that
+  # belief wrong, and this job is what that measurement was for.
+  #
+  # It is deliberately fail closed. There is no `continue-on-error` and no
+  # `|| true` anywhere in it (CLAUDE.md O6b): a run that cannot build the object,
+  # cannot load the programs, or produces an artefact that does not say `proved`
+  # fails the workflow. A phase criterion that a red job could leave green is a
+  # criterion nobody is checking.
+  kernel:
+    name: Kernel capture (privileged Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Printed, not asserted. The assertions are in the Rust below; this is so
+      # that a reader of a failed run can see what the machine offered without
+      # rerunning anything. These are the same three facts the kernel-probe
+      # workflow measured for K-28.
+      - name: What this runner offers
+        run: |
+          uname -a
+          echo "BTF: $(stat -c %s /sys/kernel/btf/vmlinux) bytes"
+          grep -E 'CapEff' /proc/self/status
+          sudo grep -E 'CapEff' /proc/self/status
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The linker for the kernel target. It is not a cargo dependency of
+      # anything: it is a host tool the object's build invokes, which is exactly
+      # why ADR-014 §8 records it as a build time cost rather than as a
+      # dependency of the shipped binary.
+      - name: Install bpf-linker
+        run: cargo install bpf-linker --locked
+
+      # The toolchain comes from crates/periskop-ebpf-object/rust-toolchain.toml,
+      # which pins a dated nightly separately from the workspace's stable pin.
+      # rustup installs it on first use, and the version is printed so a failure
+      # caused by moving that pin is visible in the log rather than inferred.
+      - name: Build the kernel side object
+        working-directory: crates/periskop-ebpf-object
+        run: |
+          rustc --version
+          cargo build --release
+          ls -l target/bpfel-unknown-none/release/periskop-ebpf-object
+
+      # The object's existence is what makes the loader a loader. Checked here
+      # rather than trusted, because every later step would otherwise fall back
+      # to the honest-but-useless `loader_not_built` path and still report green.
+      - name: The object exists and is not empty
+        run: |
+          OBJ="$PWD/crates/periskop-ebpf-object/target/bpfel-unknown-none/release/periskop-ebpf-object"
+          test -s "$OBJ"
+          echo "PERISKOP_EBPF_OBJECT=$OBJ" >> "$GITHUB_ENV"
+
+      # The three gates, with the object compiled in, so this is the first place
+      # in the repository where the loader's Linux code is compiled at all. The
+      # development machine is macOS and never sees it (ADR-014 §8).
+      - name: Formatting, lints and tests with the loader compiled in
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --workspace --all-features -- --test-threads=4
+
+      # The tests that need real authority. `--test-threads=1` is required and
+      # not a preference: one of them drops this process's capabilities, which is
+      # a change to the whole process, so a concurrent test would read them at an
+      # unpredictable moment.
+      #
+      # Both packages, because the sensor carries one of these too: it has been
+      # marked and unrunnable through three milestones waiting for a loader, and
+      # this is the first job that can run it.
+      - name: Loader tests that need a real kernel
+        run: |
+          sudo -E env "PATH=$PATH" cargo test -p periskop-ebpf-loader --all-features \
+            -- --ignored --test-threads=1
+          sudo -E env "PATH=$PATH" cargo test -p periskop-network-sensor --all-features \
+            -- --ignored --test-threads=1
+        env:
+          RUSTFLAGS: -D warnings
+
+      # The gate itself. PERISKOP_REQUIRE_KERNEL_PROOF is set only here, and it
+      # turns every path in proof_f4_kernel.rs that would record a skip into a
+      # failure.
+      - name: F4 kernel gate
+        run: |
+          sudo -E env "PATH=$PATH" PERISKOP_REQUIRE_KERNEL_PROOF=1 \
+            cargo test -p periskop-cli --test proof_f4_kernel
+          cat target/f4-kernel-proof.json
+
+      # A passing test is not the claim; the artefact is. This is the line that
+      # makes a missing or downgraded artefact fail the job, so that a gate which
+      # ran and could not prove anything cannot be read as one that did.
+      - name: The artefact says proved
+        run: |
+          python3 - <<'CHECK'
+          import json, sys
+          path = "target/f4-kernel-proof.json"
+          try:
+              proof = json.load(open(path))
+          except Exception as error:
+              sys.exit(f"{path} was not produced or is not readable: {error}")
+          if proof.get("status") != "proved":
+              sys.exit(f"F4 exit criterion 1 is open: status={proof.get('status')!r}, reason={proof.get('reason')!r}")
+          if proof.get("capture") != "ebpf":
+              sys.exit(f"the observation did not come through eBPF: capture={proof.get('capture')!r}")
+          if not proof.get("proves") or not proof.get("does_not_prove"):
+              sys.exit("the artefact must state both what it proves and what it does not")
+          evidence = proof.get("evidence") or {}
+          if evidence.get("payload_marker_found_in_any_record"):
+              sys.exit("payload reached a record")
+          print(f"proved: {len(proof['proves'])} claims, {len(proof['does_not_prove'])} exclusions")
+          CHECK
+
+      - name: Publish the kernel proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: f4-kernel-proof
+          path: target/f4-kernel-proof.json
+          if-no-files-found: error
+
+      # ADR-014 §5 requires this crate to have a separate miri or sanitiser
+      # target, and it runs here rather than in the main Rust job because this is
+      # the job that owns the crate. Unprivileged and without the object: miri
+      # interprets rather than executes, so it cannot make a syscall, and what it
+      # is worth running against is the record decoder, which reads bytes this
+      # process did not write and is the one place an out of bounds read would
+      # live.
+      - name: Miri over the loader crate
+        run: |
+          rustup toolchain install nightly --component miri --profile minimal
+          cargo +nightly miri test -p periskop-ebpf-loader --lib
+        env:
+          PERISKOP_EBPF_OBJECT: ""
+
   # The two hooks are the second detection source, and neither is compiled by
   # cargo. They carry their own blake3, written out because a hook may not add a
   # dependency to somebody else's interpreter, and the whole point of that code

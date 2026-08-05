@@ -1,0 +1,11 @@
+# Building for the kernel, not for this machine.
+#
+# `bpfel-unknown-none` ships no precompiled `core`, so it is built from source
+# alongside the program. Naming the target here rather than on every command
+# line is what stops a bare `cargo build` in this directory from producing a
+# host binary that would look like a successful build of something it is not.
+[build]
+target = "bpfel-unknown-none"
+
+[unstable]
+build-std = ["core"]

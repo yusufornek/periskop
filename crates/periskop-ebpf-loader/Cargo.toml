@@ -3,10 +3,17 @@ name = "periskop-ebpf-loader"
 description = "Opens the kernel objects the network sensor reads from, and decides nothing about what they mean."
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# Not inherited. `aya` 0.14.0 declares 1.87.0 and this is the only package in the
+# tree that depends on it, so the floor is raised here rather than across the
+# workspace: eight crates would otherwise carry a constraint one crate's
+# Linux only dependency introduced. The pinned toolchain (1.91.0) satisfies both.
+rust-version = "1.87"
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+# Locates the kernel side object, if one was built. See `build.rs`: without it
+# this crate compiles exactly as it did before and reports `loader_not_built`.
+build = "build.rs"
 
 # This crate is the `unsafe` exception ADR-002 reserved for the eBPF loader,
 # granted the way ADR-014 decided it has to be granted: at a crate boundary, in
@@ -40,7 +47,30 @@ panic = "deny"
 
 [dependencies]
 # Already a workspace dependency, so this adds nothing to the dependency tree
-# that six other crates do not already carry. No eBPF runtime library appears
-# here: that decision is still deferred and the reasons are in ADR-014 §4 and in
-# this crate's own documentation.
+# that six other crates do not already carry.
 thiserror = { workspace = true }
+
+# The eBPF runtime, and the target gate ADR-014 §6.4 said would land here rather
+# than on the feature in `periskop-network-sensor`. Both of these compile on
+# Linux only, so `cargo build --workspace` on the macOS development machine never
+# sees them and the default build's dependency tree is unchanged on every
+# platform.
+#
+# The consequence of that gate is stated rather than left implicit: the three
+# gates on a development machine do not compile this code at all. It is checked
+# by the privileged Linux job in `.github/workflows/ci.yml` and nowhere else,
+# which is the arrangement K-28 measured to be possible and ADR-014 §8 records.
+[target.'cfg(target_os = "linux")'.dependencies]
+# ADR-014 §4 chose `aya` over `libbpf-rs` and kept the choice: it is pure Rust,
+# so it adds no `libbpf` or `clang` runtime dependency to the single static
+# binary ADR-002 fixes. Pinned to an exact version because a loader that silently
+# changed the library it speaks to the kernel through cannot be re-verified by
+# any gate that runs on a development machine.
+aya = "=0.14.0"
+# Capability manipulation and the monotonic clock. Both are syscalls with no safe
+# equivalent in `std`: `capset` is what drops `CAP_BPF` and `CAP_PERFMON` the
+# moment the descriptors are open (network-sensor/spec.md §9), and
+# `clock_gettime(CLOCK_MONOTONIC)` is the reading the kernel program's own clock
+# has to be aligned against. Confined to `src/syscall.rs` with the rest of the
+# exception.
+libc = "0.2"

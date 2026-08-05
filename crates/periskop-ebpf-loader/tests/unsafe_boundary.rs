@@ -8,10 +8,20 @@
 //! change in a file nobody was reviewing for that.
 //!
 //! So it is a test. It reads this crate's own sources and fails the build if any
-//! file other than the designated module opens the exception. Today that module
-//! does not exist yet and the correct answer is zero occurrences everywhere,
-//! which means the boundary is in force before there is anything inside it, and
-//! the first line that crosses it lands red.
+//! file other than the designated module opens the exception.
+//!
+//! # What changed when the loader landed
+//!
+//! Until milestone F4-97 the correct answer was zero occurrences everywhere, and
+//! a test asserted exactly that. `syscall.rs` now exists and uses the exception,
+//! so that assertion was rewritten rather than deleted, and it was rewritten in
+//! the direction that keeps it load bearing:
+//!
+//! - the module named by the ADR **must** open the exception, because a boundary
+//!   check that passes by finding nothing to check is not a boundary check, and
+//!   deleting or emptying `syscall.rs` would otherwise turn this file green;
+//! - the number of openings is **capped**, so the exception's surface cannot
+//!   grow one line at a time without somebody raising the cap on purpose.
 //!
 //! The check is textual, and that is a real limit: it looks for the keyword in
 //! the positions the compiler accepts it in, so a comment quoting one of those
@@ -23,6 +33,16 @@ use std::path::{Path, PathBuf};
 
 /// The module ADR-014 §5 names as the only place the exception may be used.
 const DESIGNATED_MODULE: &str = "syscall.rs";
+
+/// How many times the exception may be opened in this crate.
+///
+/// Three: `capget`, `capset` and `clock_gettime`, which is one call per thing
+/// the loader needs and `std` does not provide. Raising this is a decision about
+/// the size of the workspace's only `unsafe` surface, so it is a line somebody
+/// has to change on purpose and explain in a commit message. A budget rather
+/// than an exact match on the current count, because the point is to stop the
+/// surface growing, not to make refactoring inside it a test failure.
+const OPENING_BUDGET: usize = 3;
 
 /// The forms in which the keyword actually opens the exception. A file that
 /// contains none of these cannot be using it, whatever its prose says.
@@ -89,6 +109,11 @@ fn openings(include: impl Fn(&Path) -> bool) -> Vec<Opening> {
     found
 }
 
+fn is_designated(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name == DESIGNATED_MODULE)
+}
+
 fn describe(openings: &[Opening]) -> Vec<String> {
     openings
         .iter()
@@ -98,10 +123,7 @@ fn describe(openings: &[Opening]) -> Vec<String> {
 
 #[test]
 fn the_exception_is_opened_nowhere_outside_the_module_adr_014_names() {
-    let outside = openings(|path| {
-        path.file_name()
-            .is_none_or(|name| name != DESIGNATED_MODULE)
-    });
+    let outside = openings(|path| !is_designated(path));
     assert!(
         outside.is_empty(),
         "ADR-014 confines the unsafe exception to {DESIGNATED_MODULE}; these are outside it: {:?}",
@@ -110,17 +132,31 @@ fn the_exception_is_opened_nowhere_outside_the_module_adr_014_names() {
 }
 
 #[test]
-fn this_build_opens_the_exception_nowhere_at_all() {
-    // The claim the crate documentation makes, held as an assertion rather than
-    // left as prose: the grant exists at the crate boundary and nothing has used
-    // it, because every operation that would need it is still deferred
-    // (ADR-014 §4). When the syscall module lands, this is the test that has to
-    // be rewritten, and having to rewrite it deliberately is the point.
-    let anywhere = openings(|_| true);
+fn the_designated_module_exists_and_actually_opens_the_exception() {
+    // The assertion that stops this file from passing for the wrong reason.
+    // Before the loader landed, the whole crate opened the exception nowhere and
+    // the test above was true of an empty crate; it would be true again if
+    // somebody deleted `syscall.rs`, moved the calls into a dependency, or
+    // emptied the module. None of those is the boundary holding.
+    let inside = openings(is_designated);
     assert!(
-        anywhere.is_empty(),
-        "the crate documentation says this build opens the exception nowhere: {:?}",
-        describe(&anywhere)
+        !inside.is_empty(),
+        "{DESIGNATED_MODULE} opens the exception nowhere, so the check above is checking nothing. \
+         Either the module was emptied or the syscalls moved somewhere this test cannot see them."
+    );
+}
+
+#[test]
+fn the_exception_surface_stays_within_its_budget() {
+    // A boundary that only says "in one file" lets the file grow. This is the
+    // other half: the count of places the workspace steps outside its own
+    // guarantee is fixed at a number somebody decided, and adding a fourth is a
+    // failing test rather than a diff nobody read closely.
+    let inside = openings(is_designated);
+    assert!(
+        inside.len() <= OPENING_BUDGET,
+        "the unsafe surface grew past its budget of {OPENING_BUDGET}: {:?}",
+        describe(&inside)
     );
 }
 
@@ -135,6 +171,10 @@ fn the_boundary_check_is_looking_at_a_crate_that_has_sources() {
         sources.len() >= 5,
         "expected to scan this crate's modules and found {} file(s)",
         sources.len()
+    );
+    assert!(
+        sources.iter().any(|path| is_designated(path)),
+        "{DESIGNATED_MODULE} is not among this crate's sources"
     );
 }
 

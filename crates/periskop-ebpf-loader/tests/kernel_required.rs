@@ -1,9 +1,11 @@
+#![allow(clippy::expect_used)]
 //! The tests that need a real machine, and are marked so rather than skipped.
 //!
 //! Everything else in this crate runs everywhere, because the seam was drawn so
 //! that it could. What is left here genuinely depends on the machine underneath:
-//! whether it is Linux, whether the kernel exposes BTF, and whether this process
-//! was given `CAP_BPF`. None of those can be arranged inside a test.
+//! whether it is Linux, whether the kernel exposes BTF, whether this process was
+//! given `CAP_BPF`, and whether this binary was built with a kernel side program
+//! object. None of those can be arranged inside a test.
 //!
 //! They are `#[ignore]`d with the reason in the attribute, so `cargo test`
 //! prints the name and the word "ignored" and a reader can see what was not
@@ -15,13 +17,22 @@
 //! Run them where they apply:
 //!
 //! ```text
-//! sudo -E cargo test -p periskop-ebpf-loader -- --ignored
+//! sudo -E cargo test -p periskop-ebpf-loader --all-features -- --ignored --test-threads=1
 //! ```
 //!
-//! **These are the tests that fail first when the loader lands**, and that is
-//! deliberate. Each one pins the current honest end state, which is that a
-//! fully privileged Linux machine still has no program object to load. When
-//! there is one, they go red and have to be rewritten to assert an attach.
+//! `--test-threads=1` is not a preference. [`the_load_gives_up_the_capabilities_
+//! that_allowed_it`] drops this process's capabilities, which is a change to the
+//! whole process rather than to one test, so a second test reading them
+//! concurrently would read them at an unpredictable moment.
+//!
+//! # Why two of these assert one thing or the other
+//!
+//! Not to arrange a pass. Each branch asserts a claim of its own and the two are
+//! different claims about the same loader: with the authority, that it loads and
+//! then gives the authority up; without it, that it refuses for the capability
+//! and not for something else. Which branch ran is printed, and the phase gate
+//! that has to see the first one is `proof_f4_kernel.rs`, which fails rather
+//! than branches when `PERISKOP_REQUIRE_KERNEL_PROOF` is set.
 
 use std::path::Path;
 
@@ -37,6 +48,12 @@ const BTF_VMLINUX: &str = "/sys/kernel/btf/vmlinux";
 const CAP_NET_ADMIN: u32 = 12;
 const CAP_PERFMON: u32 = 38;
 const CAP_BPF: u32 = 39;
+
+/// Whether this binary carries a kernel side program object.
+///
+/// Read from the same cfg the loader is compiled under, so a test cannot expect
+/// a load from a binary that has nothing to load.
+const KERNEL_OBJECT_COMPILED_IN: bool = cfg!(all(target_os = "linux", periskop_kernel_object));
 
 /// Reads this process's real authority off the running kernel.
 ///
@@ -85,72 +102,125 @@ const ATTRIBUTING_HOOKS: [Hook; 6] = [
 ];
 
 #[test]
-#[ignore = "needs a Linux kernel with BTF and this process holding CAP_BPF and CAP_PERFMON; \
-            neither is arrangeable on the macOS development machine or in an unprivileged runner"]
-fn on_a_privileged_linux_kernel_the_only_thing_still_missing_is_the_program_object() {
+#[ignore = "needs a Linux kernel with BTF, a process holding CAP_BPF and CAP_PERFMON, \
+            and a binary built with a kernel side object; none is arrangeable on the \
+            macOS development machine"]
+fn the_load_gives_up_the_capabilities_that_allowed_it() {
     let capabilities = capabilities_of_this_process();
-    // Asserted rather than skipped over. If the machine running this does not
-    // meet the precondition, the honest outcome is a failure that says so, not a
-    // pass that checked nothing.
+    // Asserted rather than skipped over. If the machine running this is not
+    // Linux, the honest outcome is a failure that says so, not a pass that
+    // checked nothing.
     assert_eq!(
         HostPlatform::current(),
         HostPlatform::Linux,
         "this test asserts kernel behaviour and was run somewhere else"
     );
-    assert!(
-        capabilities.may_load_programs(),
-        "run with CAP_BPF and CAP_PERFMON, or as root"
+
+    let mut loader = EbpfLoader::default();
+    let first = loader.load(HostPlatform::current(), &capabilities, &ATTRIBUTING_HOOKS);
+
+    if !capabilities.may_load_programs()
+        || !capabilities.btf_available
+        || !KERNEL_OBJECT_COMPILED_IN
+    {
+        // The other claim, and a real one: whatever is missing, the loader names
+        // it rather than trying and failing deeper.
+        eprintln!(
+            "  this machine cannot load: capabilities={}, btf={}, object_compiled_in={}",
+            capabilities.may_load_programs(),
+            capabilities.btf_available,
+            KERNEL_OBJECT_COMPILED_IN
+        );
+        assert!(first.is_err(), "a load succeeded with nothing to load it");
+        assert!(!loader.is_attached());
+        return;
+    }
+
+    assert_eq!(
+        first,
+        Ok(()),
+        "every precondition held and the load still failed: {:?}",
+        loader.last_refusal_detail()
     );
     assert!(
-        capabilities.btf_available,
+        loader.is_attached(),
+        "the load reported success and the loader is holding nothing"
+    );
+
+    // The requirement in `network-sensor/spec.md` §9, demonstrated rather than
+    // asserted about: after the load, the authority that allowed it is gone, and
+    // the way to show it is gone is that using it again does not work. A drop
+    // that had returned success without taking effect would leave this second
+    // load succeeding.
+    let mut second = EbpfLoader::default();
+    let after = second.load(
+        HostPlatform::current(),
+        &capabilities_of_this_process(),
+        &ATTRIBUTING_HOOKS,
+    );
+    assert_eq!(
+        after,
+        Err(LoaderUnavailable::MissingCapability),
+        "the capabilities survived a load, so the two stage privilege structure did not happen"
+    );
+    assert!(!second.is_attached());
+}
+
+#[test]
+#[ignore = "needs a Linux machine; the macOS development machine reports the platform \
+            before it reaches the question this asks"]
+fn the_loader_agrees_with_the_authority_this_process_actually_holds() {
+    let capabilities = capabilities_of_this_process();
+    assert_eq!(HostPlatform::current(), HostPlatform::Linux);
+
+    // The full plan, which every build of this crate refuses before it reaches a
+    // kernel because no build carries a `clsact` classifier. So this asks the
+    // capability question without loading anything, and it is safe to run beside
+    // the test that drops capabilities.
+    let mut loader = EbpfLoader::default();
+    let refusal = loader
+        .load(HostPlatform::current(), &capabilities, &EVERY_HOOK)
+        .expect_err("no build of this crate has a program for the payload helper");
+
+    let expected = if capabilities.may_load_programs() {
+        // The distinction that matters to whoever reads the report: this machine
+        // was allowed to observe and this build has no program for part of what
+        // was asked, which has a remedy in the build rather than in a grant.
+        LoaderUnavailable::LoaderNotBuilt
+    } else {
+        // And the other one: this machine can observe and was not allowed to.
+        LoaderUnavailable::MissingCapability
+    };
+    assert_eq!(
+        refusal,
+        expected,
+        "the loader's answer does not match this process's authority; detail: {:?}",
+        loader.last_refusal_detail()
+    );
+    assert!(
+        loader.last_refusal_detail().is_some(),
+        "a refusal with no detail leaves an operator with a label and no way to act on it"
+    );
+}
+
+#[test]
+#[ignore = "needs a Linux kernel; asks what this machine exposes rather than what this \
+            build believes about it"]
+fn the_kernel_this_runs_on_exposes_what_co_re_needs() {
+    // Read off the machine rather than from the loader, so that a build whose
+    // own probe was wrong cannot make this agree with it. The loader's answer
+    // depends on this file existing, and this is the only test that checks the
+    // file rather than the answer.
+    assert_eq!(HostPlatform::current(), HostPlatform::Linux);
+    assert!(
+        Path::new(BTF_VMLINUX).exists(),
         "this kernel exposes no BTF at {BTF_VMLINUX}, so CO-RE cannot work here"
     );
-
-    assert_eq!(
-        EbpfLoader.load(HostPlatform::current(), &capabilities, &ATTRIBUTING_HOOKS),
-        Err(LoaderUnavailable::LoaderNotBuilt),
-        "every machine side condition passed, so the only remaining cause must be this build"
-    );
-}
-
-#[test]
-#[ignore = "needs a Linux machine where this process holds CAP_NET_ADMIN, \
-            which an unprivileged runner and the macOS development machine do not"]
-fn on_a_linux_kernel_with_net_admin_the_payload_helper_is_permitted() {
-    let capabilities = capabilities_of_this_process();
-    assert_eq!(HostPlatform::current(), HostPlatform::Linux);
+    let size = std::fs::metadata(BTF_VMLINUX)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
     assert!(
-        capabilities.may_attach_traffic_control(),
-        "run with CAP_NET_ADMIN, or as root"
-    );
-    assert!(capabilities.may_load_programs());
-    assert!(capabilities.btf_available);
-
-    // The helper being permitted has to be visible as something other than the
-    // capability refusal, or a machine that granted CAP_NET_ADMIN would be
-    // indistinguishable from one that did not.
-    assert_eq!(
-        EbpfLoader.load(HostPlatform::current(), &capabilities, &EVERY_HOOK),
-        Err(LoaderUnavailable::LoaderNotBuilt)
-    );
-}
-
-#[test]
-#[ignore = "needs a Linux machine where this process holds no eBPF capabilities; \
-            a root runner and the macOS development machine both fail the precondition"]
-fn an_unprivileged_linux_process_is_refused_for_the_capability_and_not_the_platform() {
-    let capabilities = capabilities_of_this_process();
-    assert_eq!(HostPlatform::current(), HostPlatform::Linux);
-    assert!(
-        !capabilities.may_load_programs(),
-        "this process holds the capabilities, so it cannot demonstrate the refusal"
-    );
-
-    // The distinction that matters to whoever reads the report: this machine can
-    // observe and was not allowed to, which has a remedy, rather than this
-    // machine cannot observe, which does not.
-    assert_eq!(
-        EbpfLoader.load(HostPlatform::current(), &capabilities, &ATTRIBUTING_HOOKS),
-        Err(LoaderUnavailable::MissingCapability)
+        size > 0,
+        "{BTF_VMLINUX} is present and empty, which no loader can relocate against"
     );
 }

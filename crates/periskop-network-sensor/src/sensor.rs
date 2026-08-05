@@ -204,9 +204,13 @@ pub(crate) fn observe_on<S: FlowSource>(
         );
     };
 
-    if let Err(reason) = source.attach(&grant) {
-        return SensorOutcome::not_started(detected_platform, reason);
-    }
+    // The grant that came back rather than the one that went in. A source may
+    // attach less than it was permitted to, and the difference has to reach
+    // every record of the pass or it is a loss nobody declared.
+    let grant = match source.attach(&grant) {
+        Ok(effective) => effective,
+        Err(reason) => return SensorOutcome::not_started(detected_platform, reason),
+    };
 
     let mut flows = Vec::new();
     let mut tally = ScopeTally::default();

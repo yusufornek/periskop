@@ -1,0 +1,271 @@
+//! The whole of this workspace's `unsafe` exception, in one file.
+//!
+//! ADR-002 sets `unsafe_code = "forbid"` for the workspace and names the eBPF
+//! loader as one of three places allowed an exception. ADR-014 §5 made the grant
+//! narrower than the crate: every operation that uses it belongs in one module
+//! named `syscall`, and `tests/unsafe_boundary.rs` fails the build if any other
+//! file in this crate opens one. This is that module.
+//!
+//! # What is in here, and why each thing has to be
+//!
+//! Three calls, and none of them has a safe equivalent in `std`:
+//!
+//! - **`capget`** reads the capabilities this process holds right now. The
+//!   sensor already parses `/proc/self/status`, and this is not a second copy of
+//!   that: it is the reading taken immediately before the `bpf(2)` call and
+//!   immediately after the capabilities are dropped, at moments where a file
+//!   read of a text interface would be answering a slightly older question.
+//! - **`capset`** is the drop itself (`network-sensor/spec.md` §9). The sensor
+//!   loads with `CAP_BPF` and `CAP_PERFMON` and then must not keep them: a
+//!   long lived observer holding the authority to load kernel programs is a
+//!   larger thing to compromise than one that gave it up a second after start.
+//! - **`clock_gettime(CLOCK_MONOTONIC)`** is the clock the kernel program reads
+//!   through `bpf_ktime_get_ns`. The loader measures the offset between it and
+//!   the epoch once and hands the offset down, because no eBPF helper returns
+//!   wall clock time and a record carries a wall clock bucket. `std::time::
+//!   Instant` cannot serve: it is deliberately opaque and cannot be compared
+//!   against a number the kernel produced.
+//!
+//! Notably **not** in here: loading and attaching programs, and reading the ring
+//! buffer. `aya` exposes all three through a safe API, so this crate's exception
+//! covers less than ADR-014 expected it to. That is worth stating rather than
+//! quietly enjoying, because it is the reason the exception's surface is three
+//! functions rather than a subsystem.
+//!
+//! # What this module does not do
+//!
+//! It does not drop the bounding set. Removing a capability from the bounding
+//! set needs `CAP_SETPCAP`, which the sensor does not ask for and should not,
+//! and the effective and permitted sets are what the kernel checks when a
+//! program is loaded. The remaining exposure is a process that could regain the
+//! capability across an `execve`, and the sensor never execs.
+
+use std::os::raw::c_int;
+
+/// Bit positions from the kernel's `capability.h`.
+const CAP_NET_ADMIN: u32 = 12;
+const CAP_PERFMON: u32 = 38;
+const CAP_BPF: u32 = 39;
+
+/// `_LINUX_CAPABILITY_VERSION_3`, the 64 bit form, which is the only one worth
+/// asking for: version 1 cannot express `CAP_BPF` at all, since it sits above
+/// bit 31.
+const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+/// Two blocks of thirty two bits, which is what version 3 defines.
+const CAP_BLOCKS: usize = 2;
+
+/// The header `capget` and `capset` are handed.
+///
+/// `pid` of zero means this thread, which is the only subject this crate is
+/// entitled to change.
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: c_int,
+}
+
+/// One thirty two bit block of each of the three sets.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+/// The three capabilities that matter to this loader, as the kernel holds them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Effective {
+    pub cap_bpf: bool,
+    pub cap_perfmon: bool,
+    pub cap_net_admin: bool,
+}
+
+impl Effective {
+    fn from_blocks(blocks: &[CapData; CAP_BLOCKS]) -> Self {
+        Self {
+            cap_bpf: holds(blocks, CAP_BPF),
+            cap_perfmon: holds(blocks, CAP_PERFMON),
+            cap_net_admin: holds(blocks, CAP_NET_ADMIN),
+        }
+    }
+
+    /// Whether a program load can be expected to succeed.
+    pub fn may_load_programs(self) -> bool {
+        self.cap_bpf && self.cap_perfmon
+    }
+}
+
+fn block_of(capability: u32) -> usize {
+    (capability / 32) as usize
+}
+
+fn bit_of(capability: u32) -> u32 {
+    1u32 << (capability % 32)
+}
+
+fn holds(blocks: &[CapData; CAP_BLOCKS], capability: u32) -> bool {
+    blocks
+        .get(block_of(capability))
+        .is_some_and(|block| block.effective & bit_of(capability) != 0)
+}
+
+/// What this process holds at this instant, or nothing if the kernel refused to
+/// say.
+///
+/// A refusal is reported as absence rather than as an empty grant, because the
+/// two would send a reader to different remedies: one is "grant the capability",
+/// the other is "this kernel did not answer a question every Linux kernel
+/// answers".
+pub fn effective_capabilities() -> Option<Effective> {
+    let blocks = read_capabilities()?;
+    Some(Effective::from_blocks(&blocks))
+}
+
+fn read_capabilities() -> Option<[CapData; CAP_BLOCKS]> {
+    let mut header = CapHeader {
+        version: CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut blocks = [CapData::default(); CAP_BLOCKS];
+    // SAFETY: both pointers address stack locals of exactly the shapes the
+    // kernel's `capget` contract names, the header declares version 3 and the
+    // data buffer is the two blocks version 3 defines. The call reads the header
+    // and writes the blocks; nothing else in this process observes either while
+    // it runs.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            std::ptr::addr_of_mut!(header),
+            blocks.as_mut_ptr(),
+        )
+    };
+    (result == 0).then_some(blocks)
+}
+
+/// Gives up the authority to load programs and to attach to traffic control.
+///
+/// Called the moment the descriptors are open. What is already loaded keeps
+/// running: a program in the kernel and a ring buffer already mapped do not need
+/// the capability that put them there, which is the whole reason the two stage
+/// structure in `network-sensor/spec.md` §9 is possible.
+///
+/// Returns what the process holds afterwards, read back from the kernel rather
+/// than assumed from the fact that the call returned zero. A drop that reported
+/// success without being checked would be the quietest possible failure: the
+/// sensor would run for hours believing it had given up authority it still had.
+pub fn drop_load_capabilities() -> Option<Effective> {
+    let mut blocks = read_capabilities()?;
+    for capability in [CAP_BPF, CAP_PERFMON, CAP_NET_ADMIN] {
+        let Some(block) = blocks.get_mut(block_of(capability)) else {
+            continue;
+        };
+        let mask = !bit_of(capability);
+        block.effective &= mask;
+        // The permitted set goes too. Leaving it would let anything later in
+        // this process raise the capability back into the effective set, which
+        // would make the drop a gesture rather than a change.
+        block.permitted &= mask;
+        block.inheritable &= mask;
+    }
+    let mut header = CapHeader {
+        version: CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    // SAFETY: same shapes as the read above, and the data buffer is the one this
+    // function just filled from a successful `capget`, so every field the kernel
+    // will interpret came from the kernel.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            std::ptr::addr_of_mut!(header),
+            blocks.as_ptr(),
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    effective_capabilities()
+}
+
+/// The monotonic clock in nanoseconds, which is the clock `bpf_ktime_get_ns`
+/// reads.
+///
+/// Returns nothing rather than a fabricated reading if the kernel refuses, and
+/// the caller then refuses to load: a kernel program that was handed a wrong
+/// offset would stamp every record with a wall clock time that is wrong by the
+/// machine's uptime, and nothing downstream could tell.
+pub fn monotonic_ns() -> Option<u64> {
+    let mut spec = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: the pointer addresses a stack local of the exact type
+    // `clock_gettime` writes, and `CLOCK_MONOTONIC` is a constant this kernel
+    // defines. The call writes the two fields and returns.
+    let result: c_int = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut spec) };
+    if result != 0 {
+        return None;
+    }
+    let seconds = u64::try_from(spec.tv_sec).ok()?;
+    let nanos = u64::try_from(spec.tv_nsec).ok()?;
+    seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_capability_above_bit_thirty_one_lands_in_the_second_block() {
+        // The reason version 3 is the only version worth asking for. Reading
+        // `CAP_BPF` out of the first block would find whichever bit seven
+        // happens to be, which is `CAP_SETUID`.
+        assert_eq!(block_of(CAP_BPF), 1);
+        assert_eq!(bit_of(CAP_BPF), 1 << 7);
+        assert_eq!(block_of(CAP_NET_ADMIN), 0);
+        assert_eq!(bit_of(CAP_NET_ADMIN), 1 << 12);
+    }
+
+    #[test]
+    fn a_grant_is_read_out_of_the_block_the_capability_belongs_to() {
+        let mut blocks = [CapData::default(); CAP_BLOCKS];
+        blocks[1].effective = bit_of(CAP_BPF) | bit_of(CAP_PERFMON);
+        blocks[0].effective = bit_of(CAP_NET_ADMIN);
+        let effective = Effective::from_blocks(&blocks);
+        assert!(effective.cap_bpf);
+        assert!(effective.cap_perfmon);
+        assert!(effective.cap_net_admin);
+        assert!(effective.may_load_programs());
+    }
+
+    #[test]
+    fn half_the_pair_is_not_a_permission_to_load() {
+        let mut blocks = [CapData::default(); CAP_BLOCKS];
+        blocks[1].effective = bit_of(CAP_BPF);
+        assert!(!Effective::from_blocks(&blocks).may_load_programs());
+    }
+
+    #[test]
+    fn an_empty_grant_reads_as_no_capabilities_rather_than_as_all_of_them() {
+        let blocks = [CapData::default(); CAP_BLOCKS];
+        let effective = Effective::from_blocks(&blocks);
+        assert!(!effective.cap_bpf);
+        assert!(!effective.cap_perfmon);
+        assert!(!effective.cap_net_admin);
+    }
+
+    #[test]
+    fn the_monotonic_clock_moves_forward_and_does_not_restart() {
+        // The offset handed to the kernel program is only meaningful if this
+        // clock is the same one `bpf_ktime_get_ns` reads: monotonic, in
+        // nanoseconds, and not the wall clock. A reading that went backwards
+        // would put a record before the observation that produced it.
+        let first = monotonic_ns().expect("CLOCK_MONOTONIC is readable on Linux");
+        let second = monotonic_ns().expect("CLOCK_MONOTONIC is readable on Linux");
+        assert!(second >= first);
+        assert!(first > 0);
+    }
+}

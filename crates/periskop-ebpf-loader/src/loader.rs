@@ -13,26 +13,47 @@
 //! telling somebody to grant `CAP_BPF` on a macOS laptop wastes the time the
 //! report was supposed to save.
 //!
-//! # The refusal at the end
+//! # What happens when every check passes
 //!
-//! When every check passes, [`EbpfLoader::load`] reports
-//! [`LoaderUnavailable::LoaderNotBuilt`], because there is no kernel side
-//! program object in this build to load. That is where the `bpf(2)` calls will
-//! go, in a module named `syscall` that will hold this crate's entire share of
-//! the workspace's `unsafe` exception.
+//! It depends on whether this binary carries a kernel side object, and the
+//! difference is decided at build time by `build.rs` rather than at run time:
 //!
-//! It is worth being exact about why that refusal is preferable to code that
-//! tries. ADR-014 §4 put it as a comparison: a loader whose foreign function
-//! path has never been compiled by any gate in the development environment says
-//! "I am loading" and has not been checked, while this says "I am not loading,
-//! and here is the reason". The first is the failure mode this entire product
-//! exists to expose, appearing inside the product.
+//! - **With one** (`periskop_kernel_object`, Linux only), the programs are
+//!   loaded and attached, the capabilities that allowed it are dropped
+//!   immediately afterwards (`network-sensor/spec.md` §9), and [`Self::poll`]
+//!   starts returning what the ring buffer holds.
+//! - **Without one**, which is every build on the machine this repository is
+//!   developed on, [`EbpfLoader::load`] reports
+//!   [`LoaderUnavailable::LoaderNotBuilt`]. That is the truth about that binary,
+//!   not a placeholder: it carries no program, so it observes nothing, and it
+//!   says which of the two it is.
+//!
+//! ADR-014 §4 put the reason for keeping the second path exact: a loader that
+//! says "I am loading" without any gate having compiled the path is worse than
+//! one that says "I am not loading, and here is why". That comparison is why
+//! `loader_not_built` survives as a first class answer even now that the loading
+//! path exists.
+//!
+//! # Detail beside the cause
+//!
+//! The cause vocabulary is closed on purpose (see [`LoaderUnavailable`]): five
+//! labels where there were four would reach reports with no remedy column for
+//! the fifth. But a verifier rejection has something specific to say, and losing
+//! it would leave an operator with "the kernel cannot host the programs" and no
+//! way to find out why. So the sentence the kernel produced is kept beside the
+//! cause, in [`EbpfLoader::last_refusal_detail`], where a gate artefact and a
+//! log line can carry it and a report does not have to.
 
 use crate::capability::Capabilities;
 use crate::hook::Hook;
 use crate::platform::HostPlatform;
 use crate::record::RawEvent;
 use crate::unavailable::LoaderUnavailable;
+
+use crate::object;
+
+#[cfg(all(target_os = "linux", periskop_kernel_object))]
+use crate::{attached::Attached, attached::OpenError, syscall};
 
 /// One read of the ring buffer.
 ///
@@ -44,16 +65,47 @@ use crate::unavailable::LoaderUnavailable;
 pub struct RawBatch {
     pub events: Vec<RawEvent>,
     pub dropped: u64,
+    /// Frames that arrived and the decoder refused.
+    ///
+    /// Separate from `dropped` because the two are different losses with
+    /// different remedies: a dropped frame is a buffer that overran under load,
+    /// and an undecodable one is a kernel object that does not share this
+    /// build's record layout. Folding them together would let a version mismatch
+    /// present itself as a busy machine.
+    pub undecodable: u64,
 }
 
 /// The kernel side of the sensor.
 ///
-/// Holds no state today because it owns no descriptors today. When it owns
-/// them, `Copy` has to go and the sensor's `EbpfFlowSource` will have to stop
-/// deriving `Clone`, since two handles to one ring buffer would each read half
-/// the records.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct EbpfLoader;
+/// Owns the descriptors on a build that has a program object, which is why it is
+/// no longer `Copy` or `Clone`: two handles on one ring buffer would each read
+/// half the records and neither would know it. The sensor's `EbpfFlowSource`
+/// lost its derived `Clone` for the same reason and in the same change.
+#[derive(Default)]
+pub struct EbpfLoader {
+    /// Everything the kernel is holding for this loader. Dropping it detaches
+    /// every program.
+    #[cfg(all(target_os = "linux", periskop_kernel_object))]
+    attached: Option<Attached>,
+    /// What the kernel said about the last refusal, when it said anything.
+    ///
+    /// Cleared at the start of every load, so it can never describe an older
+    /// failure than the one being reported.
+    refusal_detail: Option<String>,
+}
+
+/// Written out rather than derived because the interesting fact about a loader
+/// is whether it is holding anything, and the kernel objects it holds have no
+/// useful debug form.
+impl std::fmt::Debug for EbpfLoader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EbpfLoader")
+            .field("attached", &self.is_attached())
+            .field("refusal_detail", &self.refusal_detail)
+            .finish()
+    }
+}
 
 impl EbpfLoader {
     /// Loads and attaches the requested programs, or says why it cannot.
@@ -70,6 +122,10 @@ impl EbpfLoader {
         capabilities: &Capabilities,
         hooks: &[Hook],
     ) -> Result<(), LoaderUnavailable> {
+        // Cleared first, so a detail left over from an earlier attempt cannot be
+        // read as an explanation of this one.
+        self.refusal_detail = None;
+
         if !platform.supports_ebpf() {
             return Err(LoaderUnavailable::UnsupportedPlatform);
         }
@@ -92,21 +148,209 @@ impl EbpfLoader {
             return Err(LoaderUnavailable::KernelUnsupported);
         }
 
-        // Everything a machine can supply is here. What is missing is in this
-        // build, and it says so rather than reporting a machine problem that
-        // does not exist.
+        // Everything a machine can supply is here. What happens next depends on
+        // whether this build carries a program object at all.
+        self.open(hooks)
+    }
+
+    /// What the kernel said when it refused, when it said anything.
+    ///
+    /// Never part of a report. It exists so that a verifier rejection, which is
+    /// the one refusal that means the program is wrong rather than the machine,
+    /// reaches whoever has to fix it instead of being flattened into a label.
+    pub fn last_refusal_detail(&self) -> Option<&str> {
+        self.refusal_detail.as_deref()
+    }
+
+    /// Whether the kernel is currently holding programs for this loader.
+    pub fn is_attached(&self) -> bool {
+        #[cfg(all(target_os = "linux", periskop_kernel_object))]
+        {
+            self.attached.is_some()
+        }
+        #[cfg(not(all(target_os = "linux", periskop_kernel_object)))]
+        {
+            false
+        }
+    }
+
+    /// A hook the program table has nothing for, if the plan names one.
+    ///
+    /// Consulted by both builds, and before anything reaches a kernel rather
+    /// than partway through: attaching what is present and stopping at the first
+    /// hook with no program would leave programs loaded that nothing is reading,
+    /// and the sensor believing it observes something it does not.
+    fn missing_program(hooks: &[Hook]) -> Option<String> {
+        hooks
+            .iter()
+            .find(|hook| !object::carries(**hook))
+            .map(|hook| {
+                format!(
+                    "no program is defined for {} in any build of this crate",
+                    hook.attach_point()
+                )
+            })
+    }
+
+    /// The build with no program object in it.
+    #[cfg(not(all(target_os = "linux", periskop_kernel_object)))]
+    fn open(&mut self, hooks: &[Hook]) -> Result<(), LoaderUnavailable> {
+        // Two different absences, and the detail says which. One is a hook
+        // nothing in this crate ever attaches; the other is this binary having
+        // been built without the object. An operator sent to build the loader
+        // when the first is the problem would build it and see no change.
+        self.refusal_detail = Some(Self::missing_program(hooks).unwrap_or_else(|| {
+            "this binary was built without a kernel side program object".to_owned()
+        }));
         Err(LoaderUnavailable::LoaderNotBuilt)
+    }
+
+    /// Loads, attaches, and then gives up the authority that allowed it.
+    ///
+    /// The order is the two stage structure `network-sensor/spec.md` §9
+    /// requires, and the drop is checked rather than assumed: a `capset` that
+    /// returned zero without taking effect would leave a long lived observer
+    /// holding the authority to load kernel programs, which is the quietest
+    /// possible way to fail this requirement. A drop that did not take effect
+    /// detaches everything and refuses, because a sensor that kept running would
+    /// be running under a structure nobody agreed to.
+    #[cfg(all(target_os = "linux", periskop_kernel_object))]
+    fn open(&mut self, hooks: &[Hook]) -> Result<(), LoaderUnavailable> {
+        if let Some(missing) = Self::missing_program(hooks) {
+            self.refusal_detail = Some(missing);
+            return Err(LoaderUnavailable::LoaderNotBuilt);
+        }
+
+        // The reading that decides whether the syscall will succeed is the one
+        // immediately before it. A kernel that would not answer at all is not
+        // treated as a refusal: the caller's own evaluation already passed, and
+        // inventing a denial from an unreadable interface would report a
+        // permission problem nobody has.
+        if let Some(live) = syscall::effective_capabilities() {
+            if !live.may_load_programs() {
+                self.refusal_detail = Some(
+                    "the capabilities were dropped between the privilege check and the load"
+                        .to_owned(),
+                );
+                return Err(LoaderUnavailable::MissingCapability);
+            }
+        }
+
+        let (monotonic_ns, epoch_ns) = self.clock()?;
+        let attached = Attached::open(hooks, monotonic_ns, epoch_ns).map_err(|error| {
+            let (cause, detail) = describe(error);
+            self.refusal_detail = Some(detail);
+            cause
+        })?;
+
+        // Held before the drop so that a failed drop detaches it. `attached`
+        // going out of scope is what closes every descriptor.
+        match syscall::drop_load_capabilities() {
+            Some(remaining) if !remaining.may_load_programs() => {
+                self.attached = Some(attached);
+                Ok(())
+            }
+            other => {
+                self.refusal_detail = Some(match other {
+                    Some(_) => "the capabilities survived the drop this sensor requires after \
+                                loading (network-sensor/spec.md §9)"
+                        .to_owned(),
+                    None => "the capabilities could not be dropped after loading \
+                             (network-sensor/spec.md §9)"
+                        .to_owned(),
+                });
+                Err(LoaderUnavailable::KernelUnsupported)
+            }
+        }
+    }
+
+    /// The two clock readings the kernel program cannot take for itself.
+    #[cfg(all(target_os = "linux", periskop_kernel_object))]
+    fn clock(&mut self) -> Result<(u64, u64), LoaderUnavailable> {
+        let monotonic_ns = syscall::monotonic_ns().ok_or(LoaderUnavailable::KernelUnsupported);
+        let epoch_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|since| u64::try_from(since.as_nanos()).ok())
+            .ok_or(LoaderUnavailable::KernelUnsupported);
+        match (monotonic_ns, epoch_ns) {
+            (Ok(monotonic_ns), Ok(epoch_ns)) => Ok((monotonic_ns, epoch_ns)),
+            _ => {
+                // Refused rather than defaulted. A kernel program handed a wrong
+                // offset stamps every record with a wall clock time that is
+                // wrong by the machine's uptime, and nothing downstream can tell.
+                self.refusal_detail = Some(
+                    "this machine would not report both a monotonic and a wall clock reading, \
+                          so the kernel program could not be told what time it is"
+                        .to_owned(),
+                );
+                Err(LoaderUnavailable::KernelUnsupported)
+            }
+        }
     }
 
     /// Reads whatever the ring buffer holds, along with what it lost.
     ///
-    /// Always empty, and reachable only if a caller ignored the refusal from
-    /// [`Self::load`]. An empty batch is the correct answer here and nowhere
-    /// else: nothing was attached, so nothing was seen, and the sensor states
-    /// that through the load error rather than by handing back a plausible
-    /// looking empty result.
+    /// On a build with nothing attached this is empty, and reachable only if a
+    /// caller ignored the refusal from [`Self::load`]. An empty batch is the
+    /// correct answer there and nowhere else: nothing was attached, so nothing
+    /// was seen, and the sensor states that through the load error rather than
+    /// by handing back a plausible looking empty result.
     pub fn poll(&mut self) -> RawBatch {
-        RawBatch::default()
+        #[cfg(all(target_os = "linux", periskop_kernel_object))]
+        {
+            let Some(attached) = self.attached.as_mut() else {
+                return RawBatch::default();
+            };
+            let mut batch = RawBatch {
+                dropped: attached.dropped(),
+                ..RawBatch::default()
+            };
+            for frame in attached.drain() {
+                match RawEvent::decode(&frame) {
+                    Ok(event) => batch.events.push(event),
+                    // Counted, never repaired. A frame this build cannot read
+                    // was written by something that does not share its layout,
+                    // and guessing at the intent would put invented values in a
+                    // report.
+                    Err(_) => batch.undecodable = batch.undecodable.saturating_add(1),
+                }
+            }
+            batch
+        }
+        #[cfg(not(all(target_os = "linux", periskop_kernel_object)))]
+        {
+            RawBatch::default()
+        }
+    }
+}
+
+/// The cause a report carries, and the sentence it does not.
+///
+/// The mapping is the only place a kernel refusal becomes one of the four
+/// labels, so it is the only place to check that none of them is being used to
+/// mean something it does not.
+#[cfg(all(target_os = "linux", periskop_kernel_object))]
+fn describe(error: OpenError) -> (LoaderUnavailable, String) {
+    match error {
+        // The kernel would not take these programs. That is what the label says,
+        // and the verifier's own words go in the detail because "a newer kernel"
+        // is the remedy for one of the two reasons this happens and not for the
+        // other.
+        OpenError::Rejected(detail) => (LoaderUnavailable::KernelUnsupported, detail),
+        OpenError::ClockUnreadable => (
+            LoaderUnavailable::KernelUnsupported,
+            "the monotonic clock read later than the wall clock, so no offset could be derived"
+                .to_owned(),
+        ),
+        OpenError::MapMissing(name) => (
+            LoaderUnavailable::LoaderNotBuilt,
+            format!("the program object declares no map named {name}"),
+        ),
+        OpenError::ProgramMissing(name) => (
+            LoaderUnavailable::LoaderNotBuilt,
+            format!("the program object contains no program named {name}"),
+        ),
     }
 }
 
@@ -148,16 +392,31 @@ mod tests {
         capabilities: &Capabilities,
         hooks: &[Hook],
     ) -> LoaderUnavailable {
-        EbpfLoader
+        EbpfLoader::default()
             .load(platform, capabilities, hooks)
-            .expect_err("this build has no program object, so no load can succeed")
+            .expect_err(
+                "these tests run where no kernel object is compiled in, so no load can succeed",
+            )
     }
 
+    /// True where these tests can safely ask for a load that would otherwise
+    /// reach the kernel.
+    ///
+    /// A unit test must not attach programs to the machine running it. Two of
+    /// the tests below drive a plan every check passes, which on a build with a
+    /// program object and a privileged process would do exactly that, so they
+    /// are compiled only where it cannot happen. The rest ask for plans that are
+    /// refused on grounds no build changes: the platform, the capabilities, and
+    /// a hook this object carries no program for.
+    const KERNEL_OBJECT_COMPILED_IN: bool = cfg!(all(target_os = "linux", periskop_kernel_object));
+
     #[test]
-    fn a_fully_permitted_load_still_reports_that_this_build_carries_no_loader() {
-        // The honest end state, and the one this milestone ships. If this ever
-        // starts returning `Ok`, something claimed to have loaded a program that
-        // does not exist.
+    fn a_plan_including_the_payload_helper_is_refused_by_every_build_of_this_crate() {
+        // No build of this crate carries a `clsact` classifier, so the full plan
+        // ends in the same refusal whether or not a program object is compiled
+        // in. If a classifier is ever added, this goes red and whoever added it
+        // has to say so in the gate artefact, which lists name resolution among
+        // the things it does not prove.
         assert_eq!(
             load_on(HostPlatform::Linux, &capable(), &every_hook()),
             LoaderUnavailable::LoaderNotBuilt
@@ -245,6 +504,15 @@ mod tests {
     fn without_net_admin_a_plan_that_omits_the_helper_gets_all_the_way_through() {
         // ADR-008's rule: the payload helper is resolution, not correctness.
         // Losing `CAP_NET_ADMIN` costs server names, never the sensor.
+        if KERNEL_OBJECT_COMPILED_IN {
+            // Skipped by construction rather than by an environment guess: this
+            // plan passes every check, so on a build that can load it the next
+            // thing that happens is programs entering the kernel of whatever
+            // machine is running the suite. The equivalent assertion for that
+            // build lives in `tests/kernel_required.rs`, which is `#[ignore]`d
+            // and run deliberately.
+            return;
+        }
         let no_net_admin = Capabilities {
             cap_net_admin: false,
             ..capable()
@@ -274,7 +542,7 @@ mod tests {
     fn a_load_that_was_refused_hands_back_no_events_and_no_losses() {
         // Not "no events" as a plausible looking result: the caller was already
         // told why, and this must not look like a quiet network.
-        let mut loader = EbpfLoader;
+        let mut loader = EbpfLoader::default();
         let _ = loader.load(HostPlatform::current(), &capable(), &every_hook());
         let batch = loader.poll();
         assert!(batch.events.is_empty());
@@ -286,7 +554,7 @@ mod tests {
         // The cause reaches a report, and a report has to be diffable. A gate
         // with any order dependence in it would make two runs on one machine
         // produce two different coverage statements.
-        let mut loader = EbpfLoader;
+        let mut loader = EbpfLoader::default();
         let first = loader.load(HostPlatform::Linux, &capable(), &every_hook());
         let second = loader.load(HostPlatform::Linux, &capable(), &every_hook());
         assert_eq!(first, second);
@@ -297,13 +565,18 @@ mod tests {
         // A caller that asked for nothing still has to be told what this build
         // cannot do, or it will read the absence of an error as a working
         // sensor.
-        assert_eq!(
-            load_on(HostPlatform::Linux, &capable(), &[]),
-            LoaderUnavailable::LoaderNotBuilt
-        );
+        // The refusal that holds in every build: an empty plan does not buy a
+        // pass on the privilege check.
         assert_eq!(
             load_on(HostPlatform::Linux, &Capabilities::default(), &[]),
             LoaderUnavailable::MissingCapability
+        );
+        if KERNEL_OBJECT_COMPILED_IN {
+            return;
+        }
+        assert_eq!(
+            load_on(HostPlatform::Linux, &capable(), &[]),
+            LoaderUnavailable::LoaderNotBuilt
         );
     }
 }

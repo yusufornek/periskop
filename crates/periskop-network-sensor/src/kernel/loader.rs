@@ -68,9 +68,12 @@ use crate::privilege::Privileges;
 
 /// The kernel side of the sensor on the machine this build runs on.
 ///
-/// Not `Copy`, because with the loader compiled in it accumulates a tally, and
-/// a copy of a counter is a counter that stops counting.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+/// Neither `Copy` nor `Clone`, and the reason is stronger than a tally that
+/// would stop counting: with a program object compiled in, the loader owns the
+/// ring buffer's descriptor, and two handles on one ring buffer would each read
+/// half the records with neither able to tell. ADR-014 §6.3 predicted this
+/// change and it arrived with the loader.
+#[derive(Debug, Default)]
 pub struct PlatformKernel {
     #[cfg(feature = "ebpf-loader")]
     loader: ebpf::EbpfLoader,
@@ -154,6 +157,17 @@ impl KernelEvents for PlatformKernel {
             return KernelBatch::default();
         }
         let batch = self.loader.poll();
+        if batch.undecodable > 0 {
+            // A frame the record decoder refused is a kernel object that does
+            // not share this build's layout, which is a different loss from a
+            // ring buffer that overran and has a different remedy. It goes into
+            // the same tally the parsers' refusals go into, because that tally
+            // is what carries a measured blind spot out of the seam.
+            *self
+                .rejected_samples
+                .entry("record_undecodable")
+                .or_insert(0) += batch.undecodable;
+        }
         let mut events = Vec::with_capacity(batch.events.len());
         for raw in batch.events {
             match kernel_event_from(raw) {

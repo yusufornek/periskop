@@ -1,0 +1,67 @@
+# The kernel side program object (milestone F4-98).
+#
+# Deliberately its own workspace and not a member of the one at the repository
+# root. Three things differ from every other package in this tree and each of
+# them is a reason on its own:
+#
+#   1. The target is `bpfel-unknown-none`, which has no precompiled `core`, so
+#      building it needs `-Z build-std` and therefore a nightly toolchain. The
+#      root pins stable 1.91.0 (ADR-002 D-19) and that pin must not move for
+#      the sake of one artefact.
+#   2. Linking is done by `bpf-linker`, not by the host linker. A member of the
+#      root workspace would inherit `[profile]` and linker settings that mean
+#      nothing here.
+#   3. Nothing links this package. It compiles to an ELF object the loader
+#      hands to `bpf(2)`; it is data to the rest of the tree, not a library.
+#
+# `unsafe` is unavoidable here: every eBPF helper is a raw pointer read into
+# kernel memory. ADR-002 names three crates allowed the exception and this is
+# not one of them, which is exactly why it sits outside the workspace the lint
+# governs: it cannot appear in any host binary's dependency graph, and
+# `cargo build --workspace` at the root never compiles it. The decision and its
+# boundary are recorded in ADR-014 section 8.
+[package]
+name = "periskop-ebpf-object"
+description = "The eBPF programs periskop loads into a kernel. Compiled for bpfel-unknown-none and linked by bpf-linker."
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+# An empty table is what makes this its own workspace root.
+[workspace]
+
+[dependencies]
+# Pinned exactly rather than by caret. A kernel program that silently changed
+# the helper bindings it was built against would change what the verifier sees
+# without a line in this file moving, and this object cannot be exercised by
+# any gate on a development machine.
+aya-ebpf = "=0.2.1"
+
+[[bin]]
+name = "periskop-ebpf-object"
+path = "src/main.rs"
+
+# The verifier rejects unoptimised BPF: an unoptimised build keeps stack slots
+# and branches that blow the instruction budget and the stack limit. So the dev
+# profile is not a debug profile here, and saying that in the manifest is
+# cheaper than finding it out from a verifier log.
+[profile.dev]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = true
+panic = "abort"
+incremental = false
+codegen-units = 1
+
+[profile.release]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = true
+panic = "abort"
+incremental = false
+codegen-units = 1

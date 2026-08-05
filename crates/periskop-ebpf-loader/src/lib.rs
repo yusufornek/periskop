@@ -30,53 +30,64 @@
 //! the `KernelEvents` implementation itself lives on the sensor's side of the
 //! seam rather than here (ADR-014 revision note, 2026-08-04).
 //!
-//! # What this build cannot do, stated plainly
+//! # Two builds of this crate, and how to tell which one you have
 //!
-//! **There is no kernel side program object in this build, so nothing is ever
-//! loaded and [`EbpfLoader::poll`] never returns an event.** [`EbpfLoader::load`]
-//! runs every check it can and then reports
-//! [`LoaderUnavailable::LoaderNotBuilt`], which is a stated cause in the same
-//! fixed vocabulary a permission failure uses. The sensor puts that cause in the
-//! coverage statement, and the scan carries on: a report from this build says
-//! "the sensor did not run, and here is why", never "the network was clean".
+//! The difference is decided at compile time by `build.rs` and never at run
+//! time. It is not a runtime switch because a binary that could be talked into
+//! loading kernel programs by its environment would be a worse thing to ship
+//! than either of the two.
 //!
-//! Three things are missing, and each is a decision rather than a gap somebody
-//! forgot to fill:
+//! **Without a program object**, which is every build on the macOS machine this
+//! repository is developed on and every build where `PERISKOP_EBPF_OBJECT` was
+//! not set: nothing is ever loaded, [`EbpfLoader::poll`] never returns an event,
+//! and [`EbpfLoader::load`] runs every check it can and then reports
+//! [`LoaderUnavailable::LoaderNotBuilt`]. That is a stated cause in the same
+//! fixed vocabulary a permission failure uses. The sensor puts it in the
+//! coverage statement and the scan carries on: such a report says "the sensor
+//! did not run, and here is why", never "the network was clean".
 //!
-//! 1. **A user space eBPF runtime.** `aya` is the accepted candidate in
-//!    principle (ADR-014 §4) and is still not added. It compiles on Linux only,
-//!    this workspace is developed on macOS, and code that no gate on the
-//!    development machine can compile cannot be claimed to have passed a gate.
-//! 2. **The kernel side object.** It needs the `bpfel-unknown-none` target and
-//!    `bpf-linker`, which is a build and toolchain decision of its own against a
-//!    toolchain this repository pins (ADR-002 D-19).
-//! 3. **The privilege drop.** `network-sensor/spec.md` §9 requires the sensor to
-//!    give up its capabilities the moment the descriptors are open. That is a
-//!    syscall, so it belongs in this crate, next to the descriptors it is
-//!    dropping around, and it arrives with them.
+//! **With one** (Linux only): [`EbpfLoader::load`] hands the object to the
+//! kernel through `aya`, attaches the hooks the caller asked for, gives up the
+//! capabilities that allowed it (`network-sensor/spec.md` §9), and
+//! [`EbpfLoader::poll`] starts returning frames decoded by [`record`].
 //!
-//! What is here instead is everything the seam needs that does **not** need a
-//! kernel, written and tested now so that what remains is a hookup rather than a
-//! design: the record layout the kernel program will have to write
-//! ([`record`]), the capability gate that decides whether a load may be
-//! attempted at all ([`capability`], [`loader`]), the closed hook list a caller
-//! may ask for ([`hook`]), and the platform decision ([`platform`]).
+//! The object itself is built separately, from `crates/periskop-ebpf-object/`,
+//! because `bpfel-unknown-none` has no precompiled `core` and needs a nightly
+//! toolchain and `bpf-linker` that the workspace's own pin does not provide
+//! (ADR-002 D-19). Keeping that build a separate, visible step is what lets a
+//! run that could not perform it produce a working binary that says so.
 //!
-//! # Where the exception will be used
+//! # What no build of this crate does
 //!
-//! When the syscalls arrive they go in a single module named `syscall`, and
-//! nowhere else. That module does not exist yet because an empty one would be
-//! the "we will need it later" code this repository does not commit; the rule it
-//! will live under is enforced today by `tests/unsafe_boundary.rs`, which reads
-//! this crate's own sources and fails if any file outside that one module opens
-//! the exception. The boundary is therefore in force before there is anything
-//! inside it.
+//! It carries no `clsact` classifier, so no build of it observes DNS answers or
+//! TLS server names, and a plan naming either traffic control hook is refused
+//! whole rather than trimmed. ADR-008 still fixes `tc` as the mechanism for
+//! them; what is absent is the program, and the gate artefact lists name
+//! resolution among the things it does not prove.
+//!
+//! # Where the exception is used
+//!
+//! In [`syscall`], and nowhere else. `tests/unsafe_boundary.rs` reads this
+//! crate's own sources and fails the build if any other file opens it, and also
+//! fails if that module stops opening it at all, because a boundary check that
+//! passes by there being nothing to check is not a boundary check.
+//!
+//! The exception turned out to be narrower than ADR-014 expected. `aya` exposes
+//! loading, attaching and the ring buffer through a safe API, so what is left is
+//! three calls with no equivalent in `std`: reading capabilities, dropping them,
+//! and the monotonic clock the kernel program's own clock has to be aligned
+//! against.
 
+#[cfg(all(target_os = "linux", periskop_kernel_object))]
+mod attached;
 pub mod capability;
 pub mod hook;
 pub mod loader;
+mod object;
 pub mod platform;
 pub mod record;
+#[cfg(all(target_os = "linux", periskop_kernel_object))]
+mod syscall;
 mod unavailable;
 
 pub use capability::Capabilities;

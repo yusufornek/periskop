@@ -532,15 +532,22 @@ fn a_source_that_cannot_attach_produces_no_records_and_a_stated_reason() {
 /// 2. `CAP_BPF` and `CAP_PERFMON` on the test process, plus `CAP_NET_ADMIN` for
 ///    the payload helper. A test runner does not have these, and granting them
 ///    to one would be a worse trade than skipping a test.
-/// 3. The loader crate ADR-014 defers, which is what would turn `attach` from
-///    `loader_not_built` into a real load. Until it lands, this test cannot
-///    pass anywhere, which is precisely why it is marked rather than deleted:
-///    a deleted test is a requirement nobody is tracking.
+/// 3. A build carrying a kernel side program object, which is what turns
+///    `attach` from `loader_not_built` into a real load. That arrived in F4-98
+///    (ADR-014 §8), so this test is no longer unpassable everywhere: the
+///    privileged Linux job in `.github/workflows/ci.yml` runs it, and it was
+///    kept rather than deleted through three milestones precisely so that there
+///    would be something to run when the loader landed.
+///
+/// It also exercises the reduction in `FlowSource::attach`: a privileged machine
+/// grants `CAP_NET_ADMIN`, so the grant asks for the payload helper, and a build
+/// whose object has no `clsact` classifier has to attach the rest rather than
+/// refusing everything (ADR-014 §8.7).
 ///
 /// Run it with `cargo test -p periskop-network-sensor -- --ignored` on a
 /// machine that satisfies all three.
 #[test]
-#[ignore = "needs a BTF capable Linux kernel, CAP_BPF and CAP_PERFMON, and the loader crate deferred by ADR-014"]
+#[ignore = "needs a BTF capable Linux kernel, CAP_BPF and CAP_PERFMON, and a build carrying a kernel side object"]
 fn the_real_loader_attaches_to_this_kernel() {
     let privileges = Privileges::probe();
     let mut source = EbpfFlowSource::new(HOST_ID);

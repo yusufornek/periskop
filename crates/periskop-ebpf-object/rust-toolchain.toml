@@ -1,0 +1,19 @@
+# The kernel object's toolchain, pinned separately from the root's.
+#
+# ADR-002 D-19 pins the workspace to a stable channel and that pin is what makes
+# two builds of this repository agree. It cannot serve here: `bpfel-unknown-none`
+# is a tier three target with no precompiled `core`, so the object has to be
+# built with `-Z build-std=core`, which is nightly only. Pinning a dated nightly
+# rather than the floating `nightly` channel keeps the same property the root pin
+# buys: the object a runner builds today and the object it builds in six months
+# come off the same compiler.
+#
+# Moving this date is a deliberate act, not maintenance. `bpf-linker` tracks the
+# LLVM version rustc ships, so a nightly newer than the pinned `bpf-linker`
+# understands fails at link time rather than at run time; the two move together
+# or not at all. The pair in force is recorded in ADR-014 section 8.
+[toolchain]
+channel = "nightly-2026-02-01"
+components = ["rust-src"]
+targets = ["bpfel-unknown-none"]
+profile = "minimal"
