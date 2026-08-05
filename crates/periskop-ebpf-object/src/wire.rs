@@ -32,10 +32,29 @@ pub const KIND_CLOSE: u8 = 3;
 pub const PROTOCOL_TCP: u8 = 6;
 pub const PROTOCOL_UDP: u8 = 17;
 
+/// The flag byte in full, none of which this object ever sets.
+///
+/// Every flag says a field is known. This object reads no IPv6 address, no
+/// namespace and no `task_struct`, and it measures no duration, so every record
+/// it writes carries a flag byte of zero and the decoder reports those fields
+/// absent. That is the deviation ADR-014 section 8 records, and it is the whole
+/// reason the flags exist: absence is a value here, not a gap.
+///
+/// They are named anyway rather than trimmed to the ones in use, because the
+/// flag byte is half of what the decoder reads out of a frame and a writer that
+/// listed only its own flags would leave the next person to set one guessing at
+/// the bit. `expect` rather than `allow`, so that the day one of them is set the
+/// attribute goes red and has to be removed rather than sitting there covering
+/// for nothing.
+#[expect(dead_code, reason = "the layout's full flag vocabulary")]
 pub const FLAG_IPV6: u8 = 1 << 0;
+#[expect(dead_code, reason = "the layout's full flag vocabulary")]
 pub const FLAG_NETNS_KNOWN: u8 = 1 << 1;
+#[expect(dead_code, reason = "the layout's full flag vocabulary")]
 pub const FLAG_PRE_EXISTING: u8 = 1 << 2;
+#[expect(dead_code, reason = "the layout's full flag vocabulary")]
 pub const FLAG_PID_START_KNOWN: u8 = 1 << 3;
+#[expect(dead_code, reason = "the layout's full flag vocabulary")]
 pub const FLAG_DURATION_KNOWN: u8 = 1 << 4;
 
 const HEADER: usize = 8;

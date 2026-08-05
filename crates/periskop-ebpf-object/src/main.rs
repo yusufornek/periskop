@@ -58,6 +58,75 @@
 //! No payload is read anywhere in this file. There is no code path that copies
 //! bytes out of a packet, which is how "periskop does not inspect TLS content"
 //! is a property of the program rather than a promise about it.
+//!
+//! # This crate can be type checked on the development machine
+//!
+//! ADR-014 section 8 says the object is built only in CI, and that is true of
+//! *building* it: linking needs `bpf-linker`, which needs a matching LLVM.
+//! Type checking needs neither. The first version of this file was written blind
+//! against a remembered API, four of its assumptions were wrong, and CI found
+//! them one round trip at a time. It did not have to:
+//!
+//! ```text
+//! cd crates/periskop-ebpf-object
+//! RUSTC_BOOTSTRAP=1 cargo check  --release
+//! RUSTC_BOOTSTRAP=1 cargo clippy --release -- -D warnings
+//! ```
+//!
+//! Three facts make that work, and each is worth knowing because losing any one
+//! of them takes the check with it. The `bpfel-unknown-none` target
+//! specification is built into `rustc`, so nothing needs installing for it to be
+//! named. What is missing is a precompiled `core`, and `build-std` in
+//! `.cargo/config.toml` compiles one from the `rust-src` that ships in the
+//! Homebrew toolchain's sysroot. `build-std` is nightly gated, and
+//! `RUSTC_BOOTSTRAP=1` is what lets the pinned stable accept it. `cargo check`
+//! and `cargo clippy` stop before the linker, which is the one part that
+//! genuinely needs CI.
+//!
+//! What this does **not** prove, and what still waits for CI: that `bpf-linker`
+//! emits an ELF, and that the verifier accepts the programs in it. It compiles
+//! with the root's stable rather than the nightly this crate pins, so it is a
+//! check against a slightly different compiler than the one that builds the
+//! artefact. Everything short of those is answerable here in ten seconds.
+//!
+//! # The `aya-ebpf` surface this file depends on
+//!
+//! Recorded because guessing at it is what produced the first round of errors.
+//! Each row was read out of the vendored source rather than recalled, so a
+//! future failure can be checked against this list instead of against a memory.
+//! Paths are relative to `aya-ebpf-0.2.1/src` and `aya-ebpf-bindings-0.2.0/src`
+//! in the cargo registry.
+//!
+//! | Call | Signature | Read from |
+//! |---|---|---|
+//! | `ProbeContext::arg` | `fn arg<T: Argument>(&self, n: usize) -> Option<T>` | `programs/probe.rs:37` |
+//! | `RetProbeContext::ret` | `fn ret<T: Argument>(&self) -> T` | `programs/retprobe.rs:28` |
+//! | `bpf_ktime_get_ns` | `pub unsafe fn bpf_ktime_get_ns() -> __u64` | `x86_64/helpers.rs:48` |
+//! | `bpf_get_current_pid_tgid` | `pub fn bpf_get_current_pid_tgid() -> u64` | `helpers.rs:648` |
+//! | `bpf_get_current_comm` | `pub fn bpf_get_current_comm() -> Result<[u8; TASK_COMM_LEN], i32>` | `helpers.rs:617` |
+//! | `TASK_COMM_LEN` | `pub const TASK_COMM_LEN: usize = 16` | `helpers.rs:598` |
+//! | `bpf_probe_read_kernel` | `pub unsafe fn bpf_probe_read_kernel<T>(src: *const T) -> Result<T, i32>` | `helpers.rs:211` |
+//! | `RingBuf::output` | `fn output<T: ?Sized>(&self, data: impl Borrow<T>, flags: u64) -> Result<(), i32>` | `maps/ring_buf.rs:200` |
+//! | `Array::get` | `fn get(&self, index: u32) -> Option<&T>` | `maps/array.rs:24` |
+//! | `Array::get_ptr_mut` | `fn get_ptr_mut(&self, index: u32) -> Option<*mut T>` | `maps/array.rs:34` |
+//! | `HashMap::get` | `pub unsafe fn get(&self, key: impl Borrow<K>) -> Option<&V>` | `maps/hash_map.rs:49` |
+//! | `HashMap::insert` | `fn insert(&self, key: impl Borrow<K>, value: impl Borrow<V>, flags: u64) -> Result<(), i32>` | `maps/hash_map.rs:71` |
+//! | `HashMap::remove` | `fn remove(&self, key: impl Borrow<K>) -> Result<(), i32>` | `maps/hash_map.rs:81` |
+//!
+//! Two of those shapes are worth stating in words, because they are the ones the
+//! first draft got wrong and they are wrong in opposite directions.
+//!
+//! **`ret` is not fallible.** It hands back the return register coerced to `T`,
+//! with no `Option` around it, because a return probe always has a return value.
+//! A kernel function that failed put a negative errno in that register, so this
+//! file compares against zero rather than unwrapping something.
+//!
+//! **`output` is generic in a way that needs help.** `T` appears only behind
+//! `impl Borrow<T>`, and a `&[u8; N]` satisfies that for both `T = [u8; N]` and
+//! `T = &[u8; N]`, so inference has two answers and picks neither. The call site
+//! names `T` explicitly. Left implicit it does not compile, which is the good
+//! case; the bad one would be it inferring the reference and writing eight bytes
+//! of pointer into the ring buffer.
 
 #![no_std]
 #![no_main]
@@ -70,6 +139,16 @@ use aya_ebpf::helpers::{
 use aya_ebpf::macros::{kprobe, kretprobe, map};
 use aya_ebpf::maps::{Array, HashMap, RingBuf};
 use aya_ebpf::programs::{ProbeContext, RetProbeContext};
+use aya_ebpf::TASK_COMM_LEN;
+
+/// The kernel's `comm` field and the layout's `comm` field are the same width.
+///
+/// Asserted rather than assumed because the two come from different places: one
+/// is `aya-ebpf`'s idea of `TASK_COMM_LEN`, the other is the sixteen bytes ADR-014
+/// section 6.5 reserved. They agree today. If a future `aya-ebpf` widened its
+/// buffer, the copy below would still compile against a coincidence, and this
+/// stops that at the build rather than at the first truncated process name.
+const _: () = assert!(TASK_COMM_LEN == 16);
 
 /// A megabyte of ring buffer.
 ///
@@ -85,9 +164,15 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 20, 0);
 ///
 /// Keyed by the task, not by the socket, because that is what identifies the
 /// call in flight. Both users of this map delete their entry on the way out, and
-/// a task that never returns leaves one behind until the map fills; the map is
-/// therefore bounded and the oldest entry loses, which costs a record rather
-/// than correctness.
+/// a task that never returns leaves one behind.
+///
+/// What a full map costs, stated rather than implied: this is a plain hash map,
+/// not an LRU one, so the kernel refuses the insert rather than evicting
+/// somebody. The call that could not stash its socket produces no record at all,
+/// which is a loss this object does not count. It is the one loss here that the
+/// coverage statement cannot name, and it is recorded as such rather than hidden
+/// behind a map type whose eviction would have made it look like nothing
+/// happened.
 #[map]
 static IN_FLIGHT: HashMap<u64, u64> = HashMap::with_max_entries(10_240, 0);
 
@@ -135,7 +220,11 @@ pub fn periskop_connect_entry(ctx: ProbeContext) -> u32 {
     let Some(sk) = ctx.arg::<*const u8>(0) else {
         return 0;
     };
-    let _ = IN_FLIGHT.insert(&bpf_get_current_pid_tgid(), &(sk as u64), 0);
+    // The insert can fail, and what it costs is stated on the map: a full map
+    // means this call is not tracked and produces no record at all. Nothing here
+    // can recover from that, and there is no counter it belongs in, so it is
+    // discarded deliberately rather than by omission.
+    let _ = IN_FLIGHT.insert(bpf_get_current_pid_tgid(), sk as u64, 0);
     0
 }
 
@@ -147,12 +236,22 @@ pub fn periskop_connect_return(ctx: RetProbeContext) -> u32 {
     };
     // A failed connect leaves a socket whose addresses mean nothing. Reporting
     // it would put a destination in the report that was never reached.
-    if ctx.ret::<i32>().unwrap_or(-1) != 0 {
+    //
+    // `ret` hands back the return register itself, not an option around it, so
+    // there is nothing here to unwrap: the kernel put either zero or a negative
+    // errno there, and everything that is not zero is a connect that did not
+    // happen.
+    if ctx.ret::<i32>() != 0 {
         return 0;
     }
     let Some(key) = key_of(sk) else {
         return 0;
     };
+    // A `comm` the helper could not read is left as sixteen zero bytes, which the
+    // decoder reads as no name rather than as an empty one; its test
+    // `an_empty_comm_field_is_absent_rather_than_an_empty_name` is what fixes
+    // that meaning. So the failure is reported as an absent name, not swallowed
+    // into a plausible one.
     let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
     let frame = wire::connect(
         &key,
@@ -194,7 +293,11 @@ pub fn periskop_tcp_recvmsg_entry(ctx: ProbeContext) -> u32 {
     let Some(sk) = ctx.arg::<*const u8>(0) else {
         return 0;
     };
-    let _ = IN_FLIGHT.insert(&bpf_get_current_pid_tgid(), &(sk as u64), 0);
+    // The insert can fail, and what it costs is stated on the map: a full map
+    // means this call is not tracked and produces no record at all. Nothing here
+    // can recover from that, and there is no counter it belongs in, so it is
+    // discarded deliberately rather than by omission.
+    let _ = IN_FLIGHT.insert(bpf_get_current_pid_tgid(), sk as u64, 0);
     0
 }
 
@@ -203,7 +306,11 @@ pub fn periskop_tcp_recvmsg_return(ctx: RetProbeContext) -> u32 {
     let Some(sk) = take_in_flight(bpf_get_current_pid_tgid()) else {
         return 0;
     };
-    let received = ctx.ret::<i32>().unwrap_or(0);
+    // The return register holds what `tcp_recvmsg` returned: a byte count, or a
+    // negative errno, or zero for an orderly shutdown. Only a positive count is
+    // bytes that arrived, and the other two produce no record rather than a
+    // record claiming zero bytes on a connection that moved some.
+    let received = ctx.ret::<i32>();
     if received <= 0 {
         return 0;
     }
@@ -261,8 +368,10 @@ fn take_in_flight(task: u64) -> Option<u64> {
     // SAFETY: the map is this object's own and holds plain `u64` values, so the
     // reference the helper hands back points at a value of the type the map was
     // declared with. It is read out before the entry is removed.
-    let sk = unsafe { IN_FLIGHT.get(&task).copied() };
-    let _ = IN_FLIGHT.remove(&task);
+    let sk = unsafe { IN_FLIGHT.get(task).copied() };
+    // A remove that fails is a key that was not there, which is the case the
+    // caller already handles by getting nothing back.
+    let _ = IN_FLIGHT.remove(task);
     sk
 }
 
@@ -292,7 +401,12 @@ fn key_of(sk: u64) -> Option<wire::Key> {
     if family != Some(AF_INET) {
         return None;
     }
-    let (daddr, dport, num) = (daddr?, dport?, num?);
+    // The source address joins the other three rather than defaulting to zero on
+    // a failed read. Zero is a real value here, `0.0.0.0` on a socket the kernel
+    // has not bound yet, so a read that failed and a socket that is genuinely
+    // unbound would arrive at the decoder as the same thing. A read this object
+    // could not make is a record it does not write.
+    let (daddr, dport, num, saddr) = (daddr?, dport?, num?, saddr?);
     if daddr == 0 || dport == 0 || num == 0 {
         return None;
     }
@@ -300,7 +414,7 @@ fn key_of(sk: u64) -> Option<wire::Key> {
     let mut dst_ip = [0u8; 16];
     // Both are already in network order in the socket, and the layout wants the
     // address bytes in that order, so they are copied rather than converted.
-    src_ip[..4].copy_from_slice(&saddr.unwrap_or(0).to_ne_bytes());
+    src_ip[..4].copy_from_slice(&saddr.to_ne_bytes());
     dst_ip[..4].copy_from_slice(&daddr.to_ne_bytes());
     Some(wire::Key {
         netns: 0,
@@ -327,17 +441,33 @@ unsafe fn read_at<T>(base: *const u8, offset: usize) -> Option<T> {
     unsafe { bpf_probe_read_kernel(base.add(offset) as *const T).ok() }
 }
 
+/// The monotonic clock, in nanoseconds since boot.
+///
+/// `aya-ebpf` exposes this one as the raw binding rather than as a checked
+/// wrapper, so it is `unsafe` and returns a bare `u64` with no error to inspect.
+/// Wrapped once here so that the `unsafe` block holds a single call and nothing
+/// else, and so that the reason it is sound is written down once instead of at
+/// each of the two call sites.
+#[inline(always)]
+fn ktime_ns() -> u64 {
+    // SAFETY: `bpf_ktime_get_ns` takes no arguments, touches no memory this
+    // program owns and reads no pointer. It is `unsafe` because every generated
+    // binding is: they are transmutes of a helper id into a function pointer.
+    // The verifier is what guarantees the helper is callable from a kprobe, and
+    // it is, from every program type this object carries.
+    unsafe { bpf_ktime_get_ns() }
+}
+
 /// Wall clock seconds, rounded down to the bucket the loader chose.
 fn bucket_now() -> u64 {
-    let wall_secs =
-        (config(CONFIG_WALL_OFFSET_NS).saturating_add(bpf_ktime_get_ns())) / NANOS_PER_SEC;
+    let wall_secs = (config(CONFIG_WALL_OFFSET_NS).saturating_add(ktime_ns())) / NANOS_PER_SEC;
     let bucket = config(CONFIG_BUCKET_SECS).max(1);
     wall_secs - (wall_secs % bucket)
 }
 
 /// Seconds since the loader attached, which is what ages the name map.
 fn seconds_since_attach() -> u64 {
-    bpf_ktime_get_ns().saturating_sub(config(CONFIG_ATTACHED_AT_NS)) / NANOS_PER_SEC
+    ktime_ns().saturating_sub(config(CONFIG_ATTACHED_AT_NS)) / NANOS_PER_SEC
 }
 
 fn config(slot: u32) -> u64 {
@@ -351,7 +481,11 @@ fn config(slot: u32) -> u64 {
 /// thousand connections and a sensor that saw a quiet machine, and only one of
 /// the two is a measurement.
 fn emit<const N: usize>(frame: &[u8; N]) {
-    if EVENTS.output(frame, 0).is_ok() {
+    // `T` is named rather than inferred. `output` takes `impl Borrow<T>` and a
+    // `&[u8; N]` borrows as both `[u8; N]` and `&[u8; N]`, so an unannotated call
+    // is ambiguous. Naming the array is also what makes `size_of_val` inside the
+    // helper equal to the frame length instead of the width of a pointer.
+    if EVENTS.output::<[u8; N]>(frame, 0).is_ok() {
         return;
     }
     // SAFETY: the pointer addresses this object's own single element array, and

@@ -1,0 +1,14 @@
+# This package is its own workspace, so its build output is its own too.
+#
+# The repository's root `.gitignore` anchors its rule at `/target/`, which covers
+# the workspace at the root and nothing else. Everything else in this tree builds
+# into that one directory; this package does not, because it is a separate
+# workspace with a separate target triple. Without this file, `crates/periskop-
+# ebpf-object/target/` is an untracked directory full of build output sitting one
+# `git add -A` away from a commit, which is the accident CLAUDE.md rule O6c
+# already exists to prevent.
+#
+# `Cargo.lock` is deliberately absent from this file. This package builds a
+# binary artefact whose dependency versions are the thing ADR-014 section 8 pins,
+# so the lock belongs in version control, not out of it.
+/target/
