@@ -180,7 +180,10 @@ fn scan(request: ScanRequest<'_>, sources: ScanSources<'_>, policy: ScanPolicy) 
     let discovery = discover(request.project_root, &DiscoveryOptions::default());
 
     let mut builder = ReportBuilder::new();
-    let mut coverage = CoverageStatement::static_only();
+    // Which detectors decided this run, as the report states it. The source and
+    // not the directory: the path is stderr's business, because it changes
+    // between machines and the body has to compare equal across them.
+    let mut coverage = CoverageStatement::static_only(request.rules.into());
     let mut unclaimed: BTreeSet<String> = BTreeSet::new();
     // Engine faults, kept apart from rule problems because they are a different
     // claim: a rule that will not load is a file someone wrote, an engine fault

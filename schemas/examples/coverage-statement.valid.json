@@ -42,5 +42,6 @@
   "sensor_platform_class": "none",
   "dns_observation": "available",
   "observation_window_ms": 0,
-  "reconciliation_mode": "static_only"
+  "reconciliation_mode": "static_only",
+  "rule_set_source": "embedded"
 }

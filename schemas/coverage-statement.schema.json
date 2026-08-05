@@ -3,7 +3,7 @@
   "$id": "https://periskop.dev/schemas/coverage-statement.schema.json",
   "title": "CoverageStatement",
   "type": "object",
-  "description": "Normative field list for the coverage statement. All 19 fields are required even when empty, because the gap between an absent field and a zero is the easiest way to break the honest coverage principle without anyone noticing. Engine, rule and schema errors do not belong here; they go to the report diagnostics block.",
+  "description": "Normative field list for the coverage statement. All 20 fields are required even when empty, because the gap between an absent field and a zero is the easiest way to break the honest coverage principle without anyone noticing. Engine, rule and schema errors do not belong here; they go to the report diagnostics block.",
   "required": [
     "parsed_files",
     "unparsed_files",
@@ -23,7 +23,8 @@
     "sensor_platform_class",
     "dns_observation",
     "observation_window_ms",
-    "reconciliation_mode"
+    "reconciliation_mode",
+    "rule_set_source"
   ],
   "additionalProperties": false,
   "properties": {
@@ -154,6 +155,10 @@
     "reconciliation_mode": {
       "enum": ["full", "static_only", "static_plus_runtime", "static_plus_wire"],
       "description": "Which sources fed reconciliation. The value partial does not exist."
+    },
+    "rule_set_source": {
+      "enum": ["embedded", "directory"],
+      "description": "Where the detectors that decided this run came from: the set shipped inside the binary, or a directory the caller named with --rules. Required because the answer changes what a clean report means. rule_set_hash fixes the content of the rule set and says nothing about its origin, and to an auditor reading an archived report, scanned with the detectors we ship is not the same claim as scanned with a local directory that may never have been under version control. A narrow rule set produces a cleaner report, and making that kind of false cleanliness visible is what this whole product is for. No path is written here, ever: an absolute path differs between runs and between machines, which would break byte identical reproducibility. Same rule that makes location fields display only and keeps paths out of finding_id."
     }
   }
 }

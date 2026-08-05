@@ -211,14 +211,23 @@ pub struct ScanReport {
 
 /// Version of the report document this build writes.
 ///
-/// `1.1` because the coverage statement gained fields, and the coverage
-/// statement has no version of its own by contract: it is a sub object of the
-/// report and inherits this one. The fields are `in_scope_flows`, the
-/// denominator the other flow buckets are read against, and
-/// `unresolved_event_targets`, the calls whose destination the hook could not
-/// read. Both are additions, so a reader of a 1.0 document loses nothing; what
-/// it cannot do is compute the attribution ratio K-15 states.
-pub const SCHEMA_VERSION: &str = "1.1";
+/// The coverage statement has no version of its own by contract: it is a sub
+/// object of the report and inherits this one, so every field added there moves
+/// this number.
+///
+/// `1.1` added `in_scope_flows`, the denominator the other flow buckets are read
+/// against, and `unresolved_event_targets`, the calls whose destination the hook
+/// could not read. Without them a 1.0 reader cannot compute the attribution ratio
+/// K-15 states.
+///
+/// `1.2` added `rule_set_source`, which says whether the detectors that decided
+/// the run were the shipped ones or a directory the caller named. A 1.1 reader
+/// loses no field; what it cannot do is tell an archived report produced by the
+/// set we ship apart from one produced by a local directory.
+///
+/// Every step here is a MINOR addition, so a reader of an older document keeps
+/// everything it had.
+pub const SCHEMA_VERSION: &str = "1.2";
 
 /// Collects findings and produces a report.
 ///
@@ -432,14 +441,39 @@ fn decide_verdict(policy: &PolicyRef) -> Verdict {
     Verdict::Pass
 }
 
+/// The one coverage field the run identity is taken without.
+///
+/// Named here rather than written inline because it is a documented exception,
+/// and an exception spelled as a bare string in the middle of a hash is one
+/// nobody finds when they go looking for why two runs share an id.
+const SOURCE_FIELD_OUTSIDE_IDENTITY: &str = "rule_set_source";
+
 /// Digest of the coverage statement, as an input to the run identity.
 ///
 /// Coverage is part of what makes one run different from another: the same
 /// findings over a tree the scanner read in full and over one it barely read are
 /// not the same run, and an identity that cannot tell them apart is worthless for
 /// storing or diffing reports.
+///
+/// `rule_set_source` is the one field left out, and only out of this digest. What
+/// the identity has to pin about the detectors is which ones ran, and
+/// `rule_set_hash` already pins that by content. Where those same bytes were read
+/// from is provenance for the reader, not an input to the analysis, so folding it
+/// in would give two runs with identical detectors and identical findings two
+/// different `scan_run_id`s. A reader comparing the two reports would see the
+/// identity move and read it as "what was analysed changed", when the only
+/// difference is a sentence about origin the body already states plainly.
+///
+/// The exclusion stops here. `body_hash` still covers the field, so a signature
+/// covers it too: it does not rename the run, and nobody can edit it unnoticed.
+/// The precedent is `envelope`, excluded from the body hash because a clock is
+/// not a claim about the code.
 fn coverage_digest(coverage: &CoverageStatement) -> Result<String, serde_json::Error> {
-    let text = crate::serialize::to_canonical_json(coverage)?;
+    let mut as_value = serde_json::to_value(coverage)?;
+    if let Some(object) = as_value.as_object_mut() {
+        object.remove(SOURCE_FIELD_OUTSIDE_IDENTITY);
+    }
+    let text = crate::serialize::to_canonical_json(&as_value)?;
     Ok(periskop_core::ids::short_hash("cv/v1", &[&text]))
 }
 
@@ -486,6 +520,7 @@ fn derive_scan_run_id(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::coverage::RuleSetSource;
     use periskop_core::finding::{
         Component, Detector, EntityRef, Evidence, EvidenceType, Kind, RefType,
     };
@@ -576,7 +611,11 @@ mod tests {
             finding(Confidence::Confirmed, "python.static.a"),
             finding(Confidence::Suspect, "python.static.b"),
         ]);
-        let report = b.build(envelope(), policy(vec![]), CoverageStatement::static_only());
+        let report = b.build(
+            envelope(),
+            policy(vec![]),
+            CoverageStatement::static_only(RuleSetSource::Embedded),
+        );
 
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.suspect_findings.len(), 1);
@@ -593,7 +632,7 @@ mod tests {
     #[test]
     fn a_coverage_gap_alone_does_not_warn() {
         let b = ReportBuilder::new();
-        let mut coverage = CoverageStatement::static_only();
+        let mut coverage = CoverageStatement::static_only(RuleSetSource::Embedded);
         coverage.parsed_files = 1;
         coverage.unparsed_files = vec![crate::coverage::UnparsedFile {
             path: "x.py".into(),
@@ -621,7 +660,7 @@ mod tests {
         let report = ReportBuilder::new().build(
             envelope(),
             policy(vec![hit.clone()]),
-            CoverageStatement::static_only(),
+            CoverageStatement::static_only(RuleSetSource::Embedded),
         );
 
         assert_eq!(report.verdict, hit.verdict);
@@ -644,7 +683,7 @@ mod tests {
                 finding_ids: None,
                 coverage_condition: Some("coverage_unparsed_ratio > 500".into()),
             }]),
-            CoverageStatement::static_only(),
+            CoverageStatement::static_only(RuleSetSource::Embedded),
         );
         assert_eq!(report.verdict, Verdict::Warn);
     }
@@ -656,7 +695,7 @@ mod tests {
             unparsed_ratio_warn: Some(500),
             ..Policy::default()
         });
-        let mut coverage = CoverageStatement::static_only();
+        let mut coverage = CoverageStatement::static_only(RuleSetSource::Embedded);
         coverage.parsed_files = 1;
         coverage.unparsed_files = vec![crate::coverage::UnparsedFile {
             path: "x.py".into(),
@@ -687,7 +726,11 @@ mod tests {
         // whatever the findings said.
         let mut b = ReportBuilder::new();
         b.add_findings([finding(Confidence::Confirmed, "python.static.a")]);
-        let report = b.build(envelope(), policy(vec![]), CoverageStatement::static_only());
+        let report = b.build(
+            envelope(),
+            policy(vec![]),
+            CoverageStatement::static_only(RuleSetSource::Embedded),
+        );
 
         assert_eq!(report.verdict, Verdict::Pass);
         let hit = report
@@ -712,7 +755,11 @@ mod tests {
             ..Policy::default()
         });
         b.add_findings([finding(Confidence::Confirmed, "python.static.a")]);
-        let report = b.build(envelope(), policy(vec![]), CoverageStatement::static_only());
+        let report = b.build(
+            envelope(),
+            policy(vec![]),
+            CoverageStatement::static_only(RuleSetSource::Embedded),
+        );
 
         assert_eq!(report.verdict, Verdict::Fail);
     }
@@ -723,7 +770,11 @@ mod tests {
         // could not prove, which is the case a human is meant to look at.
         let mut b = ReportBuilder::new();
         b.add_findings([finding(Confidence::Suspect, "python.static.b")]);
-        let report = b.build(envelope(), policy(vec![]), CoverageStatement::static_only());
+        let report = b.build(
+            envelope(),
+            policy(vec![]),
+            CoverageStatement::static_only(RuleSetSource::Embedded),
+        );
 
         assert_eq!(report.verdict, Verdict::Warn);
     }
@@ -733,7 +784,11 @@ mod tests {
         let build = || {
             let mut b = ReportBuilder::new();
             b.add_findings([finding(Confidence::Confirmed, "python.static.a")]);
-            b.build(envelope(), policy(vec![]), CoverageStatement::static_only())
+            b.build(
+                envelope(),
+                policy(vec![]),
+                CoverageStatement::static_only(RuleSetSource::Embedded),
+            )
         };
         let a = build();
         let b = build();
@@ -750,7 +805,11 @@ mod tests {
         let build = |rule: &str| {
             let mut b = ReportBuilder::new();
             b.add_findings([finding(Confidence::Confirmed, rule)]);
-            b.build(envelope(), policy(vec![]), CoverageStatement::static_only())
+            b.build(
+                envelope(),
+                policy(vec![]),
+                CoverageStatement::static_only(RuleSetSource::Embedded),
+            )
         };
         let a = build("python.static.openai");
         let b = build("typescript.static.anthropic");
@@ -768,7 +827,7 @@ mod tests {
         let build = |parsed_files: u64| {
             let mut b = ReportBuilder::new();
             b.add_findings([finding(Confidence::Confirmed, "python.static.a")]);
-            let mut coverage = CoverageStatement::static_only();
+            let mut coverage = CoverageStatement::static_only(RuleSetSource::Embedded);
             coverage.parsed_files = parsed_files;
             b.build(envelope(), policy(vec![]), coverage)
         };
@@ -783,7 +842,11 @@ mod tests {
                 scan_root_id: root.into(),
                 rule_set_hash: "c".repeat(64),
             });
-            b.build(envelope(), policy(vec![]), CoverageStatement::static_only())
+            b.build(
+                envelope(),
+                policy(vec![]),
+                CoverageStatement::static_only(RuleSetSource::Embedded),
+            )
         };
         assert_ne!(build("repo-a").scan_run_id, build("repo-b").scan_run_id);
     }
@@ -793,8 +856,12 @@ mod tests {
         let make = |order: [&str; 2]| {
             let mut b = ReportBuilder::new();
             b.add_findings(order.map(|r| finding(Confidence::Confirmed, r)));
-            b.build(envelope(), policy(vec![]), CoverageStatement::static_only())
-                .findings
+            b.build(
+                envelope(),
+                policy(vec![]),
+                CoverageStatement::static_only(RuleSetSource::Embedded),
+            )
+            .findings
         };
         let forward = make(["python.static.a", "python.static.b"]);
         let reverse = make(["python.static.b", "python.static.a"]);
@@ -809,9 +876,13 @@ mod tests {
             finding(Confidence::Confirmed, "python.static.a"),
         ]);
         assert_eq!(
-            b.build(envelope(), policy(vec![]), CoverageStatement::static_only())
-                .findings
-                .len(),
+            b.build(
+                envelope(),
+                policy(vec![]),
+                CoverageStatement::static_only(RuleSetSource::Embedded)
+            )
+            .findings
+            .len(),
             1
         );
     }

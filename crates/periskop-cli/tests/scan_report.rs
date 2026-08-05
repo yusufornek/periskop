@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use periskop_core::coverage::UnparsedReason;
-use periskop_report::coverage::RuntimeStatus;
+use periskop_report::coverage::{RuleSetSource, RuntimeStatus};
 use periskop_report::report::DiagnosticCode;
 use periskop_report::{to_canonical_json, Verdict};
 
@@ -153,6 +153,77 @@ fn the_serialized_report_is_byte_identical_across_runs() {
     let a = to_canonical_json(&run("2026-08-04T09:00:00Z").report).unwrap();
     let b = to_canonical_json(&run("2026-08-04T09:00:00Z").report).unwrap();
     assert_eq!(a, b);
+}
+
+#[test]
+fn a_run_on_the_shipped_detectors_says_so_in_the_report() {
+    // stderr already announces the source, and stderr is not what gets archived.
+    // An auditor reading a stored report has to be able to ask "clean according
+    // to what" and get an answer out of the document itself.
+    let outcome = run_in(&fixtures(), RuleSource::Embedded, "2026-08-04T09:00:00Z");
+    assert_eq!(
+        outcome.report.coverage.rule_set_source,
+        RuleSetSource::Embedded
+    );
+}
+
+#[test]
+fn a_run_on_a_named_directory_says_that_instead_and_names_no_path() {
+    // The case the field exists for. An operator can point --rules at a narrow
+    // directory, get a clean report, and archive it; without this field nothing
+    // in the document separates that run from one made with the shipped set.
+    let rules = repo_root().join("rules");
+    let outcome = run_in(
+        &fixtures(),
+        RuleSource::Directory(&rules),
+        "2026-08-04T09:00:00Z",
+    );
+    assert_eq!(
+        outcome.report.coverage.rule_set_source,
+        RuleSetSource::Directory
+    );
+
+    // The other half of the decision. The source reaches the report, the path
+    // does not: an absolute path differs between machines and would mean two
+    // runs over one tree no longer produce the same bytes.
+    let document = to_canonical_json(&outcome.report).unwrap();
+    assert!(
+        !document.contains(&*rules.to_string_lossy()),
+        "the rule directory reached the report body: {document}"
+    );
+}
+
+#[test]
+fn changing_only_the_source_changes_only_that_field() {
+    // The embedded set is the repository's `rules/` tree compiled in, which
+    // `tests/embedded_rules.rs` pins byte for byte. Handing the same rules to the
+    // same fixtures by the other route therefore has exactly one legitimate
+    // consequence: the sentence about where they came from.
+    //
+    // What this protects is the diff. Finding identities, the run identity and
+    // the report identity all have to survive the change, because none of them
+    // is about provenance: a reader who sees `scan_run_id` move reads it as "the
+    // thing that was analysed changed", and here nothing was.
+    let rules = repo_root().join("rules");
+    let embedded = run_in(&fixtures(), RuleSource::Embedded, "2026-08-04T09:00:00Z");
+    let named = run_in(
+        &fixtures(),
+        RuleSource::Directory(&rules),
+        "2026-08-04T09:00:00Z",
+    );
+
+    assert_ne!(
+        embedded.report.coverage.rule_set_source, named.report.coverage.rule_set_source,
+        "the two runs did not differ in the field under test, so the rest proves nothing"
+    );
+
+    let mut aligned = named.report.clone();
+    aligned.coverage.rule_set_source = embedded.report.coverage.rule_set_source;
+    assert_eq!(
+        to_canonical_json(&aligned).unwrap(),
+        to_canonical_json(&embedded.report).unwrap(),
+        "the two runs differ somewhere other than the rule set source"
+    );
 }
 
 #[test]

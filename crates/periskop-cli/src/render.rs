@@ -229,7 +229,7 @@ mod tests {
         Location, RefType, Span,
     };
     use periskop_report::coverage::{
-        CoverageLanguage, CoverageStatement, ReconciliationMode, RuntimeCoverage,
+        CoverageLanguage, CoverageStatement, ReconciliationMode, RuleSetSource, RuntimeCoverage,
     };
     use periskop_report::report::{
         Diagnostic, DiagnosticCode, DiagnosticComponent, Envelope, PolicyRef, ReportBuilder,
@@ -292,7 +292,7 @@ mod tests {
         ReportBuilder::new().build(
             envelope(),
             policy(Vec::new()),
-            CoverageStatement::static_only(),
+            CoverageStatement::static_only(RuleSetSource::Embedded),
         )
     }
 
@@ -325,7 +325,7 @@ mod tests {
                 finding_ids: None,
                 coverage_condition: None,
             }]),
-            CoverageStatement::static_only(),
+            CoverageStatement::static_only(RuleSetSource::Embedded),
         );
         assert!(summary(&report).starts_with("periskop FAIL"), "{report:?}");
     }
@@ -350,7 +350,7 @@ mod tests {
         let text = summary(&builder.build(
             envelope(),
             policy(Vec::new()),
-            CoverageStatement::static_only(),
+            CoverageStatement::static_only(RuleSetSource::Embedded),
         ));
 
         assert!(text.contains("1 confirmed:"), "{text}");
@@ -381,7 +381,7 @@ mod tests {
         let text = summary(&builder.build(
             envelope(),
             policy(Vec::new()),
-            CoverageStatement::static_only(),
+            CoverageStatement::static_only(RuleSetSource::Embedded),
         ));
 
         assert!(text.contains("no network sensor in this run"), "{text}");
@@ -399,7 +399,7 @@ mod tests {
         // exactly why it has to be printed: a counter nobody prints is a gap
         // nobody sees. A run whose observations mostly attribute to nothing looks
         // identical on screen to a clean one otherwise.
-        let mut coverage = CoverageStatement::static_only();
+        let mut coverage = CoverageStatement::static_only(RuleSetSource::Embedded);
         coverage.unlinked_events = 9500;
         coverage.observation_window_ms = 60_000;
         coverage.reconciliation_mode = ReconciliationMode::StaticPlusRuntime;
@@ -425,7 +425,7 @@ mod tests {
         // The bug this pins: the line was a fixed string. It agreed with the
         // report by coincidence, and would have kept printing "not instrumented"
         // on the day a hook started reporting otherwise.
-        let mut coverage = CoverageStatement::static_only();
+        let mut coverage = CoverageStatement::static_only(RuleSetSource::Embedded);
         coverage.runtime_coverage = vec![
             RuntimeCoverage {
                 language: CoverageLanguage::Python,

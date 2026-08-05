@@ -23,6 +23,13 @@
       "rationale": "A report without a coverage statement must be rejected at schema level. This is the honest coverage principle made unbreakable rather than merely documented."
     },
     {
+      "file": "coverage-statement.no-rule-set-source.invalid.json",
+      "schema": "coverage-statement.schema.json",
+      "violates": "the run must say which rule set decided it",
+      "expected_error_contains": "missingProperty: 'rule_set_source'",
+      "rationale": "Every other field here counts something the scan could not see. This one names the detectors that decided what counted as seen at all, and it is required for the same reason the block is: a report that omits it reads as if the shipped detectors produced it. An operator can pass --rules at a narrow directory, get a clean PASS, and archive it; six months later nobody can tell that run apart from one made with the set we ship. rule_set_hash pins the content of the rules and says nothing about where they came from, so leaving the field optional would make the honest answer the one a producer has to remember rather than one the schema enforces."
+    },
+    {
       "file": "egress-event.invalid.json",
       "schema": "egress-event.schema.json",
       "violates": "payload shape may not carry content",

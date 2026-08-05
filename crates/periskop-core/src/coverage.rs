@@ -99,6 +99,47 @@ impl CoverageLanguage {
     }
 }
 
+/// Where the detectors that decided a run came from.
+///
+/// Two values and no third, because a run reads exactly one of two rule sets: the
+/// one compiled into the binary, or a directory the caller named. Implicit
+/// discovery was removed, so there is no "wherever it was found" to name.
+///
+/// Lives in the coverage vocabulary rather than beside the scanner's own source
+/// type for the reason [`UnresolvedReason`] gives: the scanner produces the value
+/// and the report only carries it. It belongs to coverage because it answers the
+/// question the rest of the block answers. Every other field says what the run
+/// could not see; this one says which detectors decided what counted as seen.
+/// `rule_set_hash` already pins the content of the rule set and says nothing
+/// about its origin, and to somebody reading an archived report, scanned with the
+/// detectors we ship is not the same claim as scanned with a local directory that
+/// may never have been under version control.
+///
+/// **No path is ever carried here.** An absolute path differs between machines
+/// and would put the build machine into a document that has to compare equal
+/// across them. Same rule that keeps paths out of `finding_id` and derives
+/// `scan_root_id` from a directory name rather than from where it sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleSetSource {
+    /// The set compiled in at build time.
+    Embedded,
+    /// A directory the caller named, which replaces the embedded set entirely.
+    Directory,
+}
+
+impl RuleSetSource {
+    /// The spelling the contract fixes, for surfaces that print rather than
+    /// serialize. Same reason [`CoverageLanguage::as_str`] exists: one word per
+    /// fact, so a terminal and the JSON beside it cannot disagree.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Embedded => "embedded",
+            Self::Directory => "directory",
+        }
+    }
+}
+
 /// Denominator in basis points, so the ratio stays integer arithmetic end to end.
 const BASIS_POINTS: u64 = 10_000;
 
@@ -147,6 +188,20 @@ mod tests {
             UnparsedReason::IoError,
         ] {
             assert!(reason.counts_toward_ratio(), "{reason:?} must count");
+        }
+    }
+
+    #[test]
+    fn a_rule_set_source_is_written_in_the_words_the_contract_uses() {
+        // The enum is closed at two values by contract, and the spelling is what
+        // an archived report is read by. A printed word that differs from the
+        // serialized one would give a reader two vocabularies for one fact.
+        for source in [RuleSetSource::Embedded, RuleSetSource::Directory] {
+            assert_eq!(
+                serde_json::to_string(&source).expect("the source serializes"),
+                format!("\"{}\"", source.as_str()),
+                "{source:?}"
+            );
         }
     }
 

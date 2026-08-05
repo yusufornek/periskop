@@ -10,6 +10,8 @@
 use std::fmt;
 use std::path::Path;
 
+use periskop_core::coverage::RuleSetSource;
+
 use crate::rules::embedded::load_embedded;
 use crate::rules::loader::{load_directory, RuleLoadError};
 use crate::rules::model::RuleFile;
@@ -30,6 +32,23 @@ impl RuleSource<'_> {
         match self {
             Self::Embedded => load_embedded(),
             Self::Directory(dir) => load_directory(dir),
+        }
+    }
+}
+
+/// The same fact as the report states it, with the path dropped.
+///
+/// Two spellings for one thing on purpose. [`fmt::Display`] below names the
+/// directory because it is written to stderr, where an operator needs to see
+/// which tree they pointed at. The report gets the source and nothing else: an
+/// absolute path differs between machines, so putting one in the body would mean
+/// two runs over the same tree no longer produce the same bytes. Same rule that
+/// keeps paths out of `finding_id`.
+impl From<RuleSource<'_>> for RuleSetSource {
+    fn from(source: RuleSource<'_>) -> Self {
+        match source {
+            RuleSource::Embedded => Self::Embedded,
+            RuleSource::Directory(_) => Self::Directory,
         }
     }
 }
@@ -62,6 +81,26 @@ mod tests {
             "the embedded set answered for a directory"
         );
         assert_eq!(errors.len(), 1, "{errors:?}");
+    }
+
+    #[test]
+    fn the_report_learns_the_source_and_not_the_path() {
+        // The report field is what an auditor reads six months later, and it has
+        // to say which detectors decided the run without carrying a path that
+        // would differ on the next machine.
+        assert_eq!(
+            RuleSetSource::from(RuleSource::Embedded),
+            RuleSetSource::Embedded
+        );
+        assert_eq!(
+            RuleSetSource::from(RuleSource::Directory(Path::new("/opt/rules"))),
+            RuleSetSource::Directory
+        );
+        assert_eq!(
+            RuleSetSource::from(RuleSource::Directory(Path::new("/somewhere/else"))),
+            RuleSetSource::from(RuleSource::Directory(Path::new("/opt/rules"))),
+            "the directory itself reached the report"
+        );
     }
 
     #[test]

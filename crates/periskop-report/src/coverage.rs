@@ -11,7 +11,9 @@ use periskop_core::coverage::UnparsedReason;
 
 /// Re-exported from the core vocabulary. The scanner produces these and the
 /// report only carries them, so the types live where the producer can reach them.
-pub use periskop_core::coverage::{CoverageLanguage, UnresolvedReason, UnresolvedTarget};
+pub use periskop_core::coverage::{
+    CoverageLanguage, RuleSetSource, UnresolvedReason, UnresolvedTarget,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct UnparsedFile {
@@ -120,6 +122,19 @@ pub struct CoverageStatement {
     pub dns_observation: DnsObservation,
     pub observation_window_ms: u64,
     pub reconciliation_mode: ReconciliationMode,
+    /// Which detector set decided this run: the one shipped in the binary, or a
+    /// directory the caller named.
+    ///
+    /// The one field here that is not a count of something unseen, and it belongs
+    /// beside them because it says what "seen" was measured against. A reader told
+    /// a tree is clean has to be able to ask "clean according to what", and
+    /// `rule_set_hash` answers with the content of the rules rather than with
+    /// where they came from. A narrow rule set produces a cleaner report, and
+    /// making that kind of false cleanliness visible is the whole product.
+    ///
+    /// The run announces this on stderr as well, but stderr is not archived and
+    /// the report is.
+    pub rule_set_source: RuleSetSource,
 }
 
 impl CoverageStatement {
@@ -133,7 +148,13 @@ impl CoverageStatement {
     /// empty and the caller fills it from the languages the scan actually saw; an
     /// empty list would say nothing at all about any language, which is the
     /// silence the field exists to break.
-    pub fn static_only() -> Self {
+    ///
+    /// The rule set source is an argument rather than a default for the reason
+    /// the whole field exists. Defaulting it to `Embedded` would make a caller who
+    /// forgot it claim the shipped detectors produced the run, which is the exact
+    /// false statement the field was added to prevent, and the caller would never
+    /// see a compiler error telling them so.
+    pub fn static_only(rule_set_source: RuleSetSource) -> Self {
         Self {
             parsed_files: 0,
             unparsed_files: Vec::new(),
@@ -154,6 +175,7 @@ impl CoverageStatement {
             dns_observation: DnsObservation::Available,
             observation_window_ms: 0,
             reconciliation_mode: ReconciliationMode::StaticOnly,
+            rule_set_source,
         }
     }
 
@@ -210,7 +232,7 @@ mod tests {
 
     #[test]
     fn static_only_run_declares_no_observation() {
-        let c = CoverageStatement::static_only();
+        let c = CoverageStatement::static_only(RuleSetSource::Embedded);
         assert_eq!(c.sensor_platform_class, SensorPlatformClass::None);
         assert_eq!(c.observation_window_ms, 0);
         assert_eq!(c.reconciliation_mode, ReconciliationMode::StaticOnly);
@@ -218,7 +240,7 @@ mod tests {
 
     #[test]
     fn normalize_sorts_and_deduplicates() {
-        let mut c = CoverageStatement::static_only();
+        let mut c = CoverageStatement::static_only(RuleSetSource::Embedded);
         c.undetected_libraries = vec!["zeta".into(), "alpha".into(), "zeta".into()];
         c.normalize();
         assert_eq!(c.undetected_libraries, ["alpha", "zeta"]);
@@ -226,7 +248,7 @@ mod tests {
 
     #[test]
     fn binary_files_do_not_move_the_ratio() {
-        let mut c = CoverageStatement::static_only();
+        let mut c = CoverageStatement::static_only(RuleSetSource::Embedded);
         c.parsed_files = 10;
         c.unparsed_files = vec![UnparsedFile {
             path: "logo.png".into(),
@@ -237,7 +259,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_source_file_does_move_it() {
-        let mut c = CoverageStatement::static_only();
+        let mut c = CoverageStatement::static_only(RuleSetSource::Embedded);
         c.parsed_files = 9;
         c.unparsed_files = vec![UnparsedFile {
             path: "broken.py".into(),
