@@ -162,8 +162,67 @@ fn assert_kernel_object_rather_than_a_second_program(
     );
 }
 
+/// The command tree as this repository ships it.
+///
+/// A committed copy exists because the specification does not travel. `docs/`
+/// is deliberately absent from the published tree, so a test that reads it
+/// passes on a developer machine and fails on every clone, which is what
+/// happened: this file was green locally and red on the first CI run that
+/// reached it.
+///
+/// So the shipped assertion runs against this constant, and the agreement with
+/// `cli/spec.md` is checked separately and only where that file exists.
+const COMMITTED_TREE: &[&str] = &[
+    "hook",
+    "hook install",
+    "key",
+    "key generate",
+    "proxy",
+    "scan",
+    "sensor",
+    "serve-rpc",
+    "sign",
+    "verify",
+];
+
+fn committed_tree() -> BTreeSet<String> {
+    COMMITTED_TREE.iter().map(|s| (*s).to_string()).collect()
+}
+
 #[test]
-fn the_help_output_matches_the_command_tree_in_the_specification() {
+fn the_help_output_matches_the_committed_command_tree() {
+    let committed = committed_tree();
+    let implemented = implemented_tree();
+
+    let missing: Vec<_> = committed.difference(&implemented).collect();
+    let undocumented: Vec<_> = implemented.difference(&committed).collect();
+
+    assert!(
+        missing.is_empty(),
+        "listed but not implemented: {missing:?}"
+    );
+    assert!(
+        undocumented.is_empty(),
+        "implemented but not listed: {undocumented:?}"
+    );
+}
+
+#[test]
+fn the_specification_matches_the_command_tree_in_this_file() {
+    let spec = repo_root().join("docs/02-components/cli/spec.md");
+    if !spec.exists() {
+        // Not a silent skip. `docs/` is never published, so its absence is the
+        // normal state of a clone and the expected state in CI. What would be a
+        // defect is the directory being there with the file missing from it,
+        // and that is the case this asserts rather than passes over.
+        assert!(
+            !repo_root().join("docs").exists(),
+            "docs/ is present but cli/spec.md is not, which means the \
+             specification moved rather than that this is a published tree"
+        );
+        return;
+    }
+
     let documented = documented_tree();
     let implemented = implemented_tree();
 
