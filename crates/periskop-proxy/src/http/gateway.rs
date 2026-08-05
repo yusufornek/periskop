@@ -199,6 +199,11 @@ impl Gateway {
         allow: AllowList,
         clock: Clock,
     ) -> Result<Self, Refusal> {
+        if let Some(refusal) =
+            Self::detection_refusal(crate::detect::pattern::shapes_are_loadable())
+        {
+            return Err(refusal);
+        }
         let mut bases = BTreeMap::new();
         for provider in [Provider::OpenAi, Provider::Anthropic] {
             // A provider whose default host the operator took off the allow list
@@ -585,7 +590,34 @@ impl Gateway {
         // still goes through restoration, because a masked value can be quoted in
         // an error message as easily as in an answer.
         record.status = answer.status;
-        let body = self.restore_answer(&answer, &snapshot, &identity, &mut record);
+        let body = match self.restore_answer(&answer, &snapshot, &identity, &mut record) {
+            Ok(body) => body,
+            // The answer was begun and is not finished, so it is cut the same way
+            // a vault lost mid stream cuts it: nothing of the provider's body is
+            // written, because parts of it stand for values this vault can no
+            // longer vouch for.
+            Err(refusal) => {
+                record.status = refusal.status();
+                record.error = Some(refusal.error());
+                return (
+                    Outgoing {
+                        status: refusal.status(),
+                        headers: super::headers::to_downstream(
+                            &HeaderList::new(),
+                            &Marks {
+                                policy_id: self.policy.policy_id().to_owned(),
+                                alias_scope: record.alias_scope.clone(),
+                                error: Some(refusal.error()),
+                                stream_truncated: true,
+                                ..Marks::default()
+                            },
+                        ),
+                        body: Vec::new(),
+                    },
+                    record,
+                );
+            }
+        };
 
         // The two window facts, written whether or not a stream ran. They are
         // configuration rather than outcome: `l_max_static` is the compile time
@@ -634,20 +666,63 @@ impl Gateway {
         snapshot: &Arc<Snapshot>,
         identity: &super::session::Identity,
         record: &mut RequestRecord,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, Refusal> {
         if snapshot.is_empty() {
-            return answer.body.clone();
+            return Ok(answer.body.clone());
         }
         let content_type = answer.headers.get("content-type");
         if !is_event_stream(content_type) && !is_json(content_type) {
-            return answer.body.clone();
+            return Ok(answer.body.clone());
         }
 
         let now_ms = self.clock.now_ms();
         let session = identity.id();
         let mut vault = lock(&self.vault);
         let mut lookup = SessionLookup::new(&mut vault, snapshot, session, now_ms);
+        self.restore_with(answer, snapshot, &mut lookup, record, now_ms)
+    }
 
+    /// The half of [`Self::restore_answer`] that does the work, over any
+    /// [`Lookup`].
+    ///
+    /// Split out so that the rule below can be held by a test with a lookup that
+    /// reports a tampered record, rather than only by a corrupted vault file that
+    /// no in-memory test can produce.
+    fn restore_with(
+        &self,
+        answer: &Answer,
+        snapshot: &Arc<Snapshot>,
+        lookup: &mut dyn Lookup,
+        record: &mut RequestRecord,
+        now_ms: u64,
+    ) -> Result<Vec<u8>, Refusal> {
+        let content_type = answer.headers.get("content-type");
+        let body = self.restored_bytes(answer, snapshot, lookup, record, now_ms, content_type);
+
+        // `proxy/spec.md` section 10, the `vault_record_tamper` row, and
+        // `proxy-event.schema.json`'s own description of the field: "every non
+        // zero value is a security event and ended in a 503". The lookup answers
+        // a tampered record with `None`, so that one span goes back as the raw
+        // alias, which is safe **for the span** and not for the answer: the rest
+        // of the body is a message written about values this vault can no longer
+        // vouch for, and section 10 says the value behind a swapped record is
+        // given to the user under no circumstances. Counting it and delivering a
+        // 200 put the decision in a field nobody reads.
+        if let Some(refusal) = Self::tamper_refusal(record.measured.record_tamper) {
+            return Err(refusal);
+        }
+        Ok(body)
+    }
+
+    fn restored_bytes(
+        &self,
+        answer: &Answer,
+        snapshot: &Arc<Snapshot>,
+        lookup: &mut dyn Lookup,
+        record: &mut RequestRecord,
+        now_ms: u64,
+        content_type: Option<&str>,
+    ) -> Vec<u8> {
         if is_event_stream(content_type) {
             let mut relay = Relay::new(&Settings {
                 snapshot: Arc::clone(snapshot),
@@ -658,22 +733,76 @@ impl Gateway {
             });
             let mut out = Vec::new();
             for piece in answer.pieces() {
-                out.extend(relay.push(piece, &mut lookup, now_ms));
+                out.extend(relay.push(piece, lookup, now_ms));
             }
-            out.extend(relay.finish(&mut lookup, now_ms));
+            out.extend(relay.finish(lookup, now_ms));
             record.measured = relay.measured();
             return out;
         }
 
-        match restore_body(snapshot, &mut lookup, &answer.body) {
+        match restore_body(snapshot, lookup, &answer.body) {
             Some((body, stats)) => {
                 record.measured.restore = stats;
                 record.measured.record_tamper = lookup.tampered();
                 body
             }
             // A body that does not parse is the provider's, not ours to rewrite.
-            None => answer.body.clone(),
+            // The tamper count still has to be read off the lookup, or a record
+            // that failed verification while a stream was walked would be
+            // forgotten by the one branch that does not rewrite anything.
+            None => {
+                record.measured.record_tamper = lookup.tampered();
+                answer.body.clone()
+            }
         }
+    }
+
+    /// The refusal a build owes when detection layer A did not load.
+    ///
+    /// ADR-011 section 1 and `proxy/spec.md` section 3.1 make layer A mandatory
+    /// and always on, and `detect::pattern` compiles its shapes with
+    /// `filter_map(...ok())`: one malformed expression is dropped and the scan
+    /// then returns an empty vector for the **whole** layer. Nothing declared it.
+    /// A single bad edit to one regular expression therefore produced a proxy
+    /// that masked no IBAN, no card and no API key, on every request, with no
+    /// header, no event and no error, while `x-periskop-masked-entities: 0`
+    /// looked like a prompt with nothing in it.
+    ///
+    /// This is a refusal to **start** rather than a per-request declaration for
+    /// one reason: `proxy-event.schema.json`'s `degraded_reasons` is a closed
+    /// dictionary with no value for it, and that file is a contract this role
+    /// does not change (CLAUDE.md, E1). Refusing to start is also the stronger
+    /// answer of the two, and the closed error vocabulary's value for "fix the
+    /// configuration and restart, no request is accepted at all" is
+    /// `policy_unloadable`. The detail names the real cause; the request for a
+    /// declared reason is filed in `hub/memory/interfaces.md`.
+    fn detection_refusal(shapes_are_loadable: bool) -> Option<Refusal> {
+        (!shapes_are_loadable).then(|| {
+            Refusal::new(
+                ProxyError::PolicyUnloadable,
+                "detection layer A did not load: at least one of its shapes failed to compile, \
+                 so nothing this build promises to mask would be masked. No request is served.",
+            )
+        })
+    }
+
+    /// The refusal a restored answer owes when a vault record did not verify.
+    ///
+    /// `None` when nothing was tampered with, which is every ordinary request.
+    /// The threshold is "any", not "many": `proxy/spec.md` section 11 makes a
+    /// single non zero count a security event, and a second opinion about how
+    /// many is enough would be this component deciding for the operator how much
+    /// tampering is acceptable.
+    fn tamper_refusal(count: u32) -> Option<Refusal> {
+        (count > 0).then(|| {
+            Refusal::new(
+                ProxyError::VaultRecordTamper,
+                format!(
+                    "{count} vault record(s) failed AAD or tag verification while this answer \
+                     was restored, so the answer is not delivered"
+                ),
+            )
+        })
     }
 
     /// Masks the body, or declares why it was not masked.
@@ -967,5 +1096,114 @@ mod tests {
             "a string the user wrote is in the set the response is read against"
         );
         assert_eq!(snapshot.alias_count(), 1);
+    }
+
+    /// A lookup that reports every alias as a record that failed verification.
+    ///
+    /// The only way to reach this state in a test: an in-memory vault's records
+    /// cannot be corrupted from outside the process, which is exactly why the
+    /// rule had no test and stayed fail open.
+    struct Tampered {
+        seen: u32,
+    }
+
+    impl Lookup for Tampered {
+        fn value_for(&mut self, _alias: &str) -> Option<String> {
+            self.seen = self.seen.saturating_add(1);
+            None
+        }
+
+        fn tampered(&self) -> u32 {
+            self.seen
+        }
+    }
+
+    /// `proxy/spec.md` section 10: a record whose AAD or tag did not verify ends
+    /// the request with a **503**, and the value behind it is given to the user
+    /// under no circumstances.
+    ///
+    /// What happened instead: the count was written into the event record and the
+    /// provider's answer went back with a 200. A swapped record produced a
+    /// delivered answer and a number in a field nobody reads.
+    #[test]
+    fn a_record_that_failed_verification_ends_the_answer_instead_of_being_counted() {
+        assert!(Gateway::tamper_refusal(0).is_none());
+        let refusal =
+            Gateway::tamper_refusal(1).expect("a record that failed verification was let through");
+        assert_eq!(refusal.status(), 503);
+        assert_eq!(refusal.error(), ProxyError::VaultRecordTamper);
+
+        // And the same rule where it is actually applied, over a lookup that
+        // reports the tamper, so that removing the check from the restore path
+        // and not just from the helper is caught.
+        let gateway = tamper_gateway();
+        let mut book = minter();
+        let alias = book
+            .mint(EntityType::Person, "Ahmet Yilmaz")
+            .expect("a person is minted")
+            .alias;
+        let snapshot = refreshed(&Arc::new(Snapshot::empty()), &book);
+
+        let answer = Answer {
+            status: 200,
+            headers: HeaderList::new().with("content-type", "application/json"),
+            body: serde_json::json!({ "content": alias })
+                .to_string()
+                .into_bytes(),
+            chunks: Vec::new(),
+        };
+        let mut record = gateway.blank_record();
+        let mut lookup = Tampered { seen: 0 };
+        let refusal = gateway
+            .restore_with(&answer, &snapshot, &mut lookup, &mut record, 0)
+            .expect_err("an answer restored against a tampered record was delivered");
+        assert_eq!(refusal.status(), 503);
+        assert_eq!(refusal.error(), ProxyError::VaultRecordTamper);
+        // The count still reaches the event record, because it is a security
+        // event whether or not the request was refused.
+        assert_eq!(record.measured.record_tamper, 1);
+    }
+
+    /// Ö-5: layer A failing to load stops the proxy instead of masking nothing.
+    #[test]
+    fn a_detection_layer_that_did_not_load_refuses_to_start_rather_than_running_empty() {
+        // Both directions, because a rule that always refused would also make
+        // `is_none` true for the shipped build and prove nothing.
+        assert!(Gateway::detection_refusal(true).is_none());
+        let refusal = Gateway::detection_refusal(false)
+            .expect("a build with no pattern layer was allowed to start");
+        assert_eq!(refusal.status(), 503);
+        assert_eq!(refusal.error(), ProxyError::PolicyUnloadable);
+        assert!(refusal.detail().contains("layer A"), "{}", refusal.detail());
+
+        // And the shipped build does load, so the gateway above was buildable
+        // for the reason this claims and not by accident.
+        assert!(crate::detect::pattern::shapes_are_loadable());
+    }
+
+    /// A gateway with nothing behind it, for the rule above.
+    fn tamper_gateway() -> Gateway {
+        use crate::vault::{Backing, OpenRequest, Passphrase, ProfileName, Vault};
+        let vault = Vault::open(&OpenRequest {
+            passphrase: &Passphrase::new(b"an operator's passphrase".to_vec()),
+            profile: ProfileName::Ci,
+            backing: Backing::Memory,
+        })
+        .unwrap_or_else(|refusal| panic!("{refusal}"));
+        let policy = crate::policy::Policy::load(
+            "policy_id = \"acme\"\npolicy_version = \"1\"\n[default]\nmode = \"mask\"\n",
+            std::path::Path::new("."),
+            None,
+        )
+        .unwrap_or_else(|refusal| panic!("{refusal}"));
+        Gateway::new(
+            policy,
+            vault,
+            Arc::new(super::super::upstream::Recorder::ok())
+                as Arc<dyn super::super::upstream::Upstream>,
+            crate::http::AllowList::shipped(),
+            Clock::Fixed(1_700_000_000_000),
+        )
+        .unwrap_or_else(|refusal| panic!("{}", refusal.detail()))
     }
 }

@@ -188,6 +188,37 @@ struct ProxyArgs {
     /// prints a note that the vault is cheaper to attack offline.
     #[arg(long, value_name = "default|ci")]
     vault_profile: Option<String>,
+
+    /// Policy file the proxy serves under. Defaults to `policy.toml` here.
+    ///
+    /// There is no built-in fallback: a masking proxy running under rules nobody
+    /// wrote is what this component exists to argue against, so a policy that is
+    /// missing or unloadable stops the command.
+    #[arg(long, value_name = "PATH")]
+    policy: Option<PathBuf>,
+
+    /// Address to listen on. Defaults to `127.0.0.1:8787`.
+    ///
+    /// A reachable address is refused unless `--allow-external-interface` is also
+    /// given: this build has no per-caller authorisation on the proxy surface.
+    #[arg(long, value_name = "HOST:PORT")]
+    listen: Option<String>,
+
+    /// Accept a bind address that is reachable from outside this host.
+    ///
+    /// Behind the vault keys and the alias table there is no authorisation at
+    /// all, so this hands any host that can route here another user's alias
+    /// scope. It exists because some deployments really mean it.
+    #[arg(long)]
+    allow_external_interface: bool,
+
+    /// Send a provider's traffic somewhere other than its published endpoint.
+    ///
+    /// `--upstream openai=https://gateway.internal.example/v1`. Repeatable. The
+    /// host is added to the connect allow list, because writing it here is as
+    /// explicit as an allow list entry gets, and the run says so on start-up.
+    #[arg(long, value_name = "PROVIDER=URL")]
+    upstream: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -323,34 +354,49 @@ fn run_hook_install(args: &HookInstallArgs) -> ExitCode {
     }
 }
 
-/// Opens the masking vault, and ends without serving anything.
+/// Opens the masking vault and serves the proxy until the process ends.
 ///
-/// Both outcomes exit non zero, which is the honest report of this build: the
-/// vault works and the request path does not exist. A command that exited zero
-/// here would tell a deployment that a masking proxy was running.
+/// Every refusal exits non zero and nothing is forwarded on the way out: this
+/// command either serves under a policy that loaded and a vault that opened, or
+/// it serves nothing at all (`proxy/spec.md` section 10).
 fn run_proxy(args: &ProxyArgs) -> ExitCode {
     let stdin = std::io::stdin();
-    let outcome = proxy::run(
+    let outcome = proxy::prepare(
         &proxy::ProxyRequest {
             vault_profile: args.vault_profile.as_deref(),
+            policy: args.policy.as_deref(),
+            listen: args.listen.as_deref(),
+            allow_external_interface: args.allow_external_interface,
+            upstreams: &args.upstream,
         },
         &mut stdin.lock(),
     );
 
-    match outcome {
-        proxy::ProxyOutcome::VaultOpened { notes } => {
-            for note in &notes {
-                eprintln!("periskop: {note}");
-            }
-            eprintln!("periskop: the vault opened in memory mode; nothing was written to disk.");
-            eprintln!(
-                "periskop: the request path is not built yet, so nothing is listening. No traffic \
-                 is passed through unmasked."
-            );
+    let prepared = match outcome {
+        proxy::ProxyOutcome::Ready(prepared) => *prepared,
+        proxy::ProxyOutcome::Refused { reason } => {
+            eprintln!("periskop: {reason}");
+            return ExitCode::from(exit::ERROR);
         }
-        proxy::ProxyOutcome::Refused { reason } => eprintln!("periskop: {reason}"),
+    };
+
+    for note in &prepared.notes {
+        eprintln!("periskop: {note}");
     }
-    ExitCode::from(exit::ERROR)
+    eprintln!("periskop: the vault opened in memory mode; nothing was written to disk.");
+
+    // Printed from inside `serve`, after the bind, because `--listen 127.0.0.1:0`
+    // is a real thing to ask for and the kernel picks the port. Announcing the
+    // address that was *requested* would be a line that is sometimes false.
+    match proxy::serve(prepared, |address| {
+        eprintln!("periskop: listening on {address}");
+    }) {
+        Ok(()) => ExitCode::from(exit::PASS),
+        Err(reason) => {
+            eprintln!("periskop: {reason}");
+            ExitCode::from(exit::ERROR)
+        }
+    }
 }
 
 fn report_hook_error(error: &HookError) -> ExitCode {

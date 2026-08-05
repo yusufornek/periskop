@@ -164,36 +164,245 @@ fn compiled() -> &'static [Regex] {
 ///
 /// A detector whose expression failed to compile would silently stop detecting
 /// its type, which is the exact failure mode this product exists to expose. The
-/// scan refuses to run in that state rather than under-reporting, and
-/// `detect::merge` turns the refusal into a declared degradation.
+/// scan refuses to run in that state rather than under-reporting.
+///
+/// **Who asks.** `http::gateway::Gateway::new`, before it accepts anything, and
+/// a `false` there stops the proxy from starting. It said `detect::merge` turned
+/// the refusal into a declared degradation, and merge did no such thing: nothing
+/// called this function outside its own test and `DegradedReason` has no value
+/// for it, so one bad edit to one expression produced a proxy that masked
+/// nothing on every request with no header, no event and no error. The
+/// declaration route stayed shut because `proxy-event.schema.json`'s
+/// `degraded_reasons` is a closed dictionary this role does not extend; refusing
+/// to start is the stronger answer anyway, and the request for a declared reason
+/// is filed in `hub/memory/interfaces.md`.
 pub fn shapes_are_loadable() -> bool {
     compiled().len() == detectors().len()
 }
+
+/// What one region of the text yielded, and where scanning resumes.
+struct Admission {
+    /// The candidate's byte range in the whole text.
+    start: usize,
+    end: usize,
+    /// First byte the next search may look at. Never inside an admitted
+    /// candidate, so the walk terminates, and never past a region the gate
+    /// refused only in part, so a second value in the same region is still
+    /// reachable.
+    resume: usize,
+}
+
+/// The longest region the retry walk below is allowed to take apart.
+///
+/// The walk is quadratic in the number of runs inside a region, and the region
+/// comes from text somebody else wrote, so its cost needs a bound that is not the
+/// input's length. Every shape that can actually need the retry sits far below
+/// this: ISO 13616 caps a printed IBAN at 34 characters in 9 groups, ISO/IEC 7812
+/// caps a card at 19 digits in 5, and E.164 caps a phone at 15 digits. A region
+/// longer than this is scanned exactly as before, which is the behaviour this
+/// whole function replaces and therefore no worse than the previous build.
+const RETRY_MAX_BYTES: usize = 128;
+
+/// The most alphanumeric runs the retry walk takes apart in one region.
+///
+/// Bounds the pair walk at `(RETRY_MAX_RUNS + 1)^2`. Nine covers an IBAN's
+/// groups; twelve leaves room without letting a crafted region turn a linear scan
+/// into a quadratic one.
+const RETRY_MAX_RUNS: usize = 12;
 
 /// Scans `text` and returns every candidate layer A stands behind.
 ///
 /// Sorted by [`sort_candidates`], overlaps included: resolving them is
 /// `detect::merge`'s job and doing it here would hide the decision inside a
 /// detector.
+///
+/// # Why this is a walk and not a `find_iter`
+///
+/// Every shape here repeats greedily, so a match runs on past the value and
+/// swallows whatever token comes next: the expiry after a card, the account
+/// holder's name after an IBAN, the second number after the first. The gate then
+/// refuses the over-long string, correctly, and with one pass per match that is
+/// the end of it: `find_iter` has already consumed the region, no shorter reading
+/// is ever tried, and the real value is offered to nobody. It reaches the
+/// provider in full, which is the one outcome this component exists to prevent.
+///
+/// So a refusal is not the end of the region. [`admit_region`] looks for the
+/// **longest** reading inside it that the shape itself accepts and the gate
+/// admits, and the walk then resumes at the end of what was admitted rather than
+/// at the end of the match, so a value sitting in the swallowed tail is still
+/// found. When nothing in the region passes, the region is skipped whole: trying
+/// every offset instead would make the scan quadratic in the length of a prompt
+/// an attacker chooses.
+///
+/// Making the expressions lazy instead would not do: the short reading can be the
+/// wrong one just as easily as the long one, and only the gate knows which.
 pub fn scan(text: &str) -> Vec<Candidate> {
     let mut found = Vec::new();
     if !shapes_are_loadable() {
         return found;
     }
     for (detector, expression) in detectors().iter().zip(compiled()) {
-        for hit in expression.find_iter(text) {
-            let Some((from, to)) = (detector.admit)(hit.as_str()) else {
-                continue;
+        let mut from = 0usize;
+        while from <= text.len() {
+            let Some(hit) = expression.find_at(text, from) else {
+                break;
             };
-            let start = hit.start() + from;
-            let end = hit.start() + to;
-            if end > start && text.is_char_boundary(start) && text.is_char_boundary(end) {
-                found.push(Candidate::new(detector.entity, start, end));
+            let region = hit.start()..hit.end();
+            match admit_region(detector, expression, text, region.clone()) {
+                Some(admission) => {
+                    if text.is_char_boundary(admission.start)
+                        && text.is_char_boundary(admission.end)
+                    {
+                        found.push(Candidate::new(
+                            detector.entity,
+                            admission.start,
+                            admission.end,
+                        ));
+                    }
+                    from = admission.resume.max(region.start.saturating_add(1));
+                }
+                // Nothing in the region is an entity. Past it, not one byte on:
+                // rescanning from the next byte is what turns a crafted prompt
+                // into a quadratic scan of a fail closed component.
+                None => from = region.end.max(region.start.saturating_add(1)),
             }
         }
     }
     sort_candidates(&mut found);
     found
+}
+
+/// Decides what, if anything, one match's region contributes.
+///
+/// The whole match first, because that is the ordinary case and it has to stay
+/// free. Only a refusal pays for the retry walk.
+fn admit_region(
+    detector: &Detector,
+    expression: &Regex,
+    text: &str,
+    region: std::ops::Range<usize>,
+) -> Option<Admission> {
+    let whole = text.get(region.clone())?;
+    if let Some((from, to)) = (detector.admit)(whole) {
+        let start = region.start.checked_add(from)?;
+        let end = region.start.checked_add(to)?;
+        return (end > start).then_some(Admission {
+            start,
+            end,
+            resume: region.end,
+        });
+    }
+
+    let (base, reading) = longest_admitted_reading(detector, expression, whole)?;
+    let (from, to) = (detector.admit)(reading)?;
+    let start = region.start.checked_add(base)?.checked_add(from)?;
+    let end = region.start.checked_add(base)?.checked_add(to)?;
+    (end > start).then_some(Admission {
+        start,
+        end,
+        // The end of the reading, not the end of the region: the tail the shape
+        // swallowed may hold a second value, and the phone case is not
+        // hypothetical.
+        resume: region.start.saturating_add(base + reading.len()),
+    })
+}
+
+/// The longest sub-range of `region` that is both the shape and an entity.
+///
+/// Returns its offset inside `region` and the text itself. Longest first, then
+/// leftmost, so the answer does not depend on the order the walk happens to take.
+///
+/// Two conditions, and the first is what keeps this from inventing entities. A
+/// reading has to be a **whole match of the detector's own expression**, so a
+/// shorter reading is a shorter way of writing the same kind of thing and not an
+/// arbitrary substring that happens to satisfy a checksum. `a_region_where_
+/// nothing_passes_the_gate_is_still_refused` is the test that holds this side.
+fn longest_admitted_reading<'r>(
+    detector: &Detector,
+    expression: &Regex,
+    region: &'r str,
+) -> Option<(usize, &'r str)> {
+    if region.len() > RETRY_MAX_BYTES {
+        return None;
+    }
+    let (starts, ends) = reading_bounds(region)?;
+
+    let mut best: Option<(usize, usize)> = None;
+    for &begin in &starts {
+        for &stop in &ends {
+            if stop <= begin {
+                continue;
+            }
+            let length = stop - begin;
+            // Cheap ordering test before the two expensive ones, so a region
+            // with many bounds does not run the expression once per pair.
+            let improves = best.is_none_or(|(had_begin, had_stop)| {
+                length > had_stop - had_begin
+                    || (length == had_stop - had_begin && begin < had_begin)
+            });
+            if !improves {
+                continue;
+            }
+            let Some(reading) = region.get(begin..stop) else {
+                continue;
+            };
+            if !is_whole_match(expression, reading) {
+                continue;
+            }
+            if (detector.admit)(reading).is_none() {
+                continue;
+            }
+            best = Some((begin, stop));
+        }
+    }
+
+    let (begin, stop) = best?;
+    Some((begin, region.get(begin..stop)?))
+}
+
+/// Where inside a region a shorter reading may begin and end.
+///
+/// The region's own edges plus the edges of every alphanumeric run in it.
+/// Cutting inside a run would produce a different number rather than a shorter
+/// reading of the same one, and a detector that masked `4242 4242 4242 424` would
+/// leave the last digit in the prompt.
+///
+/// `None` when the region has more runs than the walk is allowed to take apart.
+fn reading_bounds(region: &str) -> Option<(Vec<usize>, Vec<usize>)> {
+    let mut starts = vec![0usize];
+    let mut ends = vec![region.len()];
+    let mut runs = 0usize;
+    let mut inside = false;
+    for (index, character) in region.char_indices() {
+        if character.is_alphanumeric() {
+            if !inside {
+                runs += 1;
+                if runs > RETRY_MAX_RUNS {
+                    return None;
+                }
+                starts.push(index);
+                inside = true;
+            }
+        } else if inside {
+            ends.push(index);
+            inside = false;
+        }
+    }
+    starts.sort_unstable();
+    starts.dedup();
+    ends.sort_unstable();
+    ends.dedup();
+    Some((starts, ends))
+}
+
+/// Whether `reading` is a match of `expression` from its first byte to its last.
+///
+/// A partial match means the shape only accepts part of this reading, so the
+/// reading is not a candidate of this type at all.
+fn is_whole_match(expression: &Regex, reading: &str) -> bool {
+    expression
+        .find(reading)
+        .is_some_and(|found| found.start() == 0 && found.end() == reading.len())
 }
 
 /// Trailing bytes that a shape may swallow but an entity does not own.
@@ -595,6 +804,146 @@ mod tests {
         assert!(types_in("teslim 05.08.2026 tarihinde").contains("DATE"));
         assert!(!types_in("sürüm 1.2.3 çıktı").contains("DATE"));
         assert!(!types_in("tarih 31.02.2026 yok").contains("DATE"));
+    }
+
+    // ---- A value with a neighbour beside it (K-1) ------------------------
+    //
+    // The shapes repeat greedily, so a match can swallow the token that follows
+    // the value. When it does, the gate refuses the over-long string, and
+    // without a retry the region is consumed and the real value is never offered
+    // to any detector again. Every assertion below is a leak if it fails: the
+    // value reaches the provider in full.
+
+    #[test]
+    fn a_card_keeps_its_type_when_an_expiry_follows_it() {
+        assert_eq!(
+            spans_of("kart 4242 4242 4242 4242 06 26", EntityType::CreditCard),
+            vec!["4242 4242 4242 4242"]
+        );
+        assert_eq!(
+            spans_of(
+                "kart 4242 4242 4242 4242 06/26 cvc 123",
+                EntityType::CreditCard
+            ),
+            vec!["4242 4242 4242 4242"]
+        );
+        // A neighbour that is itself a long digit run, which is the case a
+        // prefix-only retry would still get wrong.
+        assert_eq!(
+            spans_of("kart 4111 1111 1111 1111 123456", EntityType::CreditCard),
+            vec!["4111 1111 1111 1111"]
+        );
+    }
+
+    #[test]
+    fn an_iban_keeps_its_type_whatever_token_follows_it() {
+        // Four shapes of neighbour: a name, a currency code, a year, and a
+        // second number. All four are swallowed by the IBAN group repetition.
+        for tail in ["AHMET YILMAZ", "TRY", "EUR", "2026", "1234"] {
+            let text = format!("IBAN TR33 0006 1005 1978 6457 8413 26 {tail}");
+            assert_eq!(
+                spans_of(&text, EntityType::Iban),
+                vec!["TR33 0006 1005 1978 6457 8413 26"],
+                "tail `{tail}` swallowed the IBAN"
+            );
+        }
+    }
+
+    #[test]
+    fn two_phone_numbers_written_side_by_side_are_both_found() {
+        // The E.164 alternative runs over separators, so one match covers both
+        // numbers and eighteen digits fail the 7..=15 gate. Both numbers leak.
+        assert_eq!(
+            spans_of("+90 5321234567 05321234567", EntityType::Phone),
+            vec!["+90 5321234567", "05321234567"]
+        );
+    }
+
+    #[test]
+    fn every_shape_still_finds_its_value_with_a_neighbour_beside_it() {
+        // One case per type, so a retry written for one shape is not mistaken
+        // for a retry that works everywhere.
+        let key = crate::detect::sample::stripe_key();
+        // Computed rather than written down, so the fixture cannot drift from
+        // the rule the gate applies.
+        let vkn = format!(
+            "498031220{}",
+            checksum::vkn_check_digit(&[4, 9, 8, 0, 3, 1, 2, 2, 0])
+        );
+        for (text, entity, expected) in [
+            (
+                "TCKN 10000000146 2026".to_owned(),
+                EntityType::Tckn,
+                "10000000146",
+            ),
+            (format!("VKN {vkn} 2026"), EntityType::Vkn, vkn.as_str()),
+            (
+                "kart 4242 4242 4242 4242 06 26".to_owned(),
+                EntityType::CreditCard,
+                "4242 4242 4242 4242",
+            ),
+            (
+                "IBAN TR33 0006 1005 1978 6457 8413 26 TRY".to_owned(),
+                EntityType::Iban,
+                "TR33 0006 1005 1978 6457 8413 26",
+            ),
+            (
+                "mail ali@ornek.com 2026".to_owned(),
+                EntityType::Email,
+                "ali@ornek.com",
+            ),
+            (
+                "bkz https://ornek.com/a 2026".to_owned(),
+                EntityType::Url,
+                "ornek.com",
+            ),
+            (
+                "+90 5321234567 05321234567".to_owned(),
+                EntityType::Phone,
+                "+90 5321234567",
+            ),
+            (
+                "sunucu 8.8.8.8 2026".to_owned(),
+                EntityType::Ipv4,
+                "8.8.8.8",
+            ),
+            (
+                "adres 2606:4700::1111 2026".to_owned(),
+                EntityType::Ipv6,
+                "2606:4700::1111",
+            ),
+            (format!("key {key} 2026"), EntityType::ApiKey, key.as_str()),
+            (
+                "teslim 2026-08-05 2026".to_owned(),
+                EntityType::Date,
+                "2026-08-05",
+            ),
+        ] {
+            let found = spans_of(&text, entity);
+            assert!(
+                found.contains(&expected),
+                "{entity} was lost in `{text}`, found {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_region_where_nothing_passes_the_gate_is_still_refused() {
+        // The other half: the retry may not turn a rejection into a detection.
+        // Without this, "try shorter candidates until one passes" would mask a
+        // prefix of every long digit run in every prompt.
+        assert!(!types_in("numara 10000000147 2026").contains("TCKN"));
+        assert!(!types_in("TR340006100519786457841326 TRY").contains("IBAN"));
+        assert!(!types_in("kart 1234567812345670 06 26").contains("CREDIT_CARD"));
+        assert!(!types_in("localhost 127.0.0.1 2026").contains("IPV4"));
+        assert!(!types_in("tarih 31.02.2026 yok").contains("DATE"));
+        // And the reading has to be the shape, not merely something the gate
+        // tolerates. `admit_phone` measures nothing but a digit count, so a bare
+        // twelve digit run satisfies it; what refuses it is that no phone shape
+        // accepts a run with neither `+` nor a leading `0`. Drop the shape
+        // re-check in `longest_admitted_reading` and this masks long digit runs
+        // as phone numbers in every prompt.
+        assert!(!types_in("Ara +1 23456 789012345678 son").contains("PHONE"));
     }
 
     // ---- The complementarity that keeps aliases out of the scanner -------

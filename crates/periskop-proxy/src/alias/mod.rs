@@ -76,4 +76,4 @@ pub use derive::AliasKey;
 pub use entity::{AliasStyle, EntityType, LadderRung, Minting};
 pub use error::AliasError;
 pub use limits::{l_max_static, l_type_max, L_MAX_STATIC};
-pub use mint::{AliasStats, Minted, Minter, TypeStat, UrlHostAlias};
+pub use mint::{is_alias_shaped, AliasStats, Minted, Minter, TypeStat, UrlHostAlias};

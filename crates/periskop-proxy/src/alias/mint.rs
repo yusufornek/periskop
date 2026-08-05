@@ -335,6 +335,14 @@ impl Minter {
     /// source URL's length, and an unbounded alias is an unbounded streaming
     /// hold. The path and the query are the detection layer's business, entity by
     /// entity.
+    ///
+    /// This is the entry point for a caller holding a whole URL, which is where
+    /// the P-0 gate reads it from. The masking pass does **not** come through
+    /// here: detection layer A narrows a `URL` candidate to the host bytes
+    /// before anything is minted, so it already has the span this function would
+    /// go and compute, and it reaches the same generator through
+    /// [`EntityType::minted_as`]. One generator, two entry points, and neither
+    /// parses a URL the other has already parsed.
     pub fn mint_url_host(&mut self, url: &str) -> Result<UrlHostAlias, AliasError> {
         let (host_start, host_end) = rung_r::host_span(url).ok_or(AliasError::HostNotFound)?;
         let host = url
@@ -360,6 +368,42 @@ impl Minter {
 
         self.stats.fold(entity, rendered.rung);
     }
+}
+
+/// Whether a literal reads as a string this build's generators could hand out.
+///
+/// This is the question [`Minter::reserve_literal`]'s caller has to ask, and it
+/// is asked here rather than at the call site so that the answer cannot drift
+/// from the generators that produce the strings. It used to be asked as
+/// `word.starts_with("PSK_")`, which is the **opaque** style's shape: under the
+/// default `type-preserving` style no alias begins with `PSK_`, so nothing was
+/// ever withheld and the mechanism ADR-010 section 6 calls the second link of
+/// the protection chain was dead in the shipped configuration. A user who wrote
+/// `PERSON_1` in their own sentence got that string handed to a real person, and
+/// the response path then resolved the user's own words into somebody's name.
+///
+/// Two shapes, and no more. `PSK_...` covers the opaque style whole. The label
+/// rung covers `PERSON_1`, `ORG_2`, `LOC_3` and `ADDRESS_4`, and the tag has to
+/// be a type that actually mints a label, so `HTTP_2` and `TOTAL_5` in an
+/// ordinary sentence stay in the pool. The remaining type-preserving aliases are
+/// deliberately **not** here: a `.invalid` host, a TEST-NET address or a card
+/// from the published pool cannot be told from a value a user meant, and
+/// withholding those would take real values out of the pool instead of masking
+/// them.
+pub fn is_alias_shaped(word: &str) -> bool {
+    if opaque::is_opaque(word) {
+        return true;
+    }
+    // From the right: `CREDIT_CARD_1` splits at the wrong underscore otherwise,
+    // and a tag with an underscore in it is the case that would be missed.
+    let Some((tag, index)) = word.rsplit_once('_') else {
+        return false;
+    };
+    if index.is_empty() || !index.chars().all(|character| character.is_ascii_digit()) {
+        return false;
+    }
+    EntityType::from_tag(tag)
+        .is_some_and(|entity| matches!(entity.minting(), Minting::EntersAt(LadderRung::Label)))
 }
 
 /// How weak a rung's evidence is: higher is weaker.

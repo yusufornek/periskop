@@ -207,6 +207,27 @@ impl EntityType {
         }
     }
 
+    /// The type whose generator actually produces this type's alias.
+    ///
+    /// Itself for every type but one, and the exception is the reason this
+    /// function exists rather than a `match` at the call site. `URL` is not
+    /// aliased as a whole (`proxy/spec.md` section 4.4, ADR-010 section 2): only
+    /// its host component is, under [`Self::Host`]. Detection layer A already
+    /// narrows a `URL` candidate to the host bytes, so the value that reaches the
+    /// minter **is** a host and the alias it gets is a host alias. Without this
+    /// redirection the masking pass handed `URL` to a generator that refuses it,
+    /// and every prompt carrying a link came back as a `400`.
+    ///
+    /// `DATE` maps to itself and therefore still refuses, which is the point: this
+    /// redirects the one type that has somewhere to go, it does not quietly make
+    /// every type mintable.
+    pub const fn minted_as(self) -> Self {
+        match self.minting() {
+            Minting::HostComponent => Self::Host,
+            Minting::EntersAt(_) | Minting::NotMinted => self,
+        }
+    }
+
     /// The rung a value of this type may enter the ladder at, if it mints at all.
     pub const fn entry_rung(self) -> Option<LadderRung> {
         match self.minting() {

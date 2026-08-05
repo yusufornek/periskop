@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use crate::alias::mint::{AliasStats, Minted, Reservation};
-use crate::alias::{AliasKey, EntityType, LadderRung, Minter};
+use crate::alias::{AliasKey, EntityType, Minter};
 use crate::detect::segment::{segments, SegmentKind};
 use crate::detect::{
     merge, owning_layer, pattern, Candidate, DegradedReason, Detection, DetectionLayer,
@@ -145,9 +145,10 @@ pub fn mask(pass: &mut Pass<'_>, body: &Value) -> Result<Masked, Refusal> {
     degraded.sort_unstable();
     degraded.dedup();
 
+    let sent = rewrite(body, &replacements)?;
     let after = pass.minter.stats();
     Ok(Masked {
-        body: rewrite(body, &replacements),
+        body: sent,
         masked_entities: tally.minted,
         degraded,
         by_type: tally.masked_by_type(),
@@ -191,11 +192,21 @@ struct Tally {
 }
 
 impl Tally {
-    fn masked(&mut self, entity: EntityType, rung: LadderRung, reused: bool) {
+    /// Counts one occurrence replaced.
+    ///
+    /// Two types, and they are the same one everywhere except `URL`. `detected`
+    /// is what layer A claimed, and it is what `entities_masked[]` carries so the
+    /// record names the layer that actually found it. `minted.entity_type` is
+    /// what the alias came from, and it is what `alias_stats.by_type` carries so
+    /// a rung is reported for the generator that produced it. A URL's host is
+    /// found as a `URL` and aliased as a `HOST`; collapsing the two would either
+    /// credit the dictionary with a pattern layer find or claim a rung for a
+    /// generator this build does not have.
+    fn masked(&mut self, detected: EntityType, minted: &Minted) {
         self.minted = self.minted.saturating_add(1);
-        *self.masked.entry(entity).or_insert(0) += 1;
-        if !reused {
-            self.aliases.fold(entity, rung);
+        *self.masked.entry(detected).or_insert(0) += 1;
+        if !minted.reused {
+            self.aliases.fold(minted.entity_type, minted.rung);
         }
     }
 
@@ -303,8 +314,25 @@ fn apply(
                 candidate.entity,
             ),
         );
+        // A candidate whose range does not read back is a detector that produced
+        // a range off a character boundary or past the end. `continue` was a leak
+        // in the shape of a shrug: a layer said "there is an entity here", the
+        // pass silently agreed to leave it in the body, and nothing counted it,
+        // declared it or logged it. Refusing is the only answer that keeps the
+        // record true, and it is a fault in this build rather than in the
+        // request, which is the class `alias_error_class` already puts under
+        // `alias_collision_unresolved`.
         let Some(original) = candidate.text_of(text) else {
-            continue;
+            return Err(Refusal::new(
+                ProxyError::AliasCollisionUnresolved,
+                format!(
+                    "a {} candidate at {}..{} does not read back as text, so this build cannot \
+                     mask it and will not send it",
+                    candidate.entity.tag(),
+                    candidate.start,
+                    candidate.end
+                ),
+            ));
         };
 
         match decision.mode {
@@ -326,7 +354,7 @@ fn apply(
             Mode::Mask => {
                 let minted = mint_and_file(pass, candidate.entity, original)?;
                 out.replace_range(candidate.start..candidate.end, &minted.alias);
-                tally.masked(candidate.entity, minted.rung, minted.reused);
+                tally.masked(candidate.entity, &minted);
             }
         }
     }
@@ -406,9 +434,13 @@ fn mint_and_file(
     entity: EntityType,
     original: &str,
 ) -> Result<Minted, Refusal> {
+    // `minted_as` is what makes a `URL` candidate mintable: layer A hands over
+    // the host bytes, so the generator asked for is the host generator. Written
+    // as a redirection on the type rather than a branch here, so that a second
+    // caller cannot forget it.
     let minted = pass
         .minter
-        .mint(entity, original)
+        .mint(entity.minted_as(), original)
         .map_err(|refusal| Refusal::new(alias_error_class(&refusal), refusal.to_string()))?;
 
     pass.vault.store_alias(
@@ -449,10 +481,19 @@ fn alias_error_class(refusal: &crate::alias::AliasError) -> ProxyError {
 
 /// Withholds any string the user wrote that is already shaped like one of our
 /// aliases.
+///
+/// What counts as "shaped like one of ours" is [`crate::alias::is_alias_shaped`]
+/// and not a prefix test written here. It used to be `starts_with("PSK_")`,
+/// which is the opaque style's shape alone: in the default `type-preserving`
+/// style no alias starts with `PSK_`, so this loop withheld nothing at all and
+/// ADR-010 section 6's second protection link was dead in the shipped
+/// configuration.
 fn reserve_alias_literals(minter: &mut Minter, text: &str) {
     for word in text.split(|c: char| c.is_whitespace() || c == '"' || c == ',') {
         let word = word.trim_matches(|c: char| c == '.' || c == ';' || c == ':');
-        if word.starts_with("PSK_") && minter.reserve_literal(word) == Reservation::Withheld {
+        if crate::alias::is_alias_shaped(word)
+            && minter.reserve_literal(word) == Reservation::Withheld
+        {
             // Withheld. Nothing to do here: the reservation is the effect, and
             // `Minter` will not hand this string to a value later in the session.
         }
@@ -460,63 +501,91 @@ fn reserve_alias_literals(minter: &mut Minter, text: &str) {
 }
 
 /// Rebuilds the body with the masked strings put back at their paths.
-fn rewrite(body: &Value, replacements: &[(Vec<Step>, String)]) -> Value {
+///
+/// Refuses rather than skipping a replacement it cannot write, and the refusal is
+/// the whole point of the return type. A masking decision that is made, minted,
+/// filed in the vault, counted in `entities_masked[]` and then not applied is two
+/// failures at once: the value reaches the provider, and the response says it did
+/// not. The second is worse than the first, because it is what tells the operator
+/// to stop looking.
+fn rewrite(body: &Value, replacements: &[(Vec<Step>, String)]) -> Result<Value, Refusal> {
     let mut out = body.clone();
     for (path, text) in replacements {
-        set_at(&mut out, path, Value::String(text.clone()));
+        if !set_at(&mut out, path, Value::String(text.clone())) {
+            return Err(Refusal::new(
+                ProxyError::BodyUnparsable,
+                format!(
+                    "a masked value could not be written back at {}",
+                    render_path(path)
+                ),
+            ));
+        }
     }
-    out
+    Ok(out)
 }
 
-/// Writes one value at a path, doing nothing if the path is not there.
+/// Writes one value at a path, descending into a nested JSON document when the
+/// path goes below the string that carries one.
 ///
-/// A path that has gone missing means the body changed under us, which cannot
-/// happen here: the paths were read from this same document a few lines above.
-/// Written as a no-op rather than an error so that this function is total.
-fn set_at(body: &mut Value, path: &[Step], value: Value) {
-    let Some((last, leading)) = path.split_last() else {
+/// Returns whether the write happened, and every caller has to look: the previous
+/// version returned nothing and treated a path it could not walk as a no-op, on
+/// the reasoning that the paths were read from this same document a few lines
+/// above. They were, but not all of them address a slot in it. Spec section 7
+/// rule 3 descends **one level** into a string that parses as JSON, and
+/// `string_values` reports the nested document's paths under the outer string's
+/// path. So `messages[0].content.to` is a real path over a real value, and the
+/// old walk arrived at `content`, found a `Value::String` where it wanted an
+/// object, and stopped. An address written as `ahmet@acme.com` is invisible
+/// to the outer scan and visible to the nested one, so it was minted, filed,
+/// counted, and then left in the body verbatim.
+///
+/// Descending means re-encoding the nested document, which is what the outer body
+/// gets anyway on its way to the provider, so it introduces no ordering or
+/// escaping difference that was not already there.
+fn set_at(body: &mut Value, path: &[Step], value: Value) -> bool {
+    let Some((step, rest)) = path.split_first() else {
         *body = value;
-        return;
+        return true;
     };
 
-    let mut cursor = body;
-    for step in leading {
-        cursor = match step {
-            Step::Key(key) => match cursor.get_mut(key) {
-                Some(next) => next,
-                None => return,
-            },
-            Step::Index(index) => match cursor.get_mut(index) {
-                Some(next) => next,
-                None => return,
-            },
-            // `string_values` never yields a wildcard: it walks a concrete
-            // document, so every index it reports is a real one.
-            Step::AnyIndex => return,
-        };
+    // Steps left over a string: the scan descended here, so the write does too.
+    if let Value::String(carrier) = body {
+        return set_in_nested(carrier, path, value);
     }
 
-    match last {
-        Step::Key(key) => {
-            if let Some(slot) = cursor.get_mut(key) {
-                // Only when the slot still holds a string. A path that now points
-                // at an object is a path into a nested JSON document that was
-                // descended one level (spec section 7 rule 3), and its parent
-                // string is what carries the masked text.
-                if slot.is_string() {
-                    *slot = value;
-                }
-            }
-        }
-        Step::Index(index) => {
-            if let Some(slot) = cursor.get_mut(index) {
-                if slot.is_string() {
-                    *slot = value;
-                }
-            }
-        }
-        Step::AnyIndex => {}
+    let slot = match step {
+        Step::Key(key) => body.get_mut(key),
+        Step::Index(index) => body.get_mut(*index),
+        // `string_values` never yields a wildcard: it walks a concrete document,
+        // so every index it reports is a real one.
+        Step::AnyIndex => None,
+    };
+    slot.is_some_and(|next| set_at(next, rest, value))
+}
+
+/// Writes into the JSON document a string carries, and re-encodes it.
+///
+/// `false` when the string is no longer a document the write can be applied to,
+/// which is a refusal upstream rather than a shrug: the alternative is the silent
+/// no-op this function exists to replace.
+fn set_in_nested(carrier: &mut String, path: &[Step], value: Value) -> bool {
+    let Ok(mut nested) = serde_json::from_str::<Value>(carrier) else {
+        return false;
+    };
+    // The same test `string_values` applied on the way down. A bare number or
+    // string is not a document, and descending into one would rewrite the
+    // carrier as something the user did not send.
+    if !(nested.is_object() || nested.is_array()) {
+        return false;
     }
+    if !set_at(&mut nested, path, value) {
+        return false;
+    }
+    let Ok(encoded) = serde_json::to_string(&nested) else {
+        return false;
+    };
+    *carrier = encoded;
+    true
 }
 
 fn render_path(path: &[Step]) -> String {
@@ -897,6 +966,184 @@ mod tests {
         let sent = masked.body["messages"][0]["content"].as_str().unwrap_or("");
         assert!(!sent.contains(&iban()), "{sent}");
         assert!(sent.contains("account"), "the structure was lost: {sent}");
+    }
+
+    /// A prompt with a URL in it (K-2).
+    ///
+    /// Layer A narrows a `URL` candidate to its host bytes, and `EntityType::Url`
+    /// mints nothing of its own, so the mint refused and the refusal became an
+    /// `endpoint_unsupported` **400**. Under the shortest policy the loader
+    /// accepts, every prompt carrying a link was rejected, which is most prompts
+    /// a developer writes.
+    #[test]
+    fn a_prompt_with_a_url_in_it_is_served_and_only_the_host_is_aliased() {
+        let policy = policy("");
+        let body =
+            json!({"messages": [{"role": "user", "content": "see https://example.com/docs"}]});
+        let (masked, mut vault) = run(&policy, &body);
+
+        let sent = masked.body["messages"][0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(!sent.contains("example.com"), "the host crossed: {sent}");
+        // Spec section 4.4: the path keeps its structure, so entities inside it
+        // are still masked in their own types rather than swallowed by a URL.
+        assert!(sent.contains("/docs"), "the path was rewritten: {sent}");
+        assert!(
+            sent.contains("https://"),
+            "the scheme was rewritten: {sent}"
+        );
+        assert_eq!(masked.masked_entities, 1);
+
+        // The alias is a host alias and the vault holds the host under it.
+        let alias = sent
+            .trim_end_matches("/docs")
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        let Restored::Value(value) = vault.restore(&SESSION, &alias, NOW).unwrap() else {
+            panic!("the vault does not hold the alias that was sent: {alias}");
+        };
+        assert_eq!(value.expose(), b"example.com");
+
+        // What the record says: found by layer A as a `URL`, aliased as a `HOST`.
+        // Reporting `HOST` on both sides would name the dictionary as the layer
+        // that found it, and reporting `URL` on both would claim an alias
+        // generator this build does not have.
+        assert_eq!(masked.by_type.len(), 1, "{:?}", masked.by_type);
+        assert_eq!(masked.by_type[0].entity, EntityType::Url);
+        assert_eq!(masked.by_type[0].layer, DetectionLayer::Pattern);
+        assert!(
+            masked.alias_stats.by_type.contains_key(&EntityType::Host),
+            "{:?}",
+            masked.alias_stats.by_type
+        );
+    }
+
+    /// The nested write that never happened, and reported that it had.
+    ///
+    /// `@` is `@`. The outer string carries the escape, so layer A's e-mail
+    /// shape finds nothing there; the descent into the nested document
+    /// (`string_values`, spec section 7 rule 3) sees the decoded `@` and finds
+    /// the address. It was minted, filed in the vault and counted. Then the write
+    /// walked `messages[0].content.to`, found a `Value::String` where it wanted
+    /// an object, answered `None` and did nothing at all. The address crossed to
+    /// the provider under a response header saying one entity had been masked,
+    /// which is worse than the leak on its own: it tells the operator to stop
+    /// looking.
+    #[test]
+    fn an_entity_hidden_by_json_escaping_is_written_back_and_not_merely_counted() {
+        let policy = policy("");
+        let inner = "{\"to\":\"ahmet\\u0040acme.com\"}";
+        let body = json!({"messages": [{"role": "user", "content": inner}]});
+
+        let (masked, mut vault) = run(&policy, &body);
+        let sent = masked.body["messages"][0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            !sent.contains("acme.com"),
+            "the address crossed to the provider: {sent}"
+        );
+
+        // What went instead is a nested document with the alias in it, so the
+        // provider still sees the structure the user sent.
+        let rewritten: Value = serde_json::from_str(&sent).unwrap_or_else(|error| {
+            panic!("the nested document stopped being JSON: {error}: {sent}")
+        });
+        let alias = rewritten["to"].as_str().unwrap_or_default().to_owned();
+        assert!(!alias.is_empty(), "{sent}");
+
+        // And the count is true: the vault holds the original under that alias.
+        assert_eq!(masked.masked_entities, 1);
+        let Restored::Value(value) = vault.restore(&SESSION, &alias, NOW).unwrap() else {
+            panic!("the vault does not hold the alias that was sent: {alias}");
+        };
+        assert_eq!(value.expose(), b"ahmet@acme.com");
+    }
+
+    /// The other half of the same rule, held directly.
+    ///
+    /// The masking pass builds its paths out of the document it writes to, so it
+    /// cannot produce the ones below. What this test holds is that a write which
+    /// does not happen **says so**, because the moment it answers `true` by
+    /// default the silent no-op is back and no request level test would show it.
+    #[test]
+    fn a_write_that_cannot_be_applied_reports_it_rather_than_shrugging() {
+        let mut body = json!({"messages": [{"content": "not a document"}]});
+        let into_a_plain_string = vec![
+            Step::Key("messages".to_owned()),
+            Step::Index(0),
+            Step::Key("content".to_owned()),
+            Step::Key("to".to_owned()),
+        ];
+        assert!(!set_at(
+            &mut body,
+            &into_a_plain_string,
+            Value::String("ALIAS".to_owned())
+        ));
+        assert_eq!(body["messages"][0]["content"], json!("not a document"));
+
+        let nowhere = vec![Step::Key("absent".to_owned())];
+        assert!(!set_at(
+            &mut body,
+            &nowhere,
+            Value::String("ALIAS".to_owned())
+        ));
+
+        // And the write that can be applied still answers `true`, so the flag is
+        // not simply "no".
+        let real = vec![
+            Step::Key("messages".to_owned()),
+            Step::Index(0),
+            Step::Key("content".to_owned()),
+        ];
+        assert!(set_at(&mut body, &real, Value::String("ALIAS".to_owned())));
+        assert_eq!(body["messages"][0]["content"], json!("ALIAS"));
+    }
+
+    /// The withholding that was dead in the shipped configuration (Ö-6).
+    ///
+    /// `reserve_alias_literals` filtered on `PSK_`, which only the **opaque**
+    /// alias style produces. Under the default `type-preserving` style nothing
+    /// was ever withheld, so a user who wrote `PERSON_1` in their own sentence
+    /// had that exact string handed to the next real person masked, and the
+    /// response path then resolved the user's own words into somebody's name.
+    /// `alias::mint`'s own module documentation says this mechanism prevents
+    /// precisely that.
+    #[test]
+    fn a_label_the_user_wrote_is_withheld_in_the_default_alias_style() {
+        let mut vault = vault();
+        let mut book = minter(&mut vault);
+
+        reserve_alias_literals(&mut book, "PERSON_1 kim? Ahmet ile konus.");
+        assert!(
+            !book.is_free("PERSON_1"),
+            "a label the user wrote is still free to be handed to a value"
+        );
+        let minted = book
+            .mint(EntityType::Person, "Ahmet Yilmaz")
+            .unwrap_or_else(|refusal| panic!("{refusal}"));
+        assert_ne!(
+            minted.alias, "PERSON_1",
+            "the user's own string was given to a person"
+        );
+
+        // The opaque style's shape is still withheld, so this widened rather
+        // than moved.
+        reserve_alias_literals(&mut book, "bkz PSK_PERSON_0123456789abcdef.");
+        assert!(!book.is_free("PSK_PERSON_0123456789abcdef"));
+
+        // And an ordinary word that merely looks like a label is not withheld.
+        // Reserving those would shrink the pool for nothing, and every string
+        // taken out is a name a real value cannot have.
+        reserve_alias_literals(&mut book, "HTTP_2 traffic, TOTAL_5 items, PERSON_x");
+        assert!(book.is_free("HTTP_2"));
+        assert!(book.is_free("TOTAL_5"));
+        assert!(book.is_free("PERSON_x"));
     }
 
     #[test]

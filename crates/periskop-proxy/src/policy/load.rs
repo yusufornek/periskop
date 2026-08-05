@@ -576,11 +576,36 @@ fn string_of<'d>(
     document: &'d Map<String, Value>,
     key: &str,
 ) -> Result<Option<&'d str>, PolicyError> {
-    match document.get(key) {
+    string_at(document, key, key)
+}
+
+/// Reads an optional string, refusing a value of any other type.
+///
+/// # Why "absent" and "not a string" may not be the same answer
+///
+/// Every optional key in this file has a default, and every one of those
+/// defaults is the **widest** reading available: no `entity` means the rule
+/// covers every type, no `scope` means it covers every path. So a reader that
+/// answers `None` for a value it merely failed to understand does not fall back,
+/// it *widens*, and an operator who wrote `entity = ["IBAN", "TCKN"]` got a
+/// policy that loaded clean and applied their `allow` to everything. Section 7
+/// of `proxy-policy.md` requires the load to stop instead, and this function is
+/// where that happens for the string valued keys.
+///
+/// `key` indexes the table; `label` is what the operator wrote in the file,
+/// which for a rule carries its index. Splitting the two matters: an error that
+/// says `entity` rather than `rule[2].entity` sends the operator to the wrong
+/// line of a policy with several rules.
+fn string_at<'d>(
+    table: &'d Map<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<Option<&'d str>, PolicyError> {
+    match table.get(key) {
         None => Ok(None),
         Some(Value::String(text)) => Ok(Some(text.as_str())),
         Some(other) => Err(PolicyError::UnknownValue {
-            key: key.to_owned(),
+            key: label.to_owned(),
             value: other.to_string(),
             expected: "a string",
         }),
@@ -628,8 +653,12 @@ fn read_rules(value: Option<&Value>) -> Result<Vec<Rule>, PolicyError> {
             &format!("rule[{index}]."),
         )?;
         let mode = mode_of(table.get("mode"), &format!("rule[{index}].mode"))?;
+        // Both keys go through `string_at` rather than `and_then(Value::as_str)`,
+        // and the difference is not cosmetic: the two defaults below are the
+        // widest readings this loader has, so treating a value it did not
+        // understand as an absent one relaxes the rule instead of refusing it.
         let entity =
-            match table.get("entity").and_then(Value::as_str) {
+            match string_at(table, "entity", &format!("rule[{index}].entity"))? {
                 None => None,
                 Some(tag) => Some(EntityType::from_tag(tag).ok_or_else(|| {
                     PolicyError::UnknownEntityType {
@@ -638,7 +667,7 @@ fn read_rules(value: Option<&Value>) -> Result<Vec<Rule>, PolicyError> {
                     }
                 })?),
             };
-        let scope = match table.get("scope").and_then(Value::as_str) {
+        let scope = match string_at(table, "scope", &format!("rule[{index}].scope"))? {
             None => Scope::everything(),
             Some(path) => Scope::parse(path).ok_or_else(|| PolicyError::UnknownValue {
                 key: format!("rule[{index}].scope"),
@@ -688,13 +717,29 @@ fn read_detection(document: &Map<String, Value>) -> Result<(), PolicyError> {
     // 1 says so) and `enabled = true` is a load failure, not a downgrade: running
     // `pattern+dictionary` while the operator believes names are being detected
     // is the failure this whole section exists to prevent.
-    if ner.get("enabled") == Some(&Value::Bool(true)) {
-        return Err(PolicyError::RecognisedButUnimplemented {
-            key: "detection.ner.enabled",
-            value: "true".to_owned(),
-            boundary: "milestones.md F4 scope boundary 1",
-            would_have_been: "false",
-        });
+    //
+    // Matched on the type and not compared against one value, because
+    // `== Some(&Value::Bool(true))` refuses exactly one spelling and accepts
+    // every other: `enabled = "true"` and `enabled = 1` are what an operator
+    // writes when they mean it, and both used to load in silence with names
+    // going out unmasked. `dictionary.required` below is the pattern.
+    match ner.get("enabled") {
+        None | Some(Value::Bool(false)) => {}
+        Some(Value::Bool(true)) => {
+            return Err(PolicyError::RecognisedButUnimplemented {
+                key: "detection.ner.enabled",
+                value: "true".to_owned(),
+                boundary: "milestones.md F4 scope boundary 1",
+                would_have_been: "false",
+            })
+        }
+        Some(other) => {
+            return Err(PolicyError::UnknownValue {
+                key: "detection.ner.enabled".to_owned(),
+                value: other.to_string(),
+                expected: "true | false",
+            })
+        }
     }
     if let Some(threshold) = ner.get("threshold") {
         let ok = threshold.as_f64().is_some_and(|v| (0.0..=1.0).contains(&v));
@@ -890,7 +935,7 @@ fn read_dictionary(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -999,6 +1044,84 @@ mode = "mask"
                 .date_policy(),
             DatePolicy::Block
         );
+        assert!(load(&with("[detection.ner]\nenabled = false")).is_ok());
+    }
+
+    /// K-3: the fail-open that turned all masking off without saying a word.
+    ///
+    /// `.and_then(Value::as_str)` folded "absent" and "present but not a string"
+    /// into one answer, and that answer was the **widest** one available: a
+    /// missing `entity` means every type, a missing `scope` means every path. So
+    /// an operator who wrote the natural thing, a list, got a policy that loaded
+    /// clean, applied `allow` to every type at every path, and beat
+    /// `[default] mode = "mask"`. Every rule below is written as an operator
+    /// would plausibly write it.
+    #[test]
+    fn row_3_a_rule_key_of_the_wrong_type_stops_the_load_instead_of_widening_the_rule() {
+        for written in [
+            "[[rule]]\nentity = [\"IBAN\", \"TCKN\"]\nmode = \"allow\"",
+            "[[rule]]\nentity = true\nmode = \"allow\"",
+            "[[rule]]\nentity = \"IBAN\"\nscope = [\"messages[0].content\"]\nmode = \"allow\"",
+            "[[rule]]\nscope = 1\nmode = \"allow\"",
+        ] {
+            let error = load(&with(written))
+                .err()
+                .unwrap_or_else(|| panic!("this loaded and widened itself:\n{written}"));
+            assert!(
+                matches!(error, PolicyError::UnknownValue { .. }),
+                "{written} produced {error}"
+            );
+            assert_eq!(error.header_value(), "policy_unloadable");
+            // The message has to name the rule, not just the key: a policy with
+            // several rules and an error that says `entity` sends the operator
+            // to the wrong line.
+            assert!(
+                error.to_string().contains("rule[0]."),
+                "the error does not name the rule: {error}"
+            );
+        }
+
+        // And the correctly written forms still load, so the refusal is about
+        // the type of the value and not about the key existing.
+        let narrow = load(&with(
+            "[[rule]]\nentity = \"IBAN\"\nscope = \"messages[0].content\"\nmode = \"allow\"",
+        ))
+        .unwrap();
+        assert_eq!(narrow.rules().len(), 1);
+        assert_eq!(narrow.rules()[0].entity, Some(EntityType::Iban));
+    }
+
+    /// Ö-4, the same class one table over.
+    ///
+    /// `== Some(&Value::Bool(true))` refuses exactly one spelling. `enabled =
+    /// "true"` and `enabled = 1` are what an operator writes when they mean it,
+    /// and both were accepted in silence while the run stayed
+    /// `pattern+dictionary`. Section 7.1 asks for the load to stop.
+    /// `dictionary.required` already does it this way.
+    #[test]
+    fn row_4_ner_enabled_is_refused_unless_it_is_the_boolean_false() {
+        for written in [
+            "\"true\"",
+            "\"false\"",
+            "1",
+            "0",
+            "[true]",
+            "{ value = true }",
+        ] {
+            let error = load(&with(&format!("[detection.ner]\nenabled = {written}")))
+                .err()
+                .unwrap_or_else(|| panic!("`enabled = {written}` was accepted in silence"));
+            assert!(
+                matches!(error, PolicyError::UnknownValue { .. }),
+                "`enabled = {written}` produced {error}"
+            );
+        }
+        // The boolean `true` keeps its own, distinguishable class: it is a value
+        // this build recognises and has not implemented, which is a different
+        // sentence to the operator than "that is not a boolean".
+        let recognised = load(&with("[detection.ner]\nenabled = true")).unwrap_err();
+        assert!(recognised.is_unimplemented_value());
+        // And the one value F4 did write still loads.
         assert!(load(&with("[detection.ner]\nenabled = false")).is_ok());
     }
 
