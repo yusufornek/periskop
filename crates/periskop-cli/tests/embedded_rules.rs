@@ -38,11 +38,35 @@ impl Elsewhere {
     }
 
     /// Copies the built executable in, the way a release archive is unpacked.
+    ///
+    /// The copy is flushed and closed before anybody tries to run it. Linux
+    /// refuses to execute a file that any process still holds open for writing
+    /// (`ETXTBSY`, "text file busy"), and these tests run in parallel with
+    /// others that fork, so a descriptor still open here becomes a failure to
+    /// exec over there. macOS does not enforce that rule, which is why the first
+    /// version passed on the development machine and failed on both Linux jobs.
     fn install_binary(&self) -> PathBuf {
         let installed = self
             .root
             .join(format!("periskop{}", std::env::consts::EXE_SUFFIX));
-        std::fs::copy(env!("CARGO_BIN_EXE_periskop"), &installed).expect("the executable");
+
+        let mut source =
+            std::fs::File::open(env!("CARGO_BIN_EXE_periskop")).expect("the built executable");
+        let mut target = std::fs::File::create(&installed).expect("a place to put it");
+        std::io::copy(&mut source, &mut target).expect("the copy");
+        target.sync_all().expect("the copy on disk");
+        drop(target);
+
+        // `File::create` does not carry the source's mode, and an executable
+        // that is not executable is a different test failure with a confusing
+        // message.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755))
+                .expect("the executable bit");
+        }
+
         installed
     }
 
@@ -60,15 +84,39 @@ impl Drop for Elsewhere {
 /// A call the shipped Python rules confirm.
 const PYTHON_EGRESS: &str = "from openai import OpenAI\n\nclient = OpenAI()\n\n\ndef ask(record):\n    return client.chat.completions.create(model=\"gpt-4\", messages=[{\"content\": record}])\n";
 
+/// Runs a prepared command, waiting out the one failure that is about the
+/// machine rather than the program.
+///
+/// A copied executable can be refused with `ETXTBSY` while any process still
+/// holds it open for writing, and the window that matters is not this test's
+/// own: between a sibling test's `fork` and its `exec`, the child briefly holds
+/// every descriptor this process had, and closing on exec does not help inside
+/// that gap. Nothing about the product is being measured here, so the answer is
+/// to try again rather than to fail. It is bounded, and running out of attempts
+/// is still a failure.
+fn run_once_it_is_runnable<T>(mut attempt: impl FnMut() -> std::io::Result<T>) -> T {
+    for _ in 0..50 {
+        match attempt() {
+            Ok(value) => return value,
+            Err(error) if error.raw_os_error() == Some(26) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(error) => panic!("the command did not start: {error}"),
+        }
+    }
+    panic!("the copied executable stayed busy for a second, which is not a timing problem");
+}
+
 fn scan_json(binary: &Path, working_directory: &Path, extra: &[&str]) -> (i32, String, String) {
-    let output = Command::new(binary)
-        .arg("scan")
-        .arg(".")
-        .arg("--json")
-        .args(extra)
-        .current_dir(working_directory)
-        .output()
-        .expect("the scan ran");
+    let output = run_once_it_is_runnable(|| {
+        Command::new(binary)
+            .arg("scan")
+            .arg(".")
+            .arg("--json")
+            .args(extra)
+            .current_dir(working_directory)
+            .output()
+    });
     (
         output.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -138,15 +186,16 @@ fn serve_rpc(
     extra: &[&str],
     requests: &str,
 ) -> (i32, String, String) {
-    let mut child = Command::new(binary)
-        .arg("serve-rpc")
-        .args(extra)
-        .current_dir(working_directory)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the bridge started");
+    let mut child = run_once_it_is_runnable(|| {
+        Command::new(binary)
+            .arg("serve-rpc")
+            .args(extra)
+            .current_dir(working_directory)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    });
     child
         .stdin
         .take()
