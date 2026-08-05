@@ -27,12 +27,34 @@
 //! the positions the compiler accepts it in, so a comment quoting one of those
 //! forms would be a false positive. That is the right direction to be wrong in,
 //! since the alternative is a check that misses what it exists to catch.
+//!
+//! # What the scan covers, and why it is not `src/` alone
+//!
+//! It used to read `src/` and nothing else, which left two files inside the
+//! crate boundary that the grant applies to and the check could not see:
+//! `build.rs`, which runs on the machine doing the building, and everything
+//! under `tests/`. Neither is `src/syscall.rs`, so neither is allowed the
+//! exception, and neither was being checked for it. The scan now walks the whole
+//! package.
+//!
+//! That widening is the reason the patterns below are assembled at run time
+//! instead of being written out as literals. A scanner that contains the exact
+//! text it searches for reports itself the moment it starts reading its own
+//! directory, and the usual answer to that is to exempt the scanner, which puts
+//! a hole in the middle of the boundary. Building the forms from a keyword and a
+//! list of tails leaves no literal in this file, so it is scanned like every
+//! other file in the package and gets no exemption at all.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The module ADR-014 §5 names as the only place the exception may be used.
-const DESIGNATED_MODULE: &str = "syscall.rs";
+/// The module ADR-014 §5 names as the only place the exception may be used,
+/// relative to the package root.
+///
+/// A path rather than a file name: a bare `syscall.rs` matched anywhere in the
+/// package, so a `tests/syscall.rs` would have inherited the whole grant by
+/// being named after it.
+const DESIGNATED_MODULE: &str = "src/syscall.rs";
 
 /// How many times the exception may be opened in this crate.
 ///
@@ -44,15 +66,22 @@ const DESIGNATED_MODULE: &str = "syscall.rs";
 /// surface growing, not to make refactoring inside it a test failure.
 const OPENING_BUDGET: usize = 3;
 
+/// The keyword, and the five things that may follow it when it is doing
+/// something rather than being talked about.
+///
+/// Assembled rather than written out; see the module documentation. Without
+/// that, this file would be the loudest offender in its own scan.
+const KEYWORD: &str = "unsafe";
+const TAILS: [&str; 5] = [" {", " fn", " impl", " trait", " extern"];
+
 /// The forms in which the keyword actually opens the exception. A file that
 /// contains none of these cannot be using it, whatever its prose says.
-const OPENING_FORMS: [&str; 5] = [
-    "unsafe {",
-    "unsafe fn",
-    "unsafe impl",
-    "unsafe trait",
-    "unsafe extern",
-];
+fn opening_forms() -> Vec<String> {
+    TAILS
+        .iter()
+        .map(|tail| format!("{KEYWORD}{tail}"))
+        .collect()
+}
 
 /// One source file and where the exception is opened in it.
 struct Opening {
@@ -60,25 +89,50 @@ struct Opening {
     line: usize,
 }
 
-fn source_files(directory: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
+fn source_files(directory: &Path, found: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(directory) else {
-        return found;
+        return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            found.extend(source_files(&path));
+            source_files(&path, found);
         } else if path.extension().is_some_and(|extension| extension == "rs") {
             found.push(path);
         }
+    }
+}
+
+fn package_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Every Rust file inside the package the grant was given to.
+///
+/// `src/` and `tests/` are walked and `build.rs` is named, which is the whole of
+/// the package: the grant in `Cargo.toml` covers the package, so the check has
+/// to cover it too. `target/` is not walked, because nothing there was written
+/// by anybody and a generated file is not a place the boundary can be crossed.
+fn crate_sources() -> Vec<PathBuf> {
+    let root = package_root();
+    let mut found = Vec::new();
+    source_files(&root.join("src"), &mut found);
+    source_files(&root.join("tests"), &mut found);
+    let build_script = root.join("build.rs");
+    if build_script.is_file() {
+        found.push(build_script);
     }
     found.sort();
     found
 }
 
-fn crate_sources() -> Vec<PathBuf> {
-    source_files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
+/// A path as this crate's own manifest would name it, so that a failure points
+/// at a file rather than at a machine's directory layout.
+fn relative(path: &Path) -> String {
+    path.strip_prefix(package_root())
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 /// Every place the exception is opened, in the files the filter admits.
@@ -87,18 +141,19 @@ fn crate_sources() -> Vec<PathBuf> {
 /// boundary check that treats an unreadable file as clean is a boundary check
 /// that can be switched off by making a file unreadable.
 fn openings(include: impl Fn(&Path) -> bool) -> Vec<Opening> {
+    let forms = opening_forms();
     let mut found = Vec::new();
     for path in crate_sources() {
         if !include(&path) {
             continue;
         }
-        let file = path.display().to_string();
+        let file = relative(&path);
         let Ok(source) = fs::read_to_string(&path) else {
             found.push(Opening { file, line: 0 });
             continue;
         };
         for (index, line) in source.lines().enumerate() {
-            if OPENING_FORMS.iter().any(|form| line.contains(form)) {
+            if forms.iter().any(|form| line.contains(form.as_str())) {
                 found.push(Opening {
                     file: file.clone(),
                     line: index + 1,
@@ -110,8 +165,7 @@ fn openings(include: impl Fn(&Path) -> bool) -> Vec<Opening> {
 }
 
 fn is_designated(path: &Path) -> bool {
-    path.file_name()
-        .is_some_and(|name| name == DESIGNATED_MODULE)
+    relative(path) == DESIGNATED_MODULE
 }
 
 fn describe(openings: &[Opening]) -> Vec<String> {
@@ -161,7 +215,7 @@ fn the_exception_surface_stays_within_its_budget() {
 }
 
 #[test]
-fn the_boundary_check_is_looking_at_a_crate_that_has_sources() {
+fn the_boundary_check_is_looking_at_the_whole_package() {
     // Without this, moving the source directory would turn the check into a test
     // that passes by finding nothing to look at. A guarantee that holds because
     // nobody looked is the silent pass this repository treats as worse than a
@@ -176,30 +230,59 @@ fn the_boundary_check_is_looking_at_a_crate_that_has_sources() {
         sources.iter().any(|path| is_designated(path)),
         "{DESIGNATED_MODULE} is not among this crate's sources"
     );
+
+    // The three parts of the package, each named, because the scan was `src/`
+    // alone for two milestones and nobody could tell from a green run.
+    for part in ["src/", "tests/", "build.rs"] {
+        assert!(
+            sources.iter().any(|path| relative(path).starts_with(part)),
+            "nothing under {part} reached the scan, so the grant covers ground the check does not"
+        );
+    }
+    // This file is in its own scan. It has to be: it is inside the package the
+    // grant was given to, and a scanner that skipped itself would be the one
+    // place in the package where the exception could be opened unseen.
+    assert!(
+        sources
+            .iter()
+            .any(|path| relative(path) == "tests/unsafe_boundary.rs"),
+        "the scanner exempted itself"
+    );
 }
 
 #[test]
-fn the_check_recognises_every_form_the_compiler_accepts() {
+fn the_check_recognises_every_form_the_compiler_accepts_and_leaves_prose_alone() {
     // The check is only worth what its pattern list is worth. This holds the
     // list against the forms that actually open the exception, so a list that
     // silently lost one is a failing test rather than a boundary with a hole.
-    let samples = [
-        "    let value = unsafe { *pointer };",
-        "unsafe fn call_the_kernel() {}",
-        "unsafe impl Send for Ring {}",
-        "unsafe trait Mapped {}",
-        "unsafe extern \"C\" fn handler() {}",
-    ];
-    for sample in samples {
+    let forms = opening_forms();
+    assert_eq!(
+        forms.len(),
+        TAILS.len(),
+        "a form was lost between the tail list and the patterns"
+    );
+
+    let catches = |line: &str| forms.iter().any(|form| line.contains(form.as_str()));
+    for form in &forms {
+        // Assembled from the form rather than quoted, so that this file stays
+        // clean under its own scan; see the module documentation.
+        let code = format!("    {form} the_rest_of_the_line");
         assert!(
-            OPENING_FORMS.iter().any(|form| sample.contains(form)),
-            "the boundary check would not notice: {sample}"
+            catches(&code),
+            "the boundary check would not notice: {code}"
         );
     }
-    assert!(
-        !OPENING_FORMS
-            .iter()
-            .any(|form| "// the exception is documented here".contains(form)),
-        "the boundary check fires on ordinary prose"
-    );
+
+    // The two shapes the keyword takes when it is not opening anything. Both
+    // appear in this package's own prose and manifest, so a check that fired on
+    // them would be a check nobody could keep green honestly.
+    for harmless in [
+        format!("// the {KEYWORD} exception is documented here"),
+        format!("{KEYWORD}_code = \"allow\""),
+    ] {
+        assert!(
+            !catches(&harmless),
+            "the boundary check fires on something that opens nothing: {harmless}"
+        );
+    }
 }

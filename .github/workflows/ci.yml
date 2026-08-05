@@ -296,17 +296,33 @@ jobs:
 
       # ADR-014 §5 requires this crate to have a separate miri or sanitiser
       # target, and it runs here rather than in the main Rust job because this is
-      # the job that owns the crate. Unprivileged and without the object: miri
-      # interprets rather than executes, so it cannot make a syscall, and what it
-      # is worth running against is the record decoder, which reads bytes this
-      # process did not write and is the one place an out of bounds read would
-      # live.
+      # the job that owns the crate.
+      #
+      # It used to run with PERISKOP_EBPF_OBJECT set to the empty string, which
+      # made `build.rs` leave the `periskop_kernel_object` cfg off, which left
+      # `src/syscall.rs` out of the build entirely. `syscall.rs` is the only file
+      # in this workspace that steps outside `unsafe_code = "forbid"`. So the one
+      # job whose whole purpose is to interpret the exception was interpreting a
+      # crate that did not contain it, and it was green for that reason.
+      #
+      # The object built above is therefore left in place. `under_miri` in
+      # `src/lib.rs` fails the job if this line is ever reverted, because a green
+      # miri run over a build with no unsafe in it is worse than no miri run: it
+      # reads as coverage.
+      #
+      # Nothing here reaches a kernel. Miri interprets rather than executes, and
+      # no test in the lib target calls `capget` or `capset`; what it is worth
+      # running against is the record decoder, which reads bytes this process did
+      # not write and is the one place an out of bounds read would live.
+      # Isolation is off so that the monotonic clock reading in `syscall`'s own
+      # tests resolves; it relaxes what the interpreter may ask the host for and
+      # changes nothing about what it checks.
       - name: Miri over the loader crate
         run: |
           rustup toolchain install nightly --component miri --profile minimal
           cargo +nightly miri test -p periskop-ebpf-loader --lib
         env:
-          PERISKOP_EBPF_OBJECT: ""
+          MIRIFLAGS: -Zmiri-disable-isolation
 
   # F4 exit criterion 2, and the only job in this file that can close it.
   #

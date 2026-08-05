@@ -16,7 +16,8 @@
 //! | `TRACE` level output | every `Debug` and `Display` rendering of every vault type a caller can reach, plus every refusal message |
 //! | `/admin/*` responses | the body of `GET /admin/vault/status`, and of `GET /admin/policy` and `GET /admin/metrics` |
 //! | the `ProxyEvent` record | the counters the vault contributes to it |
-//! | `stdout` and `stderr` | everything a real child process that opens, loads and compacts a vault wrote to either stream |
+//! | `stdout` and `stderr` of a vault process | everything a real child process that opens, loads and compacts a vault wrote to either stream |
+//! | `stdout` and `stderr` of a **masking** process | everything a real child process that masks a prompt and restores a streamed answer wrote to either stream |
 //! | the HTTP response to the client | status, every header and the body of a real masked request |
 //! | the request record | the line the proxy leaves behind for one request |
 //! | the **streamed** response body | the server sent events of a real answer whose aliases could not be resolved |
@@ -41,14 +42,22 @@
 //! the restored plaintext is in this process while the line is written, and a
 //! counter that started carrying the value it counts is found here.
 //!
-//! The last row was missing, and its absence was a hole in this gate rather than a
-//! narrower claim: a single `dbg!(plaintext)` added to `record::seal` writes every
-//! masked value to `stderr`, and none of the five surfaces above would have seen a
-//! byte of it. The stream is captured from the child that leaves the compaction
-//! candidate, so it is a real process's real output rather than a description of
-//! one, and it is backed by `no_vault_source_writes_to_a_process_stream` plus the
-//! crate level `deny` in `src/lib.rs`, because a leak on a code path this lifecycle
-//! does not reach would still be a leak.
+//! The process stream rows were missing once, and their absence was a hole in this
+//! gate rather than a narrower claim: a single `dbg!(plaintext)` added to
+//! `record::seal` writes every masked value to `stderr`, and none of the five
+//! surfaces above would have seen a byte of it. The first is captured from the
+//! child that leaves the compaction candidate, so it is a real process's real
+//! output rather than a description of one.
+//!
+//! The **masking** process row is the same hole one module over, and it survived
+//! the first fix. A value spends most of its life outside the vault: it is read
+//! out of a request body, scanned, replaced and put back into an answer, and none
+//! of that happens in the child that opens a vault. So a `dbg!` on the request
+//! path was invisible to every gate in this repository while this file's table
+//! said `stdout` and `stderr` were searched. Both rows are backed by
+//! `no_source_writes_to_a_process_stream` plus the crate level `deny` in
+//! `src/lib.rs`, because a leak on a code path neither lifecycle reaches would
+//! still be a leak.
 //!
 //! The last row arrived with task 94, in the change that gave this crate a
 //! `ProxyEvent` type. Until then the fifth row of the table above was an
@@ -107,6 +116,11 @@ const CHILD_PROFILE: &str = "PERISKOP_NO_PLAINTEXT_CHILD_PROFILE";
 const KILLED: i32 = 70;
 /// What the child prints once it has run every path that handles a plaintext.
 const CHILD_MARK: &str = "periskop-child-sealed-unsealed-and-projected";
+
+/// Set by this test on the second child it spawns: the one that masks.
+const MASKING_CHILD: &str = "PERISKOP_NO_PLAINTEXT_MASKING_CHILD";
+/// What that child prints once it has masked a prompt and restored an answer.
+const MASKING_CHILD_MARK: &str = "periskop-child-masked-and-restored";
 
 /// The values planted in the vault, and hunted for afterwards.
 ///
@@ -205,20 +219,115 @@ fn compaction_child_terminates_itself_mid_run() {
     let _ = vault.compact(at);
 }
 
+/// A process that masks a prompt and restores an answer, so its streams can be
+/// searched.
+///
+/// The child above opens, seals, unseals and compacts a **vault**, and until this
+/// one existed that was the only process whose `stdout` and `stderr` any gate
+/// read. So the surface named "everything a process wrote" covered the vault's
+/// paths and nothing else: a `dbg!(plaintext)` on the masking path wrote every
+/// value a user typed to `stderr`, and this file's own table said `stdout` and
+/// `stderr` were searched.
+///
+/// It runs the same helper the in-process surfaces come from, which is what makes
+/// it the masking path rather than a description of one: one masked request
+/// through a real gateway, and two streamed answers, one of which restores every
+/// value back into the bytes this process assembles.
+#[test]
+#[ignore = "spawned by the gate below; it is a surface rather than a claim"]
+fn masking_child_masks_a_prompt_and_restores_an_answer() {
+    if std::env::var_os(MASKING_CHILD).is_none() {
+        return;
+    }
+    let surfaces = http_surfaces().unwrap_or_else(|why| panic!("the masking child failed: {why}"));
+    assert!(
+        surfaces.len() >= 9,
+        "the masking child ran {} surfaces, so it did not run the whole request path",
+        surfaces.len()
+    );
+    // The positive control for what the parent captures, written after every path
+    // that has held a plaintext in this process has run. A capture that does not
+    // carry this line is a capture of nothing.
+    eprintln!("{MASKING_CHILD_MARK}");
+}
+
+/// Everything that child wrote to `stdout` and `stderr`, in that order.
+fn masking_process_output() -> Result<Vec<u8>, String> {
+    let run = Command::new(std::env::current_exe().map_err(|cause| format!("{cause}"))?)
+        .args([
+            "--exact",
+            "masking_child_masks_a_prompt_and_restores_an_answer",
+            "--ignored",
+            // The same reason the vault child needs it: the harness buffers a
+            // test's own output, and a buffered stream is not the stream this
+            // gate claims to search.
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(MASKING_CHILD, "1")
+        .output()
+        .map_err(|cause| format!("{cause}"))?;
+
+    let mut output = run.stdout;
+    output.extend_from_slice(&run.stderr);
+    if !run.status.success() {
+        return Err(format!(
+            "the masking child ended with {:?}: {}",
+            run.status.code(),
+            String::from_utf8_lossy(&output)
+        ));
+    }
+    Ok(output)
+}
+
 // ---------------------------------------------------------------------------
 // The gate
 // ---------------------------------------------------------------------------
+
+/// Every surface class this sweep has to produce, by the name it is filed under.
+///
+/// A floor of "at least five" is not a floor: it passed with seven of the twelve
+/// surfaces deleted, and the artefact went on naming all twelve because the names
+/// were a literal in the writer. This list is what a deletion runs into. It is
+/// still a written down list, and that is on purpose in the other direction: a
+/// surface that stops being collected has to be **removed from here** by
+/// somebody, which is the moment the claim is meant to be re-argued.
+///
+/// The file surfaces are named without their profile suffix because the sweep
+/// files them by file name; the two vault file snapshots are separate entries
+/// because they cover different halves of the record set.
+const REQUIRED_SURFACES: &[&str] = &[
+    "appended_file:vault.psk",
+    "file:vault.psk",
+    "candidate_file",
+    "renderings",
+    "admin_vault_status",
+    "proxy_event_counters",
+    "process_output",
+    "masking_process_output",
+    "http_response",
+    "http_request_record",
+    "http_admin_policy",
+    "http_admin_vault_status",
+    "http_admin_metrics",
+    "proxy_event",
+    "http_stream_response",
+    "http_stream_request_record",
+    "http_stream_proxy_event",
+];
 
 #[test]
 fn f4_gate_no_planted_value_reaches_any_surface_outside_this_process() {
     let required = std::env::var_os(REQUIRE_PROOF).is_some();
     let mut covered = Vec::new();
     let mut skipped = Vec::new();
+    let mut scanned: BTreeSet<String> = BTreeSet::new();
 
     for profile in [ProfileName::Ci, ProfileName::Standard] {
         match sweep(profile) {
             Ok(surfaces) => {
                 check(profile, &surfaces);
+                scanned.extend(surfaces.keys().cloned());
                 covered.push(profile.as_str());
             }
             Err(reason) => {
@@ -245,9 +354,9 @@ fn f4_gate_no_planted_value_reaches_any_surface_outside_this_process() {
     // a profile.
     no_logging_dependency_has_appeared();
     no_vault_type_can_serialise_itself();
-    no_vault_source_writes_to_a_process_stream();
+    no_source_writes_to_a_process_stream();
 
-    record_outcome(&covered, &skipped);
+    record_outcome(&covered, &skipped, &scanned);
     assert!(
         covered.contains(&"ci"),
         "the reduced profile must always be runnable"
@@ -288,7 +397,15 @@ fn http_surfaces() -> Result<Vec<(String, Vec<u8>)>, String> {
     // The reduced profile: this helper is about the HTTP surface, and spending
     // 256 MiB again here would slow the gate without widening it. The shipped
     // profile is exercised by the vault half of this same sweep.
-    let vault = open_vault(&Scratch::new("http").directory(), ProfileName::Ci)
+    //
+    // Bound to a name rather than left a temporary. `Scratch` removes its
+    // directory when it drops, and a temporary drops at the end of the statement
+    // that made it: the vault file was being deleted out from under the vault
+    // that had just been opened on it, one line after it was created. Nothing
+    // noticed while every write went to a handle the file system had already
+    // unlinked, which is its own small lesson about surfaces nobody reads.
+    let scratch = Scratch::new("http");
+    let vault = open_vault(&scratch.directory(), ProfileName::Ci)
         .map_err(|refusal| format!("{refusal}"))?;
 
     let upstream = Arc::new(Recorder::ok());
@@ -348,9 +465,17 @@ fn http_surfaces() -> Result<Vec<(String, Vec<u8>)>, String> {
     // The positive control. Without it, a gateway that refused every request would
     // produce clean surfaces and this whole helper would prove nothing.
     let calls = upstream.calls();
-    let call = calls
-        .first()
-        .ok_or_else(|| "the sweep's request never reached the provider".to_owned())?;
+    // The refusal travels with the complaint. Without it this reads as "the
+    // gateway did nothing" and the reason, which the answer is carrying, is
+    // thrown away by the one line that saw it.
+    let call = calls.first().ok_or_else(|| {
+        format!(
+            "the sweep's request never reached the provider: {} {} {}",
+            response.status,
+            response.headers.get("x-periskop-error").unwrap_or("-"),
+            String::from_utf8_lossy(&response.body)
+        )
+    })?;
     if call.headers.get("authorization")
         != Some(format!("Bearer {}", planted_credential()).as_str())
     {
@@ -470,23 +595,29 @@ fn stream_surfaces(
         }
     }
 
-    let build = |upstream: Arc<dyn Upstream>| -> Result<Gateway, String> {
+    // The scratch directory is returned with the gateway rather than dropped at
+    // the end of this closure, for the reason `http_surfaces` gives: a `Scratch`
+    // that goes out of scope takes the vault file with it. Each run also gets its
+    // own name, or the two gateways below would open two vaults on one path.
+    let build = |name: &str, upstream: Arc<dyn Upstream>| -> Result<(Gateway, Scratch), String> {
         let policy = Policy::load(
             "policy_id = \"acme\"\npolicy_version = \"1\"\n[default]\nmode = \"mask\"\n",
             Path::new("."),
             None,
         )
         .map_err(|refusal| format!("{refusal}"))?;
-        let vault = open_vault(&Scratch::new("stream").directory(), ProfileName::Ci)
+        let scratch = Scratch::new(name);
+        let vault = open_vault(&scratch.directory(), ProfileName::Ci)
             .map_err(|refusal| format!("{refusal}"))?;
-        Gateway::new(
+        let gateway = Gateway::new(
             policy,
             vault,
             upstream,
             AllowList::shipped(),
             Clock::Fixed(NOW),
         )
-        .map_err(|refusal| refusal.detail().to_owned())
+        .map_err(|refusal| refusal.detail().to_owned())?;
+        Ok((gateway, scratch))
     };
 
     let request = |body: String| Incoming {
@@ -512,18 +643,25 @@ fn stream_surfaces(
     // Run one: nothing resolves, and the body is the surface. The stub answers
     // with alias shaped strings this conversation never issued, which is the
     // `masking_unresolved` path.
-    let unresolved_gateway = build(Arc::new(Recorder::streaming(vec![
-        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"about PSK_PER\"}}]}\n\n".to_vec(),
-        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"SON_1 and PSK_EMAIL_1\"}}]}\n\n"
-            .to_vec(),
-        b"data: [DONE]\n\n".to_vec(),
-    ])) as Arc<dyn Upstream>)?;
+    let (unresolved_gateway, _unresolved_scratch) = build(
+        "stream-unresolved",
+        Arc::new(Recorder::streaming(vec![
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"about PSK_PER\"}}]}\n\n"
+                .to_vec(),
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"SON_1 and PSK_EMAIL_1\"}}]}\n\n"
+                .to_vec(),
+            b"data: [DONE]\n\n".to_vec(),
+        ])) as Arc<dyn Upstream>,
+    )?;
     let unresolved =
         runtime.block_on(async { unresolved_gateway.handle(request(ask.clone())).await });
 
     // Run two: everything resolves, so the restored plaintext is in this process
     // while the record line is written.
-    let restoring_gateway = build(Arc::new(EchoesTheMaskedTextInSmallPieces) as Arc<dyn Upstream>)?;
+    let (restoring_gateway, _restoring_scratch) = build(
+        "stream-restoring",
+        Arc::new(EchoesTheMaskedTextInSmallPieces) as Arc<dyn Upstream>,
+    )?;
     let restored = runtime.block_on(async { restoring_gateway.handle(request(ask)).await });
 
     let restored_body = String::from_utf8_lossy(&restored.body).into_owned();
@@ -654,18 +792,33 @@ fn sweep(profile: ProfileName) -> Result<BTreeMap<String, Vec<u8>>, String> {
     // Everything that child wrote to either stream while it opened a vault, loaded
     // every record out of it and rebuilt the file from `M_0`.
     surfaces.insert("process_output".to_owned(), output);
+    // And everything a process that **masks** wrote to either stream. The line
+    // above covers a vault's paths; a value spends most of its life outside them,
+    // in the request path, and no gate read that process's output at all.
+    surfaces.insert(
+        "masking_process_output".to_owned(),
+        masking_process_output()?,
+    );
 
     Ok(surfaces)
 }
 
 /// Asserts the claim, on every surface, for every planted value.
 fn check(profile: ProfileName, surfaces: &BTreeMap<String, Vec<u8>>) {
-    // A scan over nothing passes, so first: there is something to scan.
+    // A scan over nothing passes, so first: every surface this gate claims to
+    // cover was actually collected. Named rather than counted, because a count is
+    // satisfied by any five of them and the artefact's list is only honest if the
+    // sweep that produced it is the sweep the list describes.
+    let missing: Vec<&&str> = REQUIRED_SURFACES
+        .iter()
+        .filter(|name| !surfaces.contains_key(**name))
+        .collect();
     assert!(
-        surfaces.len() >= 5,
-        "{} profile: only {} surfaces collected",
-        profile.as_str(),
-        surfaces.len()
+        missing.is_empty(),
+        "{} profile: the sweep no longer collects {missing:?}. A surface that stopped being \
+         collected is a claim this gate stopped making, so remove it from REQUIRED_SURFACES \
+         with a reason or put it back.",
+        profile.as_str()
     );
     for (name, bytes) in surfaces {
         assert!(
@@ -738,6 +891,20 @@ fn check(profile: ProfileName, surfaces: &BTreeMap<String, Vec<u8>>) {
         "{} profile: the child's own output was not captured, so scanning it proves \
          nothing. The harness buffers a test's output and `process::exit` discards \
          the buffer, so the child has to be run with --nocapture.",
+        profile.as_str()
+    );
+
+    // And the masking process's output, controlled the same way. Without the mark
+    // this surface is bytes from a process that never held a value, and the search
+    // through it is the vacuous pass this file refuses everywhere else.
+    let masking = surfaces
+        .get("masking_process_output")
+        .expect("the masking child's output is a surface");
+    assert!(
+        contains(masking, MASKING_CHILD_MARK.as_bytes()),
+        "{} profile: the masking child's output was not captured, so a `dbg!` on the \
+         request path would be invisible to this gate exactly as it was before the \
+         surface existed.",
         profile.as_str()
     );
 
@@ -1011,24 +1178,40 @@ fn unquote(text: &str) -> &str {
     text.trim().trim_matches('"').trim_matches('\'')
 }
 
-/// Nothing under `src/vault/` writes to a process stream.
+/// Nothing under `src/` writes to a process stream.
 ///
-/// This is the guard the `stdout` and `stderr` row of the table above stands on.
+/// This is the guard the `stdout` and `stderr` rows of the table above stand on.
 /// The sweep can only search the output of the paths it happens to run, and a
-/// `dbg!` left in a branch this lifecycle does not reach would leak on somebody
-/// else's request while every surface here stayed clean. `src/lib.rs` denies these
-/// lints for the whole crate, which is the enforcement; this scan is what catches
-/// the `#[allow]` that would turn the denial off again, and it reads the same
-/// sources the vault's other boundary test reads.
-fn no_vault_source_writes_to_a_process_stream() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vault");
+/// `dbg!` left in a branch neither lifecycle reaches would leak on somebody else's
+/// request while every surface here stayed clean. `src/lib.rs` denies these lints
+/// for the whole crate, which is the enforcement; this scan is what catches the
+/// `#[allow]` that would turn the denial off again.
+///
+/// **It used to read `src/vault` alone**, and that was the hole. The denial in
+/// `src/lib.rs` is crate wide, so an `#[allow(clippy::dbg_macro)]` written on any
+/// module of it turns the denial off for that module, and a scan that only ever
+/// looked at the vault would not have seen the line that did it. The masking path
+/// is where the plaintext is at its widest, and it was outside the only scan that
+/// could have caught the `#[allow]`. So the scan covers what the denial covers.
+fn no_source_writes_to_a_process_stream() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut sources = Vec::new();
     collect_sources(&root, &mut sources);
+    // Not "at least eight vault files" any more: the crate is what is scanned, so
+    // the floor is a number a crate this size cannot fall below without somebody
+    // having deleted most of it, and a scan over three files that passed would be
+    // the same vacuous pass this whole file exists to refuse.
     assert!(
-        sources.len() >= 8,
-        "only {} vault sources found under {}",
+        sources.len() >= 40,
+        "only {} sources found under {}, so this scan is reading a fraction of the crate",
         sources.len(),
         root.display()
+    );
+    // And the vault is inside what was read, because that is the subtree the
+    // sweep's own surfaces come from.
+    assert!(
+        sources.iter().any(|path| path.ends_with("vault/record.rs")),
+        "the scan did not reach the vault sources"
     );
 
     // `panic!` is absent from this list because the workspace already denies
@@ -1049,7 +1232,7 @@ fn no_vault_source_writes_to_a_process_stream() {
 
     let mut offences = Vec::new();
     for source in &sources {
-        let text = std::fs::read_to_string(source).expect("a vault source");
+        let text = std::fs::read_to_string(source).expect("a source of this crate");
         for (number, line) in text.lines().enumerate() {
             let code = line.trim_start();
             if code.starts_with("//") {
@@ -1059,7 +1242,7 @@ fn no_vault_source_writes_to_a_process_stream() {
                 if code.contains(stream) {
                     offences.push(format!(
                         "{}:{} names {stream}",
-                        source.file_name().unwrap_or_default().to_string_lossy(),
+                        relative(source),
                         number + 1
                     ));
                 }
@@ -1068,9 +1251,20 @@ fn no_vault_source_writes_to_a_process_stream() {
     }
     assert!(
         offences.is_empty(),
-        "a vault source writes to a process stream, which is a surface this gate \
-         searches only where the lifecycle above happens to reach: {offences:#?}"
+        "a source of this crate writes to a process stream, or takes the crate level denial \
+         off itself. Either way it is a surface this gate searches only where the two \
+         lifecycles above happen to reach: {offences:#?}"
     );
+}
+
+/// A source path as it reads in a message, rooted at the crate.
+fn relative(source: &Path) -> String {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    source
+        .strip_prefix(root)
+        .unwrap_or(source)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// The `ProxyEvent` surface is a projection, and it stays one only while no vault
@@ -1296,7 +1490,15 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// green line in the test output, so the difference goes in a file. The planted
 /// values are counted rather than listed: an artefact that carried them would be
 /// the leak this test is about.
-fn record_outcome(covered: &[&str], skipped: &[&str]) {
+///
+/// `scanned` is the list [`sweep`] actually produced, handed in rather than
+/// written here. It used to be twelve names typed into this format string, and
+/// none of them was read from anything: seven surfaces could have been deleted
+/// from the sweep and this file would have gone on claiming twelve, which is the
+/// worst failure an artefact has because it is the one a reader trusts.
+/// `proof_f4.rs` derives its own list from the surfaces it walked, and this is
+/// the same device.
+fn record_outcome(covered: &[&str], skipped: &[&str], scanned: &BTreeSet<String>) {
     let status = if skipped.is_empty() {
         "passed"
     } else {
@@ -1309,14 +1511,16 @@ fn record_outcome(covered: &[&str], skipped: &[&str]) {
             .collect::<Vec<_>>()
             .join(",")
     };
+    let surfaces = scanned
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(",");
 
     let record = format!(
         "{{\n  \"gate\": \"F4-73\",\n  \"criterion\": \"roadmap.md F4 exit criterion 3\",\n  \
          \"status\": \"{status}\",\n  \"profiles_covered\": [{}],\n  \"profiles_skipped\": [{}],\n  \
-         \"planted_values\": {},\n  \"surfaces\": [\"vault_file\",\"temporary_files\",\
-         \"renderings\",\"admin_vault_status\",\"proxy_event_counters\",\"proxy_event\",\
-         \"process_stdout_and_stderr\",\"http_response\",\"http_request_record\",\
-         \"http_stream_response\",\"http_stream_request_record\",\"http_stream_proxy_event\"],\n  \
+         \"planted_values\": {},\n  \"surfaces_scanned\": {},\n  \"surfaces\": [{surfaces}],\n  \
          \"caveat\": \"There is no logging framework in this crate, so the TRACE surface is \
          approximated by every Debug and Display rendering a log line could contain, and it is \
          held in place by a structural guard that fails when a logging dependency appears. The \
@@ -1324,7 +1528,8 @@ fn record_outcome(covered: &[&str], skipped: &[&str]) {
          rendered documents of two real masked requests are searched here.\"\n}}\n",
         list(covered),
         list(skipped),
-        PLANTED.len()
+        PLANTED.len(),
+        scanned.len()
     );
 
     let out =

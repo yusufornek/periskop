@@ -152,6 +152,16 @@ impl Metrics {
         self.refusals_total += 1;
     }
 
+    /// Raised by [`crate::http::gateway::Gateway::handle`] for a stream that
+    /// ended with data still in a buffer, which is what `proxy-api.md`'s fifth
+    /// streaming point calls a reassembly error.
+    ///
+    /// The call site is named here because for a while there was not one: this
+    /// method was called by the test below and by nothing else, so the endpoint
+    /// answered `0` for every process that had ever run and an operator reading
+    /// it would have concluded that no stream had ever failed. A counter no
+    /// request can raise is worse than a missing counter, because a missing one
+    /// is visibly missing.
     pub fn record_stream_reassembly_error(&mut self) {
         self.stream_reassembly_errors_total += 1;
     }

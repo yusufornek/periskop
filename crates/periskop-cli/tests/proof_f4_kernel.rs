@@ -54,6 +54,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use periskop_network_sensor::flow::{Flow, Mechanism, ProcessAttribution};
+use periskop_network_sensor::platform::{self, SensorPlatformClass};
 use periskop_network_sensor::privilege::{Grant, Privileges};
 use periskop_network_sensor::source::FlowSource;
 use periskop_network_sensor::{EbpfFlowSource, ScopePolicy};
@@ -301,6 +302,36 @@ fn seconds_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// What the artefact's `capture` field says, read off the record rather than
+/// typed into it.
+///
+/// This was the literal `"ebpf"`, written beside an assertion that compared the
+/// mechanism against the same `Mechanism::Ebpf` the test had handed to
+/// `Flow::from_observation` three lines earlier. Both halves were true by
+/// construction: the gate set the value, asserted the value it had set, and then
+/// declared it in the artefact. A build whose sensor stopped capturing through
+/// eBPF would have gone on saying `ebpf`, which is the one sentence this file
+/// exists to be able to say honestly.
+///
+/// Two facts decide it now, and neither is chosen here:
+///
+/// - the mechanism the **shipped** decision produced ([`platform::detect`] and
+///   [`SensorPlatformClass::mechanism`], the same pair the sensor's own reports
+///   go through), rather than a name this test picked;
+/// - the attribution on the record, which is `KernelAttributed` only when the
+///   process came out of the calling task's context. A kprobe runs there; a
+///   packet capture reading the same connection off a wire has no task to read
+///   and cannot produce it.
+///
+/// Anything else is `none`, which is the value the artefact check in
+/// `.github/workflows/ci.yml` fails the job on.
+fn capture_of(mechanism: Mechanism, attribution: ProcessAttribution) -> &'static str {
+    match (mechanism, attribution) {
+        (Mechanism::Ebpf, ProcessAttribution::KernelAttributed) => "ebpf",
+        _ => "none",
+    }
+}
+
 /// The gate. F4 exit criterion 1 is open while this does not report `proved`.
 #[test]
 fn f4_kernel_gate_a_program_in_the_kernel_reports_a_connection_this_test_made() {
@@ -312,6 +343,21 @@ fn f4_kernel_gate_a_program_in_the_kernel_reports_a_connection_this_test_made() 
         );
         return;
     }
+
+    // The mechanism every record below is built with, taken from the shipped
+    // decision rather than named here. `platform::detect` is what the sensor's
+    // own coverage statement runs through, so a build that stopped being the
+    // eBPF sensor produces a record this gate refuses instead of one it
+    // relabels.
+    let class = platform::detect();
+    let Some(mechanism) = class.mechanism() else {
+        not_proved(format!(
+            "the shipped platform decision offers no capture mechanism on this machine \
+             (class={})",
+            class.as_str()
+        ));
+        return;
+    };
 
     let privileges = Privileges::probe();
     let listener = match Listener::open() {
@@ -393,7 +439,7 @@ fn f4_kernel_gate_a_program_in_the_kernel_reports_a_connection_this_test_made() 
                 ])
             };
             observations.push(());
-            if let Ok(flow) = Flow::from_observation(observation, scope, Mechanism::Ebpf) {
+            if let Ok(flow) = Flow::from_observation(observation, scope, mechanism) {
                 flows.push(flow);
             }
         }
@@ -422,12 +468,29 @@ fn f4_kernel_gate_a_program_in_the_kernel_reports_a_connection_this_test_made() 
         Ipv4Addr::LOCALHOST.to_string(),
         "the kernel reported a destination address this test never dialled"
     );
-    assert_eq!(matched.mechanism, Mechanism::Ebpf);
     assert_eq!(
         matched.process_attribution,
         ProcessAttribution::KernelAttributed,
         "a kprobe runs in the calling task's context, so an unattributed flow means the process \
          was read from somewhere else"
+    );
+    // Not `Mechanism::Ebpf` against `Mechanism::Ebpf`: this compares the record
+    // against what the *shipped* platform decision produced, which nothing in
+    // this file chose. The gate closes F4 exit criterion 1 on the eBPF path
+    // specifically, so a machine the product would observe some other way has to
+    // fail here rather than be written up as a kernel capture.
+    assert_eq!(
+        class,
+        SensorPlatformClass::LinuxEbpf,
+        "this build's shipped platform decision is not the eBPF sensor, so no run of it closes \
+         the criterion this gate is about"
+    );
+    let capture = capture_of(matched.mechanism, matched.process_attribution);
+    assert_eq!(
+        capture, "ebpf",
+        "the record does not carry the two marks of a kernel capture (mechanism={:?}, \
+         attribution={:?})",
+        matched.mechanism, matched.process_attribution
     );
     let pid = matched.process.as_ref().map(|process| process.pid);
     assert_eq!(
@@ -472,7 +535,7 @@ fn f4_kernel_gate_a_program_in_the_kernel_reports_a_connection_this_test_made() 
     record_outcome(&KernelProof {
         gate: "F4-100",
         status: "proved",
-        capture: "ebpf",
+        capture,
         reason: "a kprobe pair the kernel verified reported the loopback connection this test made"
             .to_owned(),
         proves: proves(),
@@ -513,6 +576,70 @@ fn f4_kernel_gate_a_program_in_the_kernel_reports_a_connection_this_test_made() 
             payload_marker_found_in_any_record: leaked,
         }),
     });
+}
+
+/// The label the artefact carries has to depend on the record it describes.
+///
+/// This runs everywhere, including the development machine, because it is about
+/// the gate's own arithmetic rather than about a kernel. The value it pins is
+/// the one the artefact check in `.github/workflows/ci.yml` reads: anything but
+/// `ebpf` fails the workflow, so every row below that answers `none` is a build
+/// this gate would refuse to close the criterion for.
+#[test]
+fn the_capture_label_is_read_off_a_record_rather_than_declared() {
+    assert_eq!(
+        capture_of(Mechanism::Ebpf, ProcessAttribution::KernelAttributed),
+        "ebpf"
+    );
+
+    // A different mechanism reading the same connection. Both of these are
+    // decided by ADR-008 and unbuilt in v1, and a gate carrying a literal would
+    // have written `ebpf` for either of them the day one arrived.
+    for other in [Mechanism::Pcap, Mechanism::Etw] {
+        assert_eq!(
+            capture_of(other, ProcessAttribution::KernelAttributed),
+            "none",
+            "{other:?} was reported as a kernel capture"
+        );
+    }
+
+    // The eBPF mechanism without the mark only a program running in the calling
+    // task's context leaves. A record assembled from somewhere other than the
+    // ring buffer looks like this, and it is not what this gate closes.
+    for weaker in [
+        ProcessAttribution::Inferred,
+        ProcessAttribution::Unattributed,
+    ] {
+        assert_eq!(
+            capture_of(Mechanism::Ebpf, weaker),
+            "none",
+            "{weaker:?} was reported as a kernel capture"
+        );
+    }
+}
+
+/// The mechanism the gate builds its records with is the shipped decision.
+///
+/// Held here as well as at the point of use, because the point of use only runs
+/// on a privileged Linux runner and this is the assertion that a development
+/// machine can still fail: if `platform::detect` ever answered `linux_ebpf` off
+/// Linux, or stopped answering it on Linux, the gate would be building records
+/// under a mechanism the product does not use.
+#[test]
+fn the_gate_takes_its_mechanism_from_the_shipped_platform_decision() {
+    let class = platform::detect();
+    if cfg!(target_os = "linux") {
+        assert_eq!(class, SensorPlatformClass::LinuxEbpf);
+        assert_eq!(class.mechanism(), Some(Mechanism::Ebpf));
+    } else {
+        assert_eq!(class, SensorPlatformClass::None);
+        assert_eq!(
+            class.mechanism(),
+            None,
+            "a machine with no capture mechanism offered one, which would let this gate build \
+             records on a platform ADR-008 gives v1 no sensor for"
+        );
+    }
 }
 
 #[test]

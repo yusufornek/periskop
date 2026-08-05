@@ -165,8 +165,19 @@ impl SessionKey {
     /// name is deliberately uncomfortable so that a second caller has to justify
     /// itself.
     ///
-    /// The bytes are borrowed, never copied out into a buffer of the caller's
-    /// own: `AliasKey` wraps them in `Zeroizing` on the way in.
+    /// **What this leaves behind, stated rather than implied.** The return is a
+    /// borrow, so nothing is copied here. The caller then does copy: the one call
+    /// site dereferences it into the array `AliasKey::from_key_bytes` takes by
+    /// value, and `AliasKey` wraps *its* copy in `Zeroizing`. The temporary in
+    /// between belongs to neither type and is not cleared, so a 32 byte
+    /// fragment of `K_session` outlives the call on that stack frame until
+    /// something else writes over it.
+    ///
+    /// This paragraph used to claim the bytes were "never copied out into a
+    /// buffer of the caller's own", which the only caller has never been true of.
+    /// Closing the gap needs `AliasKey` to be constructible from a borrow, which
+    /// is a change on the alias layer's side of the boundary; until then the
+    /// residue is written down here rather than described away.
     pub fn expose_for_alias_derivation(&self) -> &[u8; KEY_BYTES] {
         self.as_bytes()
     }

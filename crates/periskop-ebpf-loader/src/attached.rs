@@ -131,13 +131,22 @@ impl Attached {
         frames
     }
 
-    /// Frames the kernel program could not fit into the ring buffer.
+    /// Frames the kernel program could not fit into the ring buffer, when the
+    /// kernel will say how many.
     ///
     /// Counted on the kernel side, because that is the only side that sees the
     /// reservation fail. A sensor that reported no losses because it had no way
     /// to count them would be understating what it missed.
-    pub fn dropped(&self) -> u64 {
-        self.dropped.get(&0, 0).unwrap_or(0)
+    ///
+    /// `None` is that case and it is deliberately not a zero. A map lookup that
+    /// the kernel refuses says nothing about how many frames were lost, and the
+    /// one answer it must never be turned into is the answer a healthy busy
+    /// machine gives. Reading `unwrap_or(0)` here made an unreadable counter
+    /// indistinguishable from a run that lost nothing, which is the confusion
+    /// between "I do not know" and "there is none" this whole product argues
+    /// against.
+    pub fn dropped(&self) -> Option<u64> {
+        self.dropped.get(&0, 0).ok()
     }
 }
 

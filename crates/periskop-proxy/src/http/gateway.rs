@@ -325,6 +325,16 @@ impl Gateway {
             } else {
                 metrics.record_request(record.masked_entities, record.added_latency_ms);
             }
+            // `periskop_proxy_stream_reassembly_errors_total` used to be called
+            // from its own unit test and from nowhere else, so the endpoint
+            // reported a permanent zero and an operator watching it would have
+            // read "no stream ever failed to reassemble" off a counter no
+            // request could raise. It is raised here, on the one condition
+            // `proxy-api.md` calls a reassembly error: the stream ended with
+            // bytes that never completed a frame or with text still held back.
+            if record.measured.truncated {
+                metrics.record_stream_reassembly_error();
+            }
         }
         if let Some(event) = self.event_for(&record) {
             let mut events = lock(&self.events);
@@ -391,7 +401,7 @@ impl Gateway {
                 (
                     Outgoing::json(
                         404,
-                        "{\"error\":\"not_found\"}".to_owned(),
+                        detail("no endpoint of this proxy answers this path"),
                         &Marks::default(),
                     ),
                     record,
@@ -403,7 +413,7 @@ impl Gateway {
                 (
                     Outgoing::json(
                         405,
-                        "{\"error\":\"method_not_allowed\"}".to_owned(),
+                        detail("this path answers a different method"),
                         &Marks::default(),
                     ),
                     record,
@@ -580,12 +590,13 @@ impl Gateway {
                 // The provider was not reached. Not a periskop error value: the
                 // closed vocabulary is about periskop's own refusals, and inventing
                 // a value for somebody else's outage would put a word on the wire
-                // that no contract defines.
+                // that no contract defines. So it does not travel under the `error`
+                // key either, which is where the invented word used to sit.
                 record.status = 502;
-                let body = format!(
-                    "{{\"error\":\"upstream_unreachable\",\"detail\":{}}}",
-                    super::json::quote(&unreachable.why)
-                );
+                let body = detail(&format!(
+                    "the provider was not reached: {}",
+                    unreachable.why
+                ));
                 return (Outgoing::json(502, body, &Marks::default()), record);
             }
         };
@@ -784,6 +795,14 @@ impl Gateway {
             }
             out.extend(relay.finish(lookup, now_ms));
             record.measured = relay.measured();
+            // The relay's own answer is about its **hold buffers**: bytes it was
+            // still holding back when the stream ended. A stream can also end
+            // inside a frame, which is data left in a buffer one layer lower, and
+            // `proxy-api.md`'s fifth streaming point does not distinguish: data
+            // left over when the connection ended is an error to be marked. Until
+            // this line the second kind was invisible, so a provider that died
+            // mid frame produced a `200` that looked complete.
+            record.measured.truncated |= super::stream::frame::ends_mid_frame(&answer.body);
             return out;
         }
 
@@ -1055,6 +1074,24 @@ fn endpoint_name(treatment: Treatment) -> &'static str {
         Treatment::NoUserText => "no_user_text",
         Treatment::UnmaskedAndDeclared => "unmasked_declared",
     }
+}
+
+/// The body of an answer that is **not** one of periskop's refusals.
+///
+/// A routing outcome and an upstream outage are both real answers with no entry
+/// in `proxy-api.md`'s closed error dictionary, and all three of them used to be
+/// written as `{"error":"<invented word>"}`. A client cannot write a total match
+/// over a dictionary that grows a word whenever a handler needs one, and that is
+/// the whole reason the dictionary is closed: `error` is the key those ten values
+/// travel under, so an answer that has none of them says so by carrying no
+/// `error` key at all. What it does carry is the same `detail` field
+/// [`Refusal::to_json`] writes, because the sentence explaining the answer is
+/// useful either way.
+///
+/// `the_error_key_never_leaves_the_closed_dictionary` is what holds this: it
+/// walks every answer this gateway can produce and reads the key back out.
+fn detail(sentence: &str) -> String {
+    format!("{{\"detail\":{}}}", super::json::quote(sentence))
 }
 
 /// Parses the request body, refusing anything that is not JSON.
@@ -1551,6 +1588,206 @@ mod tests {
     fn tamper_gateway() -> Gateway {
         gateway_over(Arc::new(super::super::upstream::Recorder::ok())
             as Arc<dyn super::super::upstream::Upstream>)
+    }
+
+    /// An upstream that is never reached, so the `502` answer can be read.
+    struct NeverReached;
+
+    impl super::super::upstream::Upstream for NeverReached {
+        fn send(&self, _call: Call) -> super::super::upstream::Pending<'_> {
+            Box::pin(async {
+                Err(super::super::upstream::Unreachable {
+                    why: "the stub refuses every connection".to_owned(),
+                })
+            })
+        }
+    }
+
+    fn blocking(gateway: &Gateway, incoming: Incoming) -> Outgoing {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(gateway.handle(incoming))
+    }
+
+    fn get(path: &str) -> Incoming {
+        Incoming {
+            method: "GET".to_owned(),
+            path: path.to_owned(),
+            query: None,
+            headers: HeaderList::new(),
+            body: Vec::new(),
+        }
+    }
+
+    fn ask(content: &str) -> Incoming {
+        Incoming {
+            method: "POST".to_owned(),
+            path: "/v1/chat/completions".to_owned(),
+            query: None,
+            headers: HeaderList::new().with(SESSION_HEADER, "one-conversation"),
+            body: serde_json::json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": content}]
+            })
+            .to_string()
+            .into_bytes(),
+        }
+    }
+
+    /// The `error` key a body carries, when it carries one.
+    fn error_key(body: &[u8]) -> Option<String> {
+        serde_json::from_slice::<Value>(body)
+            .ok()?
+            .get("error")?
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    /// A closed dictionary means nothing outside it, on every answer.
+    ///
+    /// `proxy-api.md` fixes ten values so that a client branching on periskop's
+    /// refusals can write a total match. Three answers used to put a word of
+    /// their own under the same key: `not_found`, `method_not_allowed` and
+    /// `upstream_unreachable`. None of them is a refusal of periskop's and none
+    /// of them is in the dictionary, so a client matching on the key had three
+    /// values no contract defines and no version of the contract would ever add.
+    ///
+    /// Walked over the answers rather than over the source, because what a source
+    /// scan proves is that a literal is absent and what this proves is that the
+    /// bytes on the wire carry nothing else.
+    #[test]
+    fn the_error_key_never_leaves_the_closed_dictionary() {
+        let dictionary: Vec<&str> = ProxyError::ALL.iter().map(|error| error.as_str()).collect();
+
+        let unreachable = gateway_over(Arc::new(NeverReached) as Arc<dyn Upstream>);
+        let ordinary = tamper_gateway();
+        let answers = vec![
+            // The three that carried an invented word.
+            ("not found", blocking(&ordinary, get("/nowhere"))),
+            (
+                "method not allowed",
+                blocking(
+                    &ordinary,
+                    Incoming {
+                        method: "POST".to_owned(),
+                        ..get("/admin/policy")
+                    },
+                ),
+            ),
+            (
+                "upstream unreachable",
+                blocking(&unreachable, ask("nothing to mask here")),
+            ),
+            // And a real refusal, which is the positive control: without one the
+            // loop below would pass on a build that stopped answering at all.
+            (
+                "body unparsable",
+                blocking(
+                    &ordinary,
+                    Incoming {
+                        body: b"{ this is not json".to_vec(),
+                        ..ask("")
+                    },
+                ),
+            ),
+        ];
+
+        let mut from_the_dictionary = 0usize;
+        for (name, answer) in &answers {
+            if let Some(value) = error_key(&answer.body) {
+                assert!(
+                    dictionary.contains(&value.as_str()),
+                    "the {name} answer carries error=\"{value}\", which no contract defines"
+                );
+                from_the_dictionary += 1;
+            }
+            // The header is drawn from the same dictionary, and it is the field a
+            // client is told to branch on.
+            if let Some(value) = answer.headers.get("x-periskop-error") {
+                assert!(
+                    dictionary.contains(&value),
+                    "the {name} answer's header carries {value}"
+                );
+            }
+        }
+        assert_eq!(
+            from_the_dictionary, 1,
+            "no answer carried a dictionary value, so this walked over bodies with no error \
+             key in them and proved nothing"
+        );
+
+        // The statuses are still the ones the routing contract fixes: dropping
+        // the invented word is not permission to answer 400 to a wrong path.
+        assert_eq!(answers[0].1.status, 404);
+        assert_eq!(answers[1].1.status, 405);
+        assert_eq!(answers[2].1.status, 502);
+        // And the sentence survives, because it is the half of the body that was
+        // ever useful.
+        for (name, answer) in &answers {
+            let body: Value = serde_json::from_slice(&answer.body).unwrap_or(Value::Null);
+            assert!(
+                body["detail"].as_str().is_some_and(|text| !text.is_empty()),
+                "the {name} answer says nothing about itself"
+            );
+        }
+    }
+
+    /// A stream that ends inside a frame is marked and counted.
+    ///
+    /// Two defects in one place. The frame reader dropped a leftover that carried
+    /// no `data:` field, so the client lost those bytes and nothing said so; and
+    /// `periskop_proxy_stream_reassembly_errors_total` was incremented by its own
+    /// unit test and by no request, so the endpoint reported a permanent zero.
+    /// Asserted over a real request through `handle`, because both of them were
+    /// reachable from a unit test and neither was reachable from the path a
+    /// request takes.
+    #[test]
+    fn a_stream_that_ends_inside_a_frame_is_marked_truncated_and_counted() {
+        let cut = gateway_over(Arc::new(super::super::upstream::Recorder::streaming(vec![
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Fatura \"}}]}\n\n".to_vec(),
+            // The provider died here: a cut before the payload's colon leaves
+            // bytes no frame parses out of.
+            b"event: content_block_".to_vec(),
+        ])) as Arc<dyn Upstream>);
+
+        let answer = blocking(&cut, ask("ali@ornek.com"));
+        assert_eq!(answer.status, 200);
+        assert_eq!(
+            answer.headers.get("x-periskop-stream-truncated"),
+            Some("true"),
+            "a stream that ended inside a frame was delivered as a complete one"
+        );
+        assert!(
+            String::from_utf8_lossy(&answer.body).contains("event: content_block_"),
+            "the tail the provider did send was dropped: {}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert!(
+            cut.metrics_snapshot()
+                .render()
+                .contains("periskop_proxy_stream_reassembly_errors_total 1"),
+            "{}",
+            cut.metrics_snapshot().render()
+        );
+
+        // The other direction, or the assertions above would pass on a build that
+        // marked every stream truncated and counted every request.
+        let whole = gateway_over(Arc::new(super::super::upstream::Recorder::streaming(vec![
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Fatura \"}}]}\n\n".to_vec(),
+            b"data: [DONE]\n\n".to_vec(),
+        ])) as Arc<dyn Upstream>);
+        let answer = blocking(&whole, ask("ali@ornek.com"));
+        assert_eq!(answer.headers.get("x-periskop-stream-truncated"), None);
+        assert!(
+            whole
+                .metrics_snapshot()
+                .render()
+                .contains("periskop_proxy_stream_reassembly_errors_total 0"),
+            "{}",
+            whole.metrics_snapshot().render()
+        );
     }
 
     fn gateway_over(upstream: Arc<dyn super::super::upstream::Upstream>) -> Gateway {

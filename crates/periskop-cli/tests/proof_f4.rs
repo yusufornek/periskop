@@ -1015,6 +1015,8 @@ struct Evidence {
     runs: Vec<RunEvidence>,
     /// Claim 4's zero, shown to be a measurement rather than a constant.
     unresolved_control: UnresolvedEvidence,
+    /// The third mode, which no integration gate had ever run under.
+    block_control: BlockEvidence,
 }
 
 /// The five claims, measured under one policy.
@@ -1090,6 +1092,9 @@ const PROVES: &[&str] = &[
      response body is excluded on purpose: it is the answer, and the answer carrying the \
      user's own values back is the product working",
     "a date crosses under the default policy and is counted rather than refusing the request",
+    "a request carrying an entity under `mode = \"block\"` is refused with 400 and \
+     entity_blocked, and the stub provider recorded no request at all: the third mode of the \
+     enum, which no integration gate had ever run under",
 ];
 
 const DOES_NOT_PROVE: &[&str] = &[
@@ -1214,6 +1219,7 @@ fn f4_gate_a_real_exchange_masks_restores_and_leaks_nothing() {
     }
     let unresolved_control =
         expired_records_are_counted_and_never_invented(&runtime, Arc::clone(&upstream));
+    let block_control = nothing_crosses_when_a_rule_blocks(&runtime, Arc::clone(&upstream));
 
     let artefact = record_outcome(&ProofRecord {
         gate: "F4-101",
@@ -1233,6 +1239,7 @@ fn f4_gate_a_real_exchange_masks_restores_and_leaks_nothing() {
             real_sockets: true,
             runs,
             unresolved_control,
+            block_control,
         }),
     });
 
@@ -1545,11 +1552,15 @@ fn one_run(
     RunEvidence {
         policy,
         rule,
-        masking_profile: event["masking_profile"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned(),
-        alias_style: event["alias_style"].as_str().unwrap_or_default().to_owned(),
+        // Read, not defaulted. `unwrap_or_default()` here turned a field the
+        // record did not carry into an empty string, and the artefact then went
+        // out saying `status: "proved"` beside `masking_profile: ""`. The field
+        // is the run's statement about **what was masked at all**: a reader who
+        // sees it empty cannot tell a build with no dictionary from a record
+        // that lost the key, and the gate said proved for both. A gate that
+        // cannot read its own evidence has not proved anything.
+        masking_profile: required(&event, "masking_profile", policy, &event_json),
+        alias_style: required(&event, "alias_style", policy, &event_json),
         upstream_request_bytes: seen.received.len(),
         planted_values: values.len(),
         masked_values,
@@ -1572,6 +1583,24 @@ fn one_run(
         date_crossed_under_date_policy: true,
         date_rule_scope,
     }
+}
+
+/// One field of the measurement record, or the gate fails rather than guessing.
+///
+/// The rule this enforces: **no field of this artefact is filled in by a
+/// default.** Every value here is a run's own statement about what it did, and a
+/// missing one means the run and the record disagree about what was measured.
+/// Writing an empty string in its place and going on to say `proved` is the
+/// failure mode that made this function necessary, and it is worse than a red
+/// gate because it is a green one that reads as evidence.
+fn required(event: &Value, field: &str, policy: &str, event_json: &str) -> String {
+    let value = event[field].as_str().unwrap_or_default();
+    assert!(
+        !value.is_empty(),
+        "{policy}: the measurement record carries no `{field}`, so this run cannot say what \
+         it did and the artefact may not say `proved`: {event_json}"
+    );
+    value.to_owned()
 }
 
 /// How long a conversation's records live in the two ordinary runs.
@@ -1698,6 +1727,148 @@ fn expired_records_are_counted_and_never_invented(
         aliases_restored: restored,
         values_invented: 0,
     }
+}
+
+/// The one mode no integration gate had ever run under.
+///
+/// Three times now a defect has survived because every gate ran under one
+/// configuration. `date_policy` refused ordinary prompts because no gate set it;
+/// `entities_allowed[].rule_scope` carried the matched text because every gate
+/// ran with `mode = "mask"`, under which nothing is ever allowed; and this is the
+/// third: `mode = "block"` is a third of the mode enum and no request had ever
+/// crossed a socket under it. What the block path does is refuse **before** the
+/// provider is reached, so the thing worth proving is a negative that only a real
+/// exchange can establish: the stub recorded nothing.
+fn nothing_crosses_when_a_rule_blocks(
+    runtime: &tokio::runtime::Runtime,
+    upstream: Arc<dyn Upstream>,
+) -> BlockEvidence {
+    // Scoped to a rule rather than written into `[default]`, because that is the
+    // shape an operator writes: everything is masked and one type is too
+    // sensitive to send under any name.
+    const RULE: &str =
+        "\n[[rule]]\nentity = \"IBAN\"\nscope = \"messages[*].content\"\nmode = \"block\"\n";
+
+    let tree = TempTree::new("blocked");
+    let (payload, values) = request_body();
+    let (stub_address, upstreamed) = start_stub(values.len());
+    let running = runtime.block_on(start_proxy(
+        &tree,
+        RULE,
+        LONG_TTL_MS,
+        stub_address,
+        upstream,
+    ));
+
+    let response = one_request(running.address, &payload, "f4-gate-blocked");
+    let head_end = find(&response, b"\r\n\r\n").map_or(response.len(), |at| at + 4);
+    let head = String::from_utf8_lossy(&response[..head_end])
+        .to_ascii_lowercase()
+        .replace("\r\n", "\n");
+
+    assert!(
+        response.starts_with(b"HTTP/1.1 400"),
+        "a blocked entity did not refuse the request: {}",
+        String::from_utf8_lossy(&response[..response.len().min(400)])
+    );
+    // The closed dictionary's own value, on the header a client branches on.
+    // Without this the assertion above passes on any 400 at all, including the
+    // one an unparsable body produces, and the run would prove that a broken
+    // request is refused rather than that a blocked one is.
+    assert!(
+        head.contains("x-periskop-error: entity_blocked"),
+        "the refusal does not say a blocked entity caused it: {head}"
+    );
+
+    // The claim. `proxy/spec.md` section 10: periskop never chooses "send it
+    // unmasked" over "refuse", and under `block` there is no masked form to send
+    // either, so the request stops here. A stub that recorded anything at all
+    // means bytes crossed before the refusal was decided.
+    let recorded = upstreamed
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let reached_the_provider = recorded.len();
+    drop(recorded);
+    assert_eq!(
+        reached_the_provider, 0,
+        "a request carrying an entity under `mode = \"block\"` reached the provider"
+    );
+
+    // And the surfaces, on the path nothing else covers. A refusal writes a log
+    // line and may file a measurement record, and both are written while the
+    // whole prompt is in this process: the value that caused the refusal is the
+    // one most likely to be quoted into the sentence explaining it.
+    let log: String = running
+        .gateway
+        .log()
+        .iter()
+        .map(|record| format!("{}\n", record.to_line()))
+        .collect();
+    let events: String = running
+        .gateway
+        .events()
+        .iter()
+        .map(|event| format!("{}\n", event.to_json()))
+        .collect();
+    let surfaces: Vec<(&'static str, Vec<u8>)> = vec![
+        // The whole response and not only its head: a refusal carries no restored
+        // answer, so nothing in it is meant to be a planted value.
+        ("blocked_client_response", response.clone()),
+        (
+            "blocked_vault_file",
+            std::fs::read(&running.vault_file).unwrap_or_default(),
+        ),
+        ("blocked_request_log_line", log.into_bytes()),
+        ("blocked_proxy_event", events.into_bytes()),
+    ];
+    let mut surface_bytes = 0usize;
+    for (name, bytes) in &surfaces {
+        surface_bytes += bytes.len();
+        for planted in &values {
+            assert!(
+                find(bytes, planted.value.as_bytes()).is_none(),
+                "block mode: {} appears in {name}",
+                planted.entity
+            );
+        }
+        assert!(
+            find(bytes, caller_credential().as_bytes()).is_none(),
+            "block mode: the caller's credential appears in {name}"
+        );
+    }
+    // The refusal names the **type**, which is what an operator needs to find the
+    // rule, and the assertions above are what keep it from naming the value.
+    let body = String::from_utf8_lossy(&response[head_end..]).into_owned();
+    assert!(
+        body.contains("IBAN"),
+        "the refusal does not say which type was blocked: {body}"
+    );
+
+    BlockEvidence {
+        rule: RULE,
+        blocked_entity: "IBAN",
+        status: 400,
+        proxy_error: "entity_blocked",
+        upstream_requests_recorded: reached_the_provider,
+        planted_values: values.len(),
+        surfaces_scanned: surfaces.iter().map(|(name, _)| *name).collect(),
+        surface_bytes_scanned: surface_bytes,
+    }
+}
+
+/// What the run under `mode = "block"` measured.
+#[derive(Debug, serde::Serialize)]
+struct BlockEvidence {
+    rule: &'static str,
+    blocked_entity: &'static str,
+    status: u16,
+    proxy_error: &'static str,
+    /// Zero, and it is the claim rather than a statistic: a refusal that still
+    /// sent the prompt would be the fail-open this component exists to refuse.
+    upstream_requests_recorded: usize,
+    planted_values: usize,
+    surfaces_scanned: Vec<&'static str>,
+    surface_bytes_scanned: usize,
 }
 
 /// What the positive control measured.

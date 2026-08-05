@@ -96,3 +96,30 @@ pub use loader::{EbpfLoader, RawBatch};
 pub use platform::HostPlatform;
 pub use record::{PayloadKind, Protocol, RawEvent, RawKey, RawProcess, RecordError};
 pub use unavailable::LoaderUnavailable;
+
+/// Whether the run that is interpreting this crate can see the exception at all.
+///
+/// ADR-014 §5 requires a separate miri or sanitiser target for this crate, and
+/// the reason it requires one is [`syscall`]: it is the only file in the
+/// workspace that steps outside `unsafe_code = "forbid"`, and it is compiled
+/// only when a kernel side object is present. A miri job configured without one
+/// therefore interprets a crate in which that module does not exist, passes, and
+/// establishes nothing about the thing it was created to check. That is what the
+/// job in `.github/workflows/ci.yml` did while it set `PERISKOP_EBPF_OBJECT` to
+/// the empty string.
+///
+/// A comment would not have caught it, because the job was green either way. So
+/// it is a test, and it is red on exactly the configuration that used to be
+/// silently green.
+#[cfg(all(test, miri))]
+mod under_miri {
+    #[test]
+    fn miri_is_looking_at_the_build_that_carries_the_unsafe_module() {
+        assert!(
+            cfg!(all(target_os = "linux", periskop_kernel_object)),
+            "miri is interpreting a build of this crate with no `syscall` module in it, so it is \
+             checking the one thing this crate has no exception for. Run it on Linux with \
+             PERISKOP_EBPF_OBJECT pointing at a built kernel side object."
+        );
+    }
+}

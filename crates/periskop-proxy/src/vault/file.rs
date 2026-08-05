@@ -198,6 +198,11 @@ impl VaultFile {
     /// there, or the header does not and the bytes are outside the authenticated
     /// region.
     pub(super) fn append(&mut self, frame: &Frame) -> Result<(), VaultError> {
+        // Before a byte is written, and not after. See [`Self::confirm_unchanged`]:
+        // an append into a file this process no longer describes is the one
+        // failure that reports itself as a success.
+        self.confirm_unchanged("appended to")?;
+
         let bytes = frame.encode()?;
         let tail = self.chain.link(&self.chain_tail, &bytes)?;
         let record_counter = self.record_counter.saturating_add(1);
@@ -270,12 +275,121 @@ impl VaultFile {
     /// Called by [`super::compaction`] after the rename, and only then: adopting
     /// an image the disk does not carry would leave this process describing a file
     /// that does not exist.
-    pub(super) fn adopt(&mut self, image: &FileImage) -> Result<(), VaultError> {
-        self.handle = open_handle(&self.path)?;
+    ///
+    /// **The descriptor is handed in rather than opened here, and that ordering
+    /// is the whole point of the signature.** This used to call [`open_handle`]
+    /// on the vault path, which happens after the rename has already unlinked the
+    /// old file. An open that failed there left this process holding a descriptor
+    /// on an inode with no name: every later [`Self::append`] wrote into it,
+    /// flushed it, and returned `Ok`, so `Vault::store_alias` kept its in memory
+    /// copy and the record was gone at the next restart with nothing having
+    /// reported a failure. Compaction now opens the candidate **before** the
+    /// rename, while the old vault is still untouched and a failure costs only
+    /// the compaction, and `rename(2)` leaves that descriptor addressing the file
+    /// that is now the vault. There is nothing left in this function that can
+    /// fail, which is why it no longer returns a `Result`.
+    pub(super) fn adopt(&mut self, handle: File, image: &FileImage) {
+        self.handle = handle;
         self.frame_count = image.frame_count;
         self.chain_tail = image.chain_tail;
         self.end_of_records = image.bytes.len() as u64;
+    }
+
+    /// Whether the file this process is describing is still the file on the disk.
+    ///
+    /// Two questions, in the order they can go wrong, and both are answered
+    /// immediately before a write rather than at open time:
+    ///
+    /// 1. **Is the descriptor still the vault?** A descriptor keeps addressing
+    ///    the inode it was opened on. A `rename` over the path leaves that inode
+    ///    alive, unnamed, and writable through the descriptor alone, so writes
+    ///    keep succeeding into a file nothing will ever open again.
+    /// 2. **Is the vault still in the state this process left it in?** The header
+    ///    is recomputed from what this process believes and compared byte for
+    ///    byte against the one on the disk. A second opener, which on a single
+    ///    tenant product is an operator starting a second proxy rather than an
+    ///    attack, commits its own header; the next append from this process would
+    ///    then truncate that record away and commit a chain tail describing bytes
+    ///    the file does not contain, and the open after that answers 503 for good.
+    ///
+    /// This is a detector and not a mutex, and the difference is worth stating.
+    /// Two processes writing in the same instant can still interleave inside the
+    /// window between this check and the write. What it removes is the case that
+    /// matters: both callers being told a record was stored while one of the two
+    /// records is already gone. An advisory lock would close the window as well,
+    /// and every form of one available here either adds a dependency or leaves a
+    /// file behind that a crashed run cannot clean up, which turns an ordinary
+    /// crash into a vault that will not open. Detecting costs one `lstat`, one
+    /// `fstat`, one 128 byte read and one MAC, against the two `fsync` calls an
+    /// append already pays.
+    fn confirm_unchanged(&mut self, operation: &'static str) -> Result<(), VaultError> {
+        let looked_at = regular_file(&self.path, operation)?.ok_or_else(|| {
+            VaultError::VaultFileUnavailable {
+                operation,
+                cause: "the vault file is no longer at the path this vault was opened on"
+                    .to_owned(),
+            }
+        })?;
+        let held = self
+            .handle
+            .metadata()
+            .map_err(|cause| io_error(operation, &cause))?;
+        if !is_same_file(&looked_at, &held) {
+            return Err(VaultError::VaultFileUnavailable {
+                operation,
+                cause: "the vault file was replaced, so this process is holding a file nothing \
+                        can open again"
+                    .to_owned(),
+            });
+        }
+
+        let mut found = [0u8; HEADER_BYTES];
+        self.handle
+            .seek(SeekFrom::Start(0))
+            .map_err(|cause| io_error(operation, &cause))?;
+        self.handle
+            .read_exact(&mut found)
+            .map_err(|cause| io_error(operation, &cause))?;
+        if found != self.committed_header()? {
+            return Err(VaultError::VaultFileUnavailable {
+                operation,
+                cause: "the vault file changed since this process last wrote it, so another \
+                        opener is writing to it"
+                    .to_owned(),
+            });
+        }
         Ok(())
+    }
+
+    /// The header this process last committed, rebuilt from what it believes.
+    ///
+    /// Deterministic in every field ([`Header::encode`]), so equality with the
+    /// bytes on the disk is exactly the question "is this still my file, in my
+    /// state". Rebuilt rather than cached because a cached copy would agree with
+    /// itself after a bug that stopped writing the header at all.
+    fn committed_header(&self) -> Result<[u8; HEADER_BYTES], VaultError> {
+        Ok(Header::encode(
+            &self.prefix,
+            self.record_counter,
+            self.frame_count,
+            &self.chain_tail,
+            &self.chain.header(
+                &self.prefix,
+                self.record_counter,
+                self.frame_count,
+                &self.chain_tail,
+            )?,
+        ))
+    }
+
+    /// The check [`super::compaction`] runs immediately before its rename.
+    ///
+    /// A compaction replaces the whole file, so it drops every record it was not
+    /// given, including the ones another opener committed after this process
+    /// built its frame list. The swap is irreversible and the loss is silent, so
+    /// the question is asked at the last moment it can still be answered.
+    pub(super) fn confirm_unchanged_before_swap(&mut self) -> Result<(), VaultError> {
+        self.confirm_unchanged("compacted")
     }
 
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), VaultError> {
@@ -381,25 +495,31 @@ fn regular_file(path: &Path, operation: &'static str) -> Result<Option<Metadata>
     }
 }
 
-/// Whether an opened descriptor is the file that was checked a moment ago.
+/// Whether two pieces of metadata describe one file.
 #[cfg(unix)]
-fn same_file(checked: &Metadata, opened: &Metadata) -> Result<(), VaultError> {
+fn is_same_file(checked: &Metadata, opened: &Metadata) -> bool {
     use std::os::unix::fs::MetadataExt as _;
-    if checked.dev() == opened.dev() && checked.ino() == opened.ino() {
-        return Ok(());
-    }
-    Err(VaultError::VaultFileUnavailable {
-        operation: "read",
-        cause: "replaced while it was being opened".to_owned(),
-    })
+    checked.dev() == opened.dev() && checked.ino() == opened.ino()
 }
 
 /// Platforms without inode numbers keep the check that does exist: what was at the
 /// path a moment ago was a regular file. The window between that look and the open
 /// is not closed there, and this build says so rather than implying otherwise.
 #[cfg(not(unix))]
-fn same_file(_checked: &Metadata, _opened: &Metadata) -> Result<(), VaultError> {
-    Ok(())
+fn is_same_file(_checked: &Metadata, _opened: &Metadata) -> bool {
+    true
+}
+
+/// The same question as a refusal, for the two places that open a path and then
+/// have to know they opened the file they looked at.
+fn same_file(checked: &Metadata, opened: &Metadata) -> Result<(), VaultError> {
+    if is_same_file(checked, opened) {
+        return Ok(());
+    }
+    Err(VaultError::VaultFileUnavailable {
+        operation: "read",
+        cause: "replaced while it was being opened".to_owned(),
+    })
 }
 
 fn create(
@@ -1288,6 +1408,117 @@ mod tests {
             reopen(&path, CounterFloor::Unknown).unwrap().frames.len(),
             1
         );
+    }
+
+    /// The failure this backend used to report as a success.
+    ///
+    /// A descriptor keeps addressing the inode it was opened on, and a `rename`
+    /// over the path leaves that inode alive, unnamed and reachable only through
+    /// the descriptor. Every later append then lands in a file nothing can ever
+    /// open again and returns `Ok`, so `Vault::store_alias` keeps its in memory
+    /// copy, answers the conversation correctly, and loses the record at the next
+    /// restart with nothing having reported a failure.
+    ///
+    /// The replacement is performed from outside here, which is the shape this
+    /// process can produce for itself: a compaction whose adoption could not open
+    /// the new file leaves exactly this state behind.
+    #[test]
+    fn an_append_into_a_file_this_process_no_longer_holds_is_refused() {
+        let scratch = Scratch::new("disconnected");
+        let path = scratch.vault();
+        let mut loaded =
+            open_here(&path, &passphrase(), ProfileName::Ci, CounterFloor::Unknown).unwrap();
+        loaded.file.append(&frame(1, "PSK_PERSON_1")).unwrap();
+
+        // A different file takes the vault's name. The descriptor this process
+        // holds now addresses an inode with no name at all.
+        let elsewhere = scratch.root.join("replacement.psk");
+        std::fs::write(&elsewhere, std::fs::read(&path).unwrap()).unwrap();
+        std::fs::rename(&elsewhere, &path).unwrap();
+
+        let refusal = loaded.file.append(&frame(2, "PSK_PERSON_2")).unwrap_err();
+        match &refusal {
+            VaultError::VaultFileUnavailable { operation, .. } => {
+                assert_eq!(*operation, "appended to");
+            }
+            other => panic!("expected the append to be refused, got {other:?}"),
+        }
+        assert_eq!(refusal.http_status(), 503);
+        drop(loaded);
+
+        // And the refusal was the truth: the vault at the path never held it.
+        let reloaded = reopen(&path, CounterFloor::Unknown).unwrap();
+        assert_eq!(reloaded.frames.len(), 1);
+        assert_eq!(reloaded.frames[0].alias, "PSK_PERSON_1");
+    }
+
+    /// Two openers of one vault, which on a single tenant product is an operator
+    /// starting a second proxy rather than an attack.
+    ///
+    /// Both hold a descriptor, both believe the file is theirs, and the second
+    /// one's append truncates the first one's record away and commits a header
+    /// naming its own chain. Both callers were told the record was stored, one of
+    /// the two records is gone, and the *next* append from the first opener
+    /// commits a tail that describes bytes the file does not contain, so the
+    /// following open answers 503 for good.
+    #[test]
+    fn a_second_opener_cannot_append_over_the_first_ones_record() {
+        let scratch = Scratch::new("two-openers");
+        let path = scratch.vault();
+        let mut first =
+            open_here(&path, &passphrase(), ProfileName::Ci, CounterFloor::Unknown).unwrap();
+        let mut second =
+            open_here(&path, &passphrase(), ProfileName::Ci, CounterFloor::Unknown).unwrap();
+
+        first.file.append(&frame(1, "PSK_PERSON_FIRST")).unwrap();
+
+        // `second` still describes the empty vault it opened, so the file is no
+        // longer the file it committed to.
+        let refusal = second
+            .file
+            .append(&frame(2, "PSK_PERSON_SECOND"))
+            .unwrap_err();
+        match &refusal {
+            VaultError::VaultFileUnavailable { operation, .. } => {
+                assert_eq!(*operation, "appended to");
+            }
+            other => panic!("expected the second opener to be refused, got {other:?}"),
+        }
+        assert_eq!(refusal.http_status(), 503);
+
+        // The first opener is unaffected: it is still the one describing the file.
+        first.file.append(&frame(3, "PSK_PERSON_THIRD")).unwrap();
+        drop(first);
+        drop(second);
+
+        let reloaded = reopen(&path, CounterFloor::AtLeast(2)).unwrap();
+        assert_eq!(reloaded.frames.len(), 2);
+        assert_eq!(reloaded.frames[0].alias, "PSK_PERSON_FIRST");
+        assert_eq!(reloaded.frames[1].alias, "PSK_PERSON_THIRD");
+    }
+
+    /// The control for the two tests above: the check refuses a file that changed
+    /// and nothing else.
+    ///
+    /// Without it, an append that refused unconditionally would satisfy both of
+    /// them while making the backend useless, which is the shape a check written
+    /// to make a test green tends to take.
+    #[test]
+    fn an_undisturbed_vault_still_takes_append_after_append() {
+        let scratch = Scratch::new("undisturbed");
+        let path = scratch.vault();
+        let mut loaded =
+            open_here(&path, &passphrase(), ProfileName::Ci, CounterFloor::Unknown).unwrap();
+        for byte in 1..=5u8 {
+            loaded
+                .file
+                .append(&frame(byte, &format!("PSK_PERSON_{byte}")))
+                .unwrap();
+        }
+        drop(loaded);
+
+        let reloaded = reopen(&path, CounterFloor::AtLeast(5)).unwrap();
+        assert_eq!(reloaded.frames.len(), 5);
     }
 
     #[test]

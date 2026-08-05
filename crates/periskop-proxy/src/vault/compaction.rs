@@ -38,6 +38,7 @@
 //! is removed by the next compaction rather than adopted, because a file that was
 //! never renamed is a file that was never committed.
 
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -82,7 +83,30 @@ pub(super) fn compact(file: &mut VaultFile, frames: &[Frame]) -> Result<Compacte
     // rename. It was never committed, so it carries no records this vault does
     // not already have, and it is removed rather than inspected.
     remove_stale(&candidate)?;
-    write_candidate(&candidate, &image.bytes)?;
+    // The descriptor comes back from here rather than being opened after the
+    // rename. `rename(2)` does not move an inode, so this handle addresses the
+    // new vault the instant the swap lands; opening afterwards meant an open
+    // that failed left the vault holding a descriptor on the unlinked old file,
+    // and every append after that succeeded into nothing. See `VaultFile::adopt`.
+    let handle = write_candidate(&candidate, &image.bytes)?;
+
+    // The last question before the irreversible instant: is the file about to be
+    // replaced still the one this process is describing? A second opener that
+    // committed a record since the frame list was built would have it dropped by
+    // the swap, and it was told the record was stored.
+    if let Err(refusal) = file.confirm_unchanged_before_swap() {
+        // The candidate goes with the refusal, for the reason the rename failure
+        // below gives: a leftover nobody was told about is cleared by the next
+        // compaction and looks like a repair.
+        drop(handle);
+        return Err(match std::fs::remove_file(&candidate) {
+            Ok(()) => refusal,
+            Err(cause) => VaultError::VaultFileUnavailable {
+                operation: "compacted, and its candidate could not be removed either",
+                cause: format!("{:?}", cause.kind()),
+            },
+        });
+    }
 
     // The one irreversible instant, and it is a single system call.
     if let Err(cause) = std::fs::rename(&candidate, file.path()) {
@@ -104,7 +128,7 @@ pub(super) fn compact(file: &mut VaultFile, frames: &[Frame]) -> Result<Compacte
         });
     }
 
-    file.adopt(&image)?;
+    file.adopt(handle, &image);
     Ok(Compacted {
         before,
         after: file.frame_count(),
@@ -128,9 +152,13 @@ fn remove_stale(candidate: &Path) -> Result<(), VaultError> {
     }
 }
 
-fn write_candidate(candidate: &Path, bytes: &[u8]) -> Result<(), VaultError> {
+/// Writes the candidate, flushes it, and hands back the descriptor on it.
+///
+/// The descriptor is the return value because the caller needs one that survives
+/// the rename; see [`VaultFile::adopt`] for what opening it afterwards cost.
+fn write_candidate(candidate: &Path, bytes: &[u8]) -> Result<File, VaultError> {
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    options.read(true).write(true).create_new(true);
     // The candidate becomes the vault, so it is born with the vault's mode rather
     // than being widened for an instant in between.
     #[cfg(unix)]
@@ -147,7 +175,8 @@ fn write_candidate(candidate: &Path, bytes: &[u8]) -> Result<(), VaultError> {
         .map_err(|cause| unavailable(&cause))?;
     // Before the rename, not after: the rename is only atomic in the useful sense
     // if the bytes it points at are already on the disk.
-    handle.sync_all().map_err(|cause| unavailable(&cause))
+    handle.sync_all().map_err(|cause| unavailable(&cause))?;
+    Ok(handle)
 }
 
 fn unavailable(cause: &std::io::Error) -> VaultError {
@@ -397,6 +426,42 @@ mod tests {
 
         let after = open_here(&scratch.vault(), CounterFloor::Unknown).unwrap();
         assert_eq!(after.frames.len(), 2);
+    }
+
+    /// A compaction is a whole file replacement, so it drops every record it was
+    /// not given, including the ones it never saw.
+    ///
+    /// Two openers of one vault is the case: the second appends, the first
+    /// compacts from the frame list it built before that append existed, and the
+    /// rename puts a file over the vault that has no trace of the record the
+    /// second opener was told had been stored. Nothing reports a loss, and the
+    /// counter carried across makes the shortened file look like the current one.
+    #[test]
+    fn a_compaction_does_not_discard_a_record_another_opener_committed() {
+        let scratch = Scratch::new("second-opener");
+        let (mut first, frames) = seeded(&scratch, 3);
+
+        let mut second = open_here(&scratch.vault(), CounterFloor::Unknown).unwrap();
+        second.file.append(&frame(9, 1)).unwrap();
+
+        let refusal = compact(&mut first.file, &frames[..2]).unwrap_err();
+        match &refusal {
+            VaultError::VaultFileUnavailable { operation, .. } => {
+                assert_eq!(*operation, "compacted");
+            }
+            other => panic!("expected the compaction to be refused, got {other:?}"),
+        }
+        assert_eq!(refusal.http_status(), 503);
+
+        // Refused before the swap, so the record the other opener committed is
+        // still there, and so is the candidate's absence.
+        assert_eq!(scratch.names(), BTreeSet::from(["vault.psk".to_owned()]));
+        drop(first);
+        drop(second);
+
+        let reloaded = open_here(&scratch.vault(), CounterFloor::AtLeast(4)).unwrap();
+        assert_eq!(reloaded.frames.len(), 4);
+        assert_eq!(reloaded.frames[3].alias, "PSK_PERSON_9");
     }
 
     /// The candidate is beside the vault, which is what keeps the rename on one

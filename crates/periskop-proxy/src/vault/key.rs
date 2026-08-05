@@ -70,8 +70,23 @@ pub const SALT_BYTES: usize = 16;
 /// In `memory` mode it is drawn fresh every time the process opens its vault:
 /// nothing is stored, so nothing has to agree with a previous run. The `file`
 /// backend will read it out of the vault header instead.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Salt([u8; SALT_BYTES]);
+
+/// A width, like every other rendering in this vault.
+///
+/// Written by hand rather than derived. A salt is not a key and it is not
+/// secret: it is written into the vault header in the clear. What it is, is a
+/// stable identifier for one vault file, and a derived `Debug` puts it into the
+/// first `{:?}` anybody reaches for, which is how it would reach a log line, a
+/// test failure and a bug report. Two of those are places `proxy/spec.md`
+/// section 9 keeps vault material out of, and the third correlates a report with
+/// a file on somebody's disk.
+impl fmt::Debug for Salt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Salt({} bytes)", SALT_BYTES)
+    }
+}
 
 impl Salt {
     pub fn generate() -> Result<Self, VaultError> {
@@ -424,16 +439,17 @@ pub(crate) fn one_derivation_at_a_time() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
-    use std::time::{Duration, Instant};
-
     use super::*;
 
-    /// How long a rejection may take before it stops being a rejection.
+    /// How many derivations this thread has entered, at this instant.
     ///
-    /// Far above the cost of three comparisons and far below the cost of the
-    /// derivation being refused, so it is not a performance assertion and belongs
-    /// to no latency budget.
-    const REFUSAL_BUDGET: Duration = Duration::from_secs(5);
+    /// The observable the ordering tests are written against. What they are
+    /// about is whether a derivation ran, and that is a fact this counter holds
+    /// exactly; a stopwatch answers it only on a machine that happened to be
+    /// idle.
+    fn derivations_entered() -> usize {
+        DERIVATIONS_ENTERED.with(std::cell::Cell::get)
+    }
 
     fn claim(memory_kib: u32, iterations: u32, parallelism: u32) -> ClaimedKdfParameters {
         ClaimedKdfParameters {
@@ -496,16 +512,22 @@ mod tests {
     /// The claim below is what a forged vault header looks like: 3.8 GiB of
     /// memory, ten passes. If validation ran after derivation, or after the
     /// header MAC that derivation feeds, this test would not fail an assertion.
-    /// It would allocate 3.8 GiB and grind for minutes, which is the attack. The
-    /// budget is here so that failure arrives as a message rather than as a
-    /// continuous integration job somebody kills an hour later.
+    /// It would allocate 3.8 GiB and grind for minutes, which is the attack.
+    ///
+    /// Counted rather than timed. This bounded the elapsed time at five seconds
+    /// once, which is a stopwatch measuring the machine: four of these run at
+    /// once under `--test-threads=4`, each other thread may be holding Argon2's
+    /// memory, and a *correct* refusal on a loaded runner can be descheduled past
+    /// any budget somebody picks. Raising the budget only moves the flake
+    /// further away, and the failure it reports ("the ordering is broken") is not
+    /// what happened. `DERIVATIONS_ENTERED` is the fact the test is about, and it
+    /// does not depend on what else is running.
     #[test]
     fn parameters_above_the_hard_ceiling_are_refused_before_any_derivation_runs() {
         let forged = claim(4_000_000, 10, 8);
 
-        let started = Instant::now();
+        let before = derivations_entered();
         let refusal = KdfProfile::validate(&forged).unwrap_err();
-        let took = started.elapsed();
 
         assert_eq!(
             refusal,
@@ -516,8 +538,30 @@ mod tests {
                 ceiling: MEMORY_CEILING_KIB,
             }
         );
-        assert!(took < REFUSAL_BUDGET, "refusal took {took:?}");
+        assert_eq!(
+            derivations_entered(),
+            before,
+            "the header claimed 3.8 GiB and a derivation was entered anyway, which is the \
+             resource exhaustion the bound exists to refuse"
+        );
         assert_eq!(refusal.http_status(), 503);
+    }
+
+    /// The control for the counter the test above rests on.
+    ///
+    /// Without it, a counter that never moved would make that assertion hold no
+    /// matter when validation ran, which is the same silent pass the stopwatch
+    /// had. This is the one derivation in this module's tests that exists to be
+    /// counted rather than to produce a key.
+    #[test]
+    fn the_derivation_counter_moves_when_a_derivation_runs() {
+        let before = derivations_entered();
+        let _ = derived(&ci(), &passphrase(), &salt()).unwrap();
+        assert_eq!(
+            derivations_entered(),
+            before + 1,
+            "the counter the ordering tests read did not notice a derivation"
+        );
     }
 
     #[test]

@@ -369,6 +369,22 @@ impl SessionStore {
             .sum()
     }
 
+    /// Records held across sessions that are still live at `now_ms`.
+    ///
+    /// Counting rather than sweeping, because the caller is a projection and a
+    /// read of `/admin/vault/status` may not change what the vault holds. What it
+    /// removes is the difference between what the store still has and what a
+    /// lookup would still return: expiry is applied by a sweep, sweeps happen on
+    /// requests, and between two requests the two numbers disagree by every
+    /// conversation that ended in the meantime.
+    pub(super) fn record_count_at(&self, now_ms: u64) -> usize {
+        self.sessions
+            .values()
+            .filter(|session| !session.is_expired(now_ms, self.limits.ttl_ms))
+            .map(|session| session.aliases.len())
+            .sum()
+    }
+
     /// Returns the named session, creating it if this is its first request.
     ///
     /// The key is built by the caller's closure and only when a session is

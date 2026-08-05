@@ -137,6 +137,21 @@ pub struct Vault {
     /// and counts it in `/admin/vault/status`. The first call that carries a clock
     /// sweeps, and the flag is what makes that happen once rather than never.
     awaiting_first_clock: bool,
+    /// The most recent "now" any caller has handed this vault.
+    ///
+    /// The vault reads no clock of its own, on purpose: every answer it gives is
+    /// a function of what it was told, which is what keeps it testable and its
+    /// output diffable. [`Vault::status`] needs a time anyway, because a record
+    /// whose session has outlived its time to live is not a record this vault can
+    /// resolve, and counting it in `entries_count` reports a mapping the very
+    /// next lookup would refuse. So the clock is remembered where it arrives
+    /// rather than invented where it is needed.
+    ///
+    /// `None` until the first request carries one. A vault that has never been
+    /// told what time it is cannot say which of the sessions it read off a disk
+    /// are still alive, so it reports what it holds rather than guessing, and the
+    /// sweep happens the moment a clock does arrive.
+    last_clock_ms: Option<u64>,
 }
 
 /// Says what the vault is doing and nothing about what it holds.
@@ -217,6 +232,11 @@ impl Vault {
     /// than at open is what lets the vault be loaded before any request exists
     /// without the time to live becoming optional.
     fn sweep_sessions_loaded_from_a_file(&mut self, now_ms: u64) {
+        // Every entry point that carries a clock passes through here, which makes
+        // it the one place the vault learns what time it is. Kept monotone so a
+        // late request carrying an earlier stamp cannot walk the reading back and
+        // resurrect a session in the status projection.
+        self.last_clock_ms = Some(self.last_clock_ms.map_or(now_ms, |seen| seen.max(now_ms)));
         if !self.awaiting_first_clock {
             return;
         }
@@ -260,6 +280,7 @@ impl Vault {
             counters: RecordCounters::default(),
             notes: Vec::new(),
             awaiting_first_clock: false,
+            last_clock_ms: None,
         })
     }
 
@@ -273,14 +294,37 @@ impl Vault {
     /// did not close never became a `Vault` at all: the three violations are
     /// errors out of [`Vault::open`], and their value is read off the refusal with
     /// [`VaultError::integrity`].
+    ///
+    /// `entries_count` is what this vault can still resolve, not what it is still
+    /// holding. Expiry is applied by a sweep and a sweep needs a clock, so
+    /// between two requests the store keeps sessions whose time to live has
+    /// already run out; counting those reported mappings that the next lookup
+    /// answers `masking_unresolved` for, and after a restart from a file it
+    /// reported a whole day of conversations that were over before the process
+    /// started. The count is taken against the last clock a caller supplied
+    /// instead, which is the newest time this vault is entitled to believe.
     pub fn status(&self) -> VaultStatus {
         VaultStatus::new(
             VaultState::Unsealed,
             self.storage,
             self.file.as_ref().map(|file| file.path()),
             Integrity::Ok,
-            self.sessions.record_count(),
+            self.resolvable_record_count(),
         )
+    }
+
+    /// Records a lookup could still return, as of the last clock this vault saw.
+    ///
+    /// Without a clock there is nothing to apply, and the honest answer is what
+    /// the store holds: a vault opened on a file and asked for its status before
+    /// any request has arrived does not know which of those sessions survived,
+    /// and reporting zero would be as invented as reporting all of them. That
+    /// window closes at the first request, which sweeps.
+    fn resolvable_record_count(&self) -> usize {
+        match self.last_clock_ms {
+            Some(now_ms) => self.sessions.record_count_at(now_ms),
+            None => self.sessions.record_count(),
+        }
     }
 
     /// The record counter a caller should pass as [`CounterFloor`] next time.
@@ -477,6 +521,7 @@ impl Vault {
         // The one place the flag is cleared without its own sweep mattering: this
         // call is the sweep.
         self.awaiting_first_clock = false;
+        self.last_clock_ms = Some(self.last_clock_ms.map_or(now_ms, |seen| seen.max(now_ms)));
         self.sessions.purge_expired(now_ms)
     }
 
@@ -529,9 +574,22 @@ mod tests {
         Passphrase::new(b"the operator typed this".to_vec())
     }
 
+    /// Every `Vault::open` in this module goes through here.
+    ///
+    /// One place takes the permit, so no two Argon2id derivations in this test
+    /// binary run beside each other; see [`key::one_derivation_at_a_time`]. The
+    /// three tests below opened vaults without it, which is how four derivations
+    /// came to be able to run at once under `--test-threads=4` on a machine with
+    /// sixteen gigabytes: the permit existed, it was taken by the `file` and
+    /// `key` suites, and the facade's own tests were the hole in it.
+    fn open_here(request: &OpenRequest<'_>) -> Result<Vault, VaultError> {
+        let _permit = key::one_derivation_at_a_time();
+        Vault::open(request)
+    }
+
     #[test]
     fn a_vault_opened_under_the_reduced_profile_carries_its_note() {
-        let vault = Vault::open(&OpenRequest {
+        let vault = open_here(&OpenRequest {
             passphrase: &passphrase(),
             profile: ProfileName::Ci,
             backing: Backing::Memory,
@@ -547,7 +605,7 @@ mod tests {
 
     #[test]
     fn a_vault_cannot_be_opened_without_a_passphrase() {
-        let refusal = Vault::open(&OpenRequest {
+        let refusal = open_here(&OpenRequest {
             passphrase: &Passphrase::new(Vec::new()),
             profile: ProfileName::Ci,
             backing: Backing::Memory,
@@ -560,7 +618,7 @@ mod tests {
 
     #[test]
     fn a_memory_vault_reports_the_memory_backend_and_no_path() {
-        let vault = Vault::open(&OpenRequest {
+        let vault = open_here(&OpenRequest {
             passphrase: &passphrase(),
             profile: ProfileName::Ci,
             backing: Backing::Memory,
@@ -579,7 +637,7 @@ mod tests {
 
     #[test]
     fn compacting_a_memory_vault_purges_and_reports_no_file_work() {
-        let mut vault = Vault::open(&OpenRequest {
+        let mut vault = open_here(&OpenRequest {
             passphrase: &passphrase(),
             profile: ProfileName::Ci,
             backing: Backing::Memory,
@@ -599,6 +657,64 @@ mod tests {
         let after_ttl = 1_700_000_000_000 + vault.limits().ttl_ms + 1;
         assert_eq!(vault.compact(after_ttl).unwrap(), None);
         assert_eq!(vault.session_count(), 0);
+    }
+
+    /// `entries_count` is what a lookup could still return, not what the store
+    /// happens to be holding.
+    ///
+    /// The two diverge whenever a session outlives its time to live without
+    /// anything having swept it, which is every moment between two requests and
+    /// the whole gap between a restart and the first one. The second
+    /// conversation below carries the clock that makes the first one over; the
+    /// first session is still in the store, and `/admin/vault/status` used to
+    /// count its record as a mapping this vault could resolve.
+    #[test]
+    fn the_status_count_leaves_out_records_a_lookup_would_no_longer_resolve() {
+        let mut vault =
+            Vault::from_master_key(MasterKey::from_bytes([0x5a; 32]), SessionLimits::default())
+                .unwrap();
+        let started = 1_700_000_000_000;
+        let ended = SessionId::from_bytes([0x44; 16]);
+        let live = SessionId::from_bytes([0x55; 16]);
+
+        vault
+            .store_alias(
+                &ended,
+                AliasSeed::from_bytes([1u8; 32]),
+                "PSK_PERSON_1",
+                b"Ahmet Yilmaz",
+                started,
+            )
+            .unwrap();
+        assert!(vault.status().to_json().contains("\"entries_count\":1"));
+
+        let after_ttl = started + vault.limits().ttl_ms + 1;
+        vault
+            .store_alias(
+                &live,
+                AliasSeed::from_bytes([2u8; 32]),
+                "PSK_PERSON_2",
+                b"Ayse Demir",
+                after_ttl,
+            )
+            .unwrap();
+
+        // The expired session is still there: nothing touched it, and a
+        // projection may not change what the vault holds in order to answer.
+        assert_eq!(vault.session_count(), 2);
+        let json = vault.status().to_json();
+        assert!(json.contains("\"entries_count\":1"), "{json}");
+
+        // And the count agrees with the answer the endpoint's own vault gives:
+        // the record it left out is the one that no longer resolves.
+        assert!(matches!(
+            vault.restore(&ended, "PSK_PERSON_1", after_ttl).unwrap(),
+            Restored::Unresolved(UnresolvedReason::SessionExpired)
+        ));
+        assert!(matches!(
+            vault.restore(&live, "PSK_PERSON_2", after_ttl).unwrap(),
+            Restored::Value(_)
+        ));
     }
 
     #[test]

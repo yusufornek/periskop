@@ -45,11 +45,18 @@
 //! command_surface.rs` fails if a second one appears.
 
 // The vault may not write to a process stream, and neither may anything else in
-// this crate. `tests/vault_no_plaintext.rs` searches five surfaces for a planted
-// value and `stdout` is the sixth; a single `dbg!(plaintext)` in the sealing path
-// puts every masked value on `stderr`, where no artefact and no reviewer would
-// look. Denied here rather than left to review, and `no_vault_source_writes_to_a_
-// process_stream` is what catches an `#[allow]` put back on top of it.
+// this crate. `tests/vault_no_plaintext.rs` searches a named list of surfaces for
+// a planted value and two of them are the `stdout` and `stderr` of real child
+// processes: one that runs a vault's lifecycle, one that masks a prompt and
+// restores an answer. A single `dbg!(plaintext)` on either path puts every value
+// a user typed on `stderr`, where no artefact and no reviewer would look.
+//
+// This denial is crate wide, and that is exactly why a scan that read one subtree
+// was not enough to hold it: an `#[allow(clippy::dbg_macro)]` written on **any**
+// module turns it off for that module, and the request path is where the
+// plaintext is at its widest. `no_source_writes_to_a_process_stream` reads what
+// this line covers and fails on the `#[allow]` that would put the denial back to
+// sleep.
 #![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
 pub mod alias;

@@ -73,6 +73,17 @@ pub struct Frame {
     /// Whether the payload lines carried a trailing `\r`, so a frame this proxy
     /// rewrites comes back in the line ending it arrived in.
     crlf: bool,
+    /// The bytes verbatim, when this is the unterminated tail of a stream.
+    ///
+    /// `None` for every frame read between two terminators, which is every
+    /// ordinary frame. It is `Some` only for what [`Frames::finish`] was holding
+    /// when the connection ended, and only when those bytes carry no `data:`
+    /// field: they are then a frame nothing can be parsed out of, and this field
+    /// is what keeps them from being dropped. Rendering them back through
+    /// [`Frame::render`] would invent a `data:` line the provider never wrote, so
+    /// they go out exactly as they arrived and are marked
+    /// (`x-periskop-stream-truncated`) rather than rewritten.
+    tail: Option<String>,
 }
 
 impl Frame {
@@ -116,7 +127,19 @@ impl Frame {
 
     /// The frame as it arrived.
     pub fn bytes(&self) -> Vec<u8> {
-        self.render(&self.data)
+        match &self.tail {
+            Some(raw) => raw.clone().into_bytes(),
+            None => self.render(&self.data),
+        }
+    }
+
+    /// Whether this frame is the tail a stream ended in the middle of.
+    ///
+    /// Exposed so a caller can tell "the provider finished" from "the connection
+    /// stopped part way through a frame", which `proxy-api.md`'s fifth streaming
+    /// point calls an error to be marked.
+    pub const fn is_unterminated_tail(&self) -> bool {
+        self.tail.is_some()
     }
 
     /// The same frame carrying a different payload.
@@ -174,6 +197,15 @@ impl Frames {
     /// at the end of a stream an error to be **marked**, not one to be silently
     /// discarded, and discarding them here would lose the last words of an answer
     /// as well as the mark.
+    ///
+    /// The second branch is the one that was missing. [`parse`] answers `None`
+    /// for a block carrying no `data:` field, and a cut that lands anywhere
+    /// before the payload's colon produces exactly that: `event: content_block_`
+    /// or `dat` is a leftover nothing parses out of. Those bytes used to be
+    /// cleared here and the stream then looked complete to every layer above,
+    /// which is the silent half of a truncation. They are handed back verbatim
+    /// now, so the client receives what arrived and
+    /// [`ends_mid_frame`] is what puts the mark on it.
     pub fn finish(&mut self) -> Option<Frame> {
         if self.pending.iter().all(u8::is_ascii_whitespace) {
             self.pending.clear();
@@ -181,7 +213,15 @@ impl Frames {
         }
         let text = String::from_utf8_lossy(&self.pending).into_owned();
         self.pending.clear();
-        parse(&text)
+        if let Some(frame) = parse(&text) {
+            return Some(frame);
+        }
+        Some(Frame {
+            prelude: Vec::new(),
+            data: String::new(),
+            crlf: text.contains("\r\n"),
+            tail: Some(text),
+        })
     }
 
     /// Whether any byte is still waiting for its terminator.
@@ -249,7 +289,49 @@ fn parse(block: &str) -> Option<Frame> {
         prelude,
         data: data.join("\n"),
         crlf,
+        tail: None,
     })
+}
+
+/// Whether these bytes end without completing a frame.
+///
+/// The answer `x-periskop-stream-truncated` is written from, and the reason it
+/// is a function over the whole body rather than a flag on the reader: the
+/// reader is drained frame by frame as the stream arrives, so by the time
+/// anybody asks it what it is holding it is holding the tail and nothing that
+/// says a tail is what it is.
+///
+/// Read at the same two terminators [`boundary`] reads, and
+/// `the_boundary_scan_and_the_reader_agree_on_where_a_stream_ends` is what stops
+/// the two drifting: a scan that answered a different question would put the
+/// mark on complete streams or leave it off truncated ones, and both are worse
+/// than not marking at all.
+pub fn ends_mid_frame(body: &[u8]) -> bool {
+    let after = last_terminator_end(body);
+    !body[after..].iter().all(u8::is_ascii_whitespace)
+}
+
+/// Where the last complete frame in these bytes ends.
+///
+/// One left to right pass, unlike [`boundary`], which restarts at the front of
+/// what is still pending. That matters here because this walks a whole answer
+/// rather than one reader's buffer, and a rescan per frame would make the cost
+/// of marking a stream quadratic in the number of events it carried.
+fn last_terminator_end(body: &[u8]) -> usize {
+    let mut end = 0;
+    let mut at = 0;
+    while at < body.len() {
+        if body[at..].starts_with(b"\n\n") {
+            at += 2;
+            end = at;
+        } else if body[at..].starts_with(b"\r\n\r\n") {
+            at += 4;
+            end = at;
+        } else {
+            at += 1;
+        }
+    }
+    end
 }
 
 /// Every text slot a frame's document carries, in document order.
@@ -501,5 +583,72 @@ mod tests {
         assert!(reader.push(b"data: {\"choices\":[]}").is_empty());
         let leftover = reader.finish().expect("the truncated frame is returned");
         assert_eq!(leftover.data(), "{\"choices\":[]}");
+        assert!(!leftover.is_unterminated_tail());
+    }
+
+    /// The half of the rule above that was missing.
+    ///
+    /// A cut before the payload's colon leaves bytes no `data:` line can be read
+    /// out of, and those used to be cleared without a trace: the client lost the
+    /// bytes, no header said so, and the stream read as complete everywhere
+    /// above. Every one of these is a real cut of a real Anthropic frame.
+    #[test]
+    fn a_tail_that_parses_as_no_frame_is_still_handed_back() {
+        for cut in [
+            "event: content_block_",
+            "event: content_block_delta\n",
+            "dat",
+            ": keep-ali",
+        ] {
+            let mut reader = Frames::new();
+            assert!(reader.push(cut.as_bytes()).is_empty(), "{cut}");
+            let leftover = reader
+                .finish()
+                .unwrap_or_else(|| panic!("{cut} was dropped"));
+            assert!(leftover.is_unterminated_tail(), "{cut}");
+            // Verbatim, because rendering it would invent a `data:` line the
+            // provider never wrote and hand the client a frame it did not send.
+            assert_eq!(leftover.bytes(), cut.as_bytes(), "{cut}");
+            assert!(!leftover.ends_the_stream(), "{cut}");
+            assert!(leftover.document().is_none(), "{cut}");
+        }
+    }
+
+    /// The mark and the reader answer the same question about the same bytes.
+    ///
+    /// [`ends_mid_frame`] walks a whole answer in one pass and [`Frames`] walks
+    /// it a frame at a time; they read the same two terminators and this is what
+    /// fails if one of them stops. A scan that drifted would either mark complete
+    /// streams truncated or leave the mark off a stream that lost its last words,
+    /// and the second is the silent failure this whole rule exists for.
+    #[test]
+    fn the_boundary_scan_and_the_reader_agree_on_where_a_stream_ends() {
+        let complete = format!("{}data: [DONE]\n\n", openai_chunk("Fatura "));
+        let cases: &[(&str, bool)] = &[
+            (&complete, false),
+            ("data: one\n\ndata: two", true),
+            ("event: ping\r\ndata: {}\r\n\r\n", false),
+            ("event: ping\r\ndata: {}\r\n\r\nevent: pi", true),
+            ("", false),
+            ("\n\n", false),
+            // Trailing whitespace after the last terminator is the shape a
+            // provider's keep alive newline leaves, and it is not a truncation.
+            ("data: one\n\n\n", false),
+        ];
+        for (stream, truncated) in cases {
+            assert_eq!(
+                ends_mid_frame(stream.as_bytes()),
+                *truncated,
+                "ends_mid_frame disagrees on {stream:?}"
+            );
+
+            let mut reader = Frames::new();
+            let _complete = reader.push(stream.as_bytes());
+            assert_eq!(
+                reader.finish().is_some(),
+                *truncated,
+                "the reader disagrees with ends_mid_frame on {stream:?}"
+            );
+        }
     }
 }

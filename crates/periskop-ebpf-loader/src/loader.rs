@@ -65,6 +65,15 @@ use crate::{attached::Attached, attached::OpenError, syscall};
 pub struct RawBatch {
     pub events: Vec<RawEvent>,
     pub dropped: u64,
+    /// Whether `dropped` is a reading or a placeholder.
+    ///
+    /// True when the kernel would not answer for the loss counter at all. The
+    /// number beside it is then zero because a `u64` has no other empty value,
+    /// and zero is precisely the wrong thing for a reader to believe: it is what
+    /// a healthy run reports. Anything deciding what a coverage statement says
+    /// has to consult [`RawBatch::losses`] rather than the number, which is why
+    /// that accessor exists and this flag is public beside it.
+    pub dropped_unknown: bool,
     /// Frames that arrived and the decoder refused.
     ///
     /// Separate from `dropped` because the two are different losses with
@@ -73,6 +82,42 @@ pub struct RawBatch {
     /// build's record layout. Folding them together would let a version mismatch
     /// present itself as a busy machine.
     pub undecodable: u64,
+}
+
+impl RawBatch {
+    /// An empty batch carrying what the kernel said about its loss counter.
+    ///
+    /// The one place `Option<u64>` becomes the pair of fields above, and it is a
+    /// constructor rather than three lines inside [`EbpfLoader::poll`] for a
+    /// reason a mutation run produced: `poll`'s body is behind
+    /// `cfg(all(target_os = "linux", periskop_kernel_object))`, which is compiled
+    /// in exactly one continuous integration job. Replacing the unknown arm with
+    /// a plain `RawBatch::default()` there, which is precisely the `unwrap_or(0)`
+    /// defect coming back, survived every test the development machine can run,
+    /// because there was nothing on that machine to compile. Out here it is
+    /// checked on every platform.
+    pub fn from_loss_counter(dropped: Option<u64>) -> Self {
+        match dropped {
+            Some(dropped) => Self {
+                dropped,
+                ..Self::default()
+            },
+            None => Self {
+                dropped_unknown: true,
+                ..Self::default()
+            },
+        }
+    }
+
+    /// What the ring buffer lost, or nothing when the kernel would not say.
+    ///
+    /// The reading that cannot be misread. `dropped` on its own is zero both for
+    /// a run that lost nothing and for a run that could not find out, and those
+    /// are the two facts `network-sensor/spec.md` §8 requires a coverage
+    /// statement to keep apart.
+    pub fn losses(&self) -> Option<u64> {
+        (!self.dropped_unknown).then_some(self.dropped)
+    }
 }
 
 /// The kernel side of the sensor.
@@ -302,10 +347,12 @@ impl EbpfLoader {
             let Some(attached) = self.attached.as_mut() else {
                 return RawBatch::default();
             };
-            let mut batch = RawBatch {
-                dropped: attached.dropped(),
-                ..RawBatch::default()
-            };
+            // An unreadable loss counter is carried as "unknown" rather than as
+            // a zero, because the two would send a reader to opposite
+            // conclusions about the same run. The decision itself is in
+            // `RawBatch::from_loss_counter`, which is compiled and tested
+            // everywhere; this line is the only part of it that is not.
+            let mut batch = RawBatch::from_loss_counter(attached.dropped());
             for frame in attached.drain() {
                 match RawEvent::decode(&frame) {
                     Ok(event) => batch.events.push(event),
@@ -547,6 +594,35 @@ mod tests {
         let batch = loader.poll();
         assert!(batch.events.is_empty());
         assert_eq!(batch.dropped, 0);
+    }
+
+    /// The distinction the coverage statement rests on, held as an assertion.
+    ///
+    /// `dropped` is zero in two of the three batches below and they mean
+    /// opposite things: one machine lost nothing and one machine would not say.
+    /// Only [`RawBatch::losses`] tells them apart, which is why the number is
+    /// not the accessor a consumer is meant to read.
+    #[test]
+    fn a_loss_counter_the_kernel_would_not_read_does_not_report_zero_losses() {
+        // Built through the constructor the kernel path uses, so this covers the
+        // mapping and not just the accessor.
+        let quiet = RawBatch::from_loss_counter(Some(0));
+        assert_eq!(quiet.losses(), Some(0));
+
+        let unreadable = RawBatch::from_loss_counter(None);
+        assert_eq!(
+            unreadable.dropped, quiet.dropped,
+            "the number cannot carry the difference, which is the whole reason for the flag"
+        );
+        assert_eq!(
+            unreadable.losses(),
+            None,
+            "an unreadable loss counter came back as a run that lost nothing"
+        );
+
+        let busy = RawBatch::from_loss_counter(Some(17));
+        assert_eq!(busy.losses(), Some(17));
+        assert_eq!(busy.dropped, 17);
     }
 
     #[test]
