@@ -21,7 +21,12 @@ schema_version = "1.0"
 language = "typescript"
 provider = "unknown"
 rule_id = "typescript.static.http-provider-endpoint"
-rule_version = "1.0.0"
+# 1.1.0 rather than 1.0.0: the alternation below gained the AWS Bedrock host that
+# the Python, Go and Java copies of this rule already carried, so this detector
+# now reports call sites that the version before it walked past in silence. That
+# is a change in what the rule finds, and a reader comparing two reports has to be
+# able to see it without diffing rule hashes.
+rule_version = "1.1.0"
 
 # Libraries this rule accounts for. It keys on the destination rather than on a
 # client object, so without this the HTTP clients it covers would be reported as
@@ -37,7 +42,7 @@ query = '''
     .
     (string) @url)
   (#eq? @fn "fetch")
-  (#match? @url "(api\\.openai\\.com|api\\.anthropic\\.com|generativelanguage\\.googleapis\\.com|openai\\.azure\\.com)")) @call
+  (#match? @url "(api\\.openai\\.com|api\\.anthropic\\.com|generativelanguage\\.googleapis\\.com|openai\\.azure\\.com|bedrock-runtime\\.[a-z0-9-]+\\.amazonaws\\.com)")) @call
 '''
 
 [[match]]
@@ -51,7 +56,7 @@ query = '''
     .
     (string) @url)
   (#match? @verb "^(post|get|put|request)$")
-  (#match? @url "(api\\.openai\\.com|api\\.anthropic\\.com|generativelanguage\\.googleapis\\.com|openai\\.azure\\.com)")) @call
+  (#match? @url "(api\\.openai\\.com|api\\.anthropic\\.com|generativelanguage\\.googleapis\\.com|openai\\.azure\\.com|bedrock-runtime\\.[a-z0-9-]+\\.amazonaws\\.com)")) @call
 '''
 
 [extract]

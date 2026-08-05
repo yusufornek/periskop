@@ -83,6 +83,11 @@ fn fixtures(group: &str) -> Vec<(String, String, Language)> {
 /// the fixtures that must stay confirmed. This table keeps both statements.
 const EXPECTED_CONFIDENCE: &[(&str, Confidence)] = &[
     ("anthropic_messages.ts", Confidence::Confirmed),
+    // Same rule and the same reason as `fetch_literal.ts`: matched on the text of
+    // a URL. Listed separately because the host it exercises is the one the
+    // TypeScript alternation was missing, and a fixture folded into the other
+    // entry would stop naming what it guards.
+    ("fetch_bedrock.ts", Confidence::Suspect),
     // Matched on the text of a URL, so the provider claim is a text coincidence
     // away from being wrong.
     ("fetch_literal.ts", Confidence::Suspect),

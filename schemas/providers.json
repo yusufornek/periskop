@@ -1,0 +1,48 @@
+{
+  "$comment": "The provider classification table, in one place. Written because the same list lived in six hand maintained copies and drifted: `rules/typescript/http-literal-endpoint.toml` was missing the Bedrock alternative that the Python, Go and Java copies carried, so `fetch(\"https://bedrock-runtime.<region>.amazonaws.com/...\")` produced no finding in TypeScript and a `suspect` finding in Python. Nothing was red, because no gate compared the copies. The copies still exist, and have to: a hook runs inside somebody else's process where this file is not on disk, and a tree-sitter query is compiled from a literal string that no loader interpolates. What changed is that they are now derived claims rather than independent ones, checked against this file by `crates/periskop-static-scanner/tests/provider_table.rs`. Format decided in hub/memory/interfaces.md line 350: JSON rather than TOML, because a hook may carry no dependency and only JSON is stdlib in both Python and Node.",
+  "schema_version": "1.0",
+  "exact_hosts": [
+    {
+      "host": "api.openai.com",
+      "provider_ref": "openai",
+      "static_url_pattern": "api\\.openai\\.com"
+    },
+    {
+      "host": "api.anthropic.com",
+      "provider_ref": "anthropic",
+      "static_url_pattern": "api\\.anthropic\\.com"
+    },
+    {
+      "host": "generativelanguage.googleapis.com",
+      "provider_ref": "google-gemini",
+      "static_url_pattern": "generativelanguage\\.googleapis\\.com"
+    },
+    { "host": "api.mistral.ai", "provider_ref": "mistral" },
+    { "host": "api.cohere.ai", "provider_ref": "cohere" },
+    { "host": "api.cohere.com", "provider_ref": "cohere" },
+    { "host": "api.groq.com", "provider_ref": "groq" },
+    { "host": "api.deepseek.com", "provider_ref": "deepseek" },
+    { "host": "api.together.xyz", "provider_ref": "together" },
+    { "host": "openrouter.ai", "provider_ref": "openrouter" }
+  ],
+  "suffix_hosts": [
+    {
+      "suffix": ".openai.azure.com",
+      "provider_ref": "azure-openai",
+      "static_url_pattern": "openai\\.azure\\.com"
+    },
+    { "suffix": ".cognitiveservices.azure.com", "provider_ref": "azure-cognitive" },
+    { "suffix": "-aiplatform.googleapis.com", "provider_ref": "google-vertex" },
+    { "suffix": ".huggingface.co", "provider_ref": "huggingface" },
+    { "suffix": ".pinecone.io", "provider_ref": "pinecone" },
+    { "suffix": ".weaviate.network", "provider_ref": "weaviate" },
+    { "suffix": ".qdrant.io", "provider_ref": "qdrant" }
+  ],
+  "pattern_hosts": [
+    {
+      "pattern": "^bedrock(-runtime)?\\.[a-z0-9-]+\\.amazonaws\\.com$",
+      "provider_ref": "aws-bedrock",
+      "static_url_pattern": "bedrock-runtime\\.[a-z0-9-]+\\.amazonaws\\.com"
+    }
+  ]
+}

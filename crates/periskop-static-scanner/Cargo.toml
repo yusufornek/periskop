@@ -29,3 +29,7 @@ tree-sitter-java = { workspace = true }
 [dev-dependencies]
 periskop-core = { workspace = true }
 streaming-iterator = { workspace = true }
+# Reads `schemas/providers.json` in `tests/provider_table.rs`, the gate that keeps
+# the six copies of the provider table equal. Test only and already a workspace
+# dependency, so this adds nothing to what the binary carries.
+serde_json = { workspace = true }

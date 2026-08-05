@@ -88,6 +88,34 @@ function checkSchemaIdentities() {
   return problems;
 }
 
+// Normative data files that live beside the schemas rather than under examples/,
+// because they are the contract itself and not an illustration of one. Each is
+// validated against its own schema. Without this the file would be the one
+// document in this directory with no gate, which is exactly how the provider
+// table drifted in the first place: a rule with no gate stays silent when it is
+// broken.
+const NORMATIVE_DATA = [["providers.json", "providers.schema.json"]];
+
+function checkNormativeData() {
+  let problems = 0;
+  for (const [dataFile, schemaFile] of NORMATIVE_DATA) {
+    const dataPath = join(schemaDir, dataFile);
+    if (!existsSync(dataPath)) {
+      console.error(`FAIL ${dataFile}: declared normative but not present in schemas/`);
+      problems++;
+      continue;
+    }
+    const { ok, output } = ajvValidate(schemaFile, dataPath);
+    if (!ok) {
+      console.error(`FAIL ${dataFile}: expected to validate against ${schemaFile}\n${output}`);
+      problems++;
+      continue;
+    }
+    console.log(`ok   ${dataFile} valid against ${schemaFile}`);
+  }
+  return problems;
+}
+
 const expectationsPath = join(exampleDir, "invalid-expectations.json");
 const expectations = JSON.parse(readFileSync(expectationsPath, "utf8"));
 const expectedByFile = new Map(expectations.cases.map((c) => [c.file, c]));
@@ -96,7 +124,7 @@ const examples = readdirSync(exampleDir)
   .filter((f) => f.endsWith(".json") && f !== "invalid-expectations.json")
   .sort();
 
-let failures = checkSchemaIdentities();
+let failures = checkSchemaIdentities() + checkNormativeData();
 let checked = 0;
 
 for (const file of examples) {

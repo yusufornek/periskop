@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://periskop.dev/schemas/providers.schema.json",
+  "title": "ProviderTable",
+  "type": "object",
+  "description": "The one table that says which host belongs to which provider. Every other copy in the repository is derived from it and gated against it.",
+  "$comment": "This schema exists for the reason mcp-tools.schema.json gives about itself: a contract with no gate stays silent when it is broken, which is the failure mode this product reports on. The agreement between this file and its six copies is checked in Rust; the shape of this file is checked here, so a malformed entry fails before it can silently drop a provider from the derived alternation.",
+  "required": ["schema_version", "exact_hosts", "suffix_hosts", "pattern_hosts"],
+  "additionalProperties": false,
+  "properties": {
+    "$comment": { "type": "string" },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$",
+      "description": "Version of this table's shape, not of its contents. A new provider is not a new version."
+    },
+    "exact_hosts": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Hosts that classify on a whole-string match. Consulted first, because an exact answer must not be reachable by a broader rule.",
+      "items": {
+        "type": "object",
+        "required": ["host", "provider_ref"],
+        "additionalProperties": false,
+        "properties": {
+          "host": { "type": "string", "minLength": 1 },
+          "provider_ref": { "$ref": "#/$defs/provider_ref" },
+          "static_url_pattern": { "$ref": "#/$defs/static_url_pattern" }
+        }
+      }
+    },
+    "suffix_hosts": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Hosts a tenant or index name sits in front of, so an exact match cannot reach them. Consulted after the exact table and in the order written.",
+      "items": {
+        "type": "object",
+        "required": ["suffix", "provider_ref"],
+        "additionalProperties": false,
+        "properties": {
+          "suffix": { "type": "string", "minLength": 1 },
+          "provider_ref": { "$ref": "#/$defs/provider_ref" },
+          "static_url_pattern": { "$ref": "#/$defs/static_url_pattern" }
+        }
+      }
+    },
+    "pattern_hosts": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Hosts with a variable segment in the middle, which neither an exact nor a suffix test reaches. Consulted last.",
+      "items": {
+        "type": "object",
+        "required": ["pattern", "provider_ref"],
+        "additionalProperties": false,
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "pattern": "^\\^.*\\$$",
+            "description": "Anchored at both ends. A suffix test alone would read bedrock-runtime.eu-west-1.amazonaws.com.attacker.test as Bedrock, so the anchors are part of the contract rather than a style choice."
+          },
+          "provider_ref": { "$ref": "#/$defs/provider_ref" },
+          "static_url_pattern": { "$ref": "#/$defs/static_url_pattern" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "provider_ref": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "description": "Provider identity, spelled the way finding.schema.json and egress-event.schema.json spell it. Inventing a value here would put a name in reports that no other component knows."
+    },
+    "static_url_pattern": {
+      "type": "string",
+      "minLength": 1,
+      "description": "How the static scanner's http-literal-endpoint rules spell this host inside a tree-sitter #match? predicate, with single backslashes. Absent means the static rules deliberately do not target this host: the scanner reports LLM egress, and a vector database is not that. Present entries are concatenated in file order to form the alternation every language family's rule must carry, which is why the order of these arrays is load bearing."
+    }
+  }
+}
