@@ -30,6 +30,11 @@ repository = "https://github.com/yusufornek/periskop"
 authors = ["periskop contributors"]
 
 [workspace.dependencies]
+# Detection layer B's single pass scan (ADR-004, ADR-016 section 1's table). One
+# automaton over the whole organization word list, built once per policy load and
+# frozen for the life of a request (ADR-010 section 4), because rebuilding it mid
+# stream would change what a half emitted alias matches against.
+aho-corasick = "1.1"
 periskop-core = { path = "crates/periskop-core" }
 periskop-static-scanner = { path = "crates/periskop-static-scanner" }
 periskop-report = { path = "crates/periskop-report" }
@@ -78,7 +83,56 @@ hkdf = "0.12"
 # chain calls it directly and a crate this workspace uses on purpose has to be a
 # line somebody decided to write.
 hmac = "0.12"
+# The proxy's own HTTP surface, server half (ADR-004) and client half (ADR-016
+# section 3). One stack for both directions: a second HTTP implementation would
+# mean two parsers disagreeing about the same request on the two sides of the
+# component that is supposed to mediate it.
+hyper = { version = "1.5", default-features = false, features = [
+    "server",
+    "client",
+    "http1",
+] }
+# What hyper 1.0 moved out of its own core (ADR-016 section 3): the tokio
+# adapters, the connection server loop and the pooling client. Not a new
+# maintainer and not a new audit surface, which is the whole reason the ADR let
+# them in without a separate decision.
+hyper-util = { version = "0.1", default-features = false, features = [
+    "tokio",
+    "server",
+    "http1",
+    "client-legacy",
+] }
+http-body-util = "0.1"
+# TLS to the provider. `ring` rather than `aws-lc-rs`, and this line is the
+# per-target build attempt ADR-016 section 3 said the choice had to wait for:
+# `aws-lc-rs` wants `cmake` and, on some targets, `nasm`, which ADR-002's cross
+# compilation story pays for on every host. `ring` builds with the `cc` the ADR
+# already budgeted. Recorded here rather than in the ADR because the ADR fixed
+# the stack and left the provider to packaging.
+hyper-rustls = { version = "0.27", default-features = false, features = [
+    "ring",
+    "http1",
+    "tls12",
+    "native-tokio",
+] }
+# `native-tokio` above is what pulls `rustls-native-certs` in, which is the root
+# store ADR-016 section 3 chose over an embedded list: the trust decision belongs
+# to the operating system the organization administers, not to periskop's release
+# calendar. Named through the feature rather than as a direct dependency so that
+# the version the connector was built against and the version this manifest asks
+# for cannot drift apart.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
 ignore = "0.4"
+# Detection layer A's pattern engine (ADR-016 section 1). Chosen for its linear
+# time guarantee rather than for its popularity: the proxy scans attacker chosen
+# text, and a backtracking engine turns one carefully written prompt into a hang
+# of a fail closed component, which is every LLM call in the organization
+# stopping. A hand written engine was rejected in the same section.
+regex = "1.11"
 tree-sitter = "0.25"
 tree-sitter-python = "0.25"
 tree-sitter-typescript = "0.23"
@@ -93,6 +147,18 @@ serde_json = "1.0"
 # with no measurement behind it.
 sha2 = "0.10"
 thiserror = "2.0"
+# The proxy's runtime (ADR-004). Deliberately not `features = ["full"]`: the
+# proxy needs sockets, a scheduler, timers and a mutex, and `full` would add a
+# process spawner and a signal handler to the one component in this workspace
+# that holds vault keys and unmasked request bodies.
+tokio = { version = "1.41", default-features = false, features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+    "macros",
+] }
 toml = "0.9"
 streaming-iterator = "0.1"
 # Clears private key bytes from the buffers this workspace owns. The signing key
