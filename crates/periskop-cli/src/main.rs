@@ -4,7 +4,7 @@
 //! they are mapped explicitly here rather than falling out of whatever the last
 //! expression returned.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
@@ -56,7 +56,13 @@ enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Directory holding detector rules.
+        /// Directory holding detector rules, replacing the ones built in.
+        ///
+        /// Without it the scan runs the rule set compiled into this binary, so a
+        /// downloaded executable works from any directory. With it the named
+        /// directory decides the run and the embedded set is not consulted,
+        /// because an operator running detectors they wrote must not have the
+        /// shipped ones firing alongside them.
         #[arg(long, value_name = "DIR")]
         rules: Option<PathBuf>,
 
@@ -118,7 +124,7 @@ enum Command {
     /// Used by the MCP server, which stays a thin client so that detection lives
     /// in one place rather than being reimplemented in a second language.
     ServeRpc {
-        /// Directory holding detector rules.
+        /// Directory holding detector rules, replacing the ones built in.
         #[arg(long, value_name = "DIR")]
         rules: Option<PathBuf>,
     },
@@ -405,14 +411,17 @@ fn report_hook_error(error: &HookError) -> ExitCode {
 }
 
 fn run_serve_rpc(rules: Option<PathBuf>) -> ExitCode {
-    let rules_root = rules.unwrap_or_else(default_rules_root);
+    let rule_source = match resolve_rule_source(rules.as_deref()) {
+        Ok(source) => source,
+        Err(given) => return report_missing_rule_directory(given),
+    };
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
 
     match rpc::serve(
         stdin.lock(),
         stdout.lock(),
-        rules_root,
+        rule_source,
         env!("CARGO_PKG_VERSION"),
         now_rfc3339,
     ) {
@@ -496,14 +505,19 @@ fn run_scan(args: ScanArgs) -> ExitCode {
         return ExitCode::from(exit::ERROR);
     }
 
-    let rules_root = rules.unwrap_or_else(default_rules_root);
-    if !rules_root.is_dir() {
-        eprintln!(
-            "periskop: no rule directory at {}. Pass --rules to point at one.",
-            rules_root.display()
-        );
-        return ExitCode::from(exit::ERROR);
-    }
+    let rule_source = match resolve_rule_source(rules.as_deref()) {
+        Ok(source) => source,
+        Err(given) => return report_missing_rule_directory(given),
+    };
+    // Printed on every run, and on stderr so that `--json` stays byte for byte
+    // what it was. A reader told a tree is clean has to be able to ask what it
+    // was clean according to, and the answer differs between a downloaded binary
+    // and a checkout whose rule directory somebody edited. The report body has
+    // nowhere to carry this yet; the request for a field is in
+    // `hub/memory/interfaces.md`, and an absolute path could not go in the body
+    // anyway without breaking the promise that two runs of one tree compare
+    // equal.
+    eprintln!("periskop: rules {rule_source}");
 
     // A path that does not resolve stops the run rather than being read as an
     // empty stream. The difference matters more here than anywhere else in this
@@ -573,7 +587,7 @@ fn run_scan(args: ScanArgs) -> ExitCode {
     let outcome = scan::run_with_sources(
         scan::ScanRequest {
             project_root: &path,
-            rules_root: &rules_root,
+            rules: rule_source,
             tool_version: env!("CARGO_PKG_VERSION"),
             generated_at,
         },
@@ -658,19 +672,35 @@ fn resolve_source_dir(flag: Option<PathBuf>, variable: &str) -> Result<Option<Pa
     }
 }
 
-/// Where rules live when the caller does not say.
+/// Which rule set this run uses, and a refusal when the caller named one that is
+/// not there.
 ///
-/// Looks next to the executable first, which is how an installed build finds the
-/// rules shipped alongside it, then falls back to the repository layout so the
-/// binary works from a development checkout without extra flags.
-fn default_rules_root() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let beside = dir.join("rules");
-            if beside.is_dir() {
-                return beside;
-            }
-        }
+/// The default is the set compiled into the binary (ADR-002: one artefact, no
+/// runtime dependency). Nothing is discovered on disk any more. The previous
+/// behaviour looked beside the executable and then in the working directory, and
+/// it failed in both directions: run from a directory with no `rules` tree the
+/// scan refused outright, which is what made `periskop scan path/to/project`
+/// wrong for everyone who unpacked one file; run from a directory that happened
+/// to have one, that tree silently replaced the shipped detectors.
+///
+/// A `--rules` path that is not a directory stops the run rather than falling
+/// back to the embedded set. Falling back would be the worst answer available:
+/// the operator asked for their own detectors, and the run would answer with
+/// somebody else's while reporting success.
+fn resolve_rule_source(flag: Option<&Path>) -> Result<scan::RuleSource<'_>, &Path> {
+    match flag {
+        Some(dir) if dir.is_dir() => Ok(scan::RuleSource::Directory(dir)),
+        Some(dir) => Err(dir),
+        None => Ok(scan::RuleSource::Embedded),
     }
-    PathBuf::from("rules")
+}
+
+/// Says the named directory is not there, in the shape every other refusal in
+/// this command takes.
+fn report_missing_rule_directory(given: &Path) -> ExitCode {
+    eprintln!(
+        "periskop: no rule directory at {}. Drop --rules to use the rules built into this binary.",
+        given.display()
+    );
+    ExitCode::from(exit::ERROR)
 }

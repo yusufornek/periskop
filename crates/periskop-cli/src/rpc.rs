@@ -9,13 +9,13 @@
 //! and the user sees a dead tool rather than an error they can act on.
 
 use std::io::{BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::clock::ClockError;
-use crate::scan;
+use crate::scan::{self, RuleSource};
 
 /// Error codes from the JSON-RPC specification, plus one of our own.
 mod code {
@@ -84,7 +84,7 @@ impl Response {
 pub fn serve(
     input: impl BufRead,
     mut output: impl Write,
-    rules_root: PathBuf,
+    rules: RuleSource<'_>,
     tool_version: &str,
     now: impl Fn() -> Result<String, ClockError>,
 ) -> std::io::Result<()> {
@@ -93,7 +93,7 @@ pub fn serve(
         if line.trim().is_empty() {
             continue;
         }
-        let response = handle(&line, &rules_root, tool_version, &now);
+        let response = handle(&line, rules, tool_version, &now);
         // A notification carries no id and expects no answer.
         if let Some(response) = response {
             let text = serde_json::to_string(&response)
@@ -107,7 +107,7 @@ pub fn serve(
 
 fn handle(
     line: &str,
-    rules_root: &Path,
+    rules: RuleSource<'_>,
     tool_version: &str,
     now: &impl Fn() -> Result<String, ClockError>,
 ) -> Option<Response> {
@@ -139,7 +139,7 @@ fn handle(
         "scan" => Some(scan_method(
             reply_id,
             &request.params,
-            rules_root,
+            rules,
             tool_version,
             now,
         )),
@@ -155,7 +155,7 @@ fn handle(
 fn scan_method(
     id: Value,
     params: &Value,
-    rules_root: &Path,
+    rules: RuleSource<'_>,
     tool_version: &str,
     now: &impl Fn() -> Result<String, ClockError>,
 ) -> Response {
@@ -177,7 +177,7 @@ fn scan_method(
 
     let outcome = scan::run(scan::ScanRequest {
         project_root: &project_root,
-        rules_root,
+        rules,
         tool_version,
         generated_at,
     });
@@ -197,13 +197,14 @@ fn scan_method(
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::path::Path;
 
     fn call(request: &str) -> String {
         let mut out = Vec::new();
         serve(
             Cursor::new(request),
             &mut out,
-            PathBuf::from("rules"),
+            RuleSource::Directory(Path::new("rules")),
             "0.0.0-test",
             || Ok("2026-08-04T09:00:00Z".to_owned()),
         )
@@ -281,7 +282,7 @@ mod tests {
                 serde_json::to_string(&project.to_string_lossy()).unwrap()
             )),
             &mut out,
-            PathBuf::from("this-rule-directory-does-not-exist"),
+            RuleSource::Directory(Path::new("this-rule-directory-does-not-exist")),
             "0.0.0-test",
             || Ok("2026-08-04T09:00:00Z".to_owned()),
         )
@@ -301,7 +302,7 @@ mod tests {
                 "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"scan\",\"params\":{\"path\":\".\"}}\n",
             ),
             &mut out,
-            PathBuf::from("rules"),
+            RuleSource::Directory(Path::new("rules")),
             "0.0.0-test",
             || Err(ClockError::BeforeEpoch),
         )

@@ -303,7 +303,11 @@ fn collect_toml_files(dir: &Path, out: &mut Vec<PathBuf>, errors: &mut Vec<RuleL
 /// Named rather than inferred. Skipping "anything that does not parse" would
 /// turn a genuinely broken detector rule into a silent omission, which is the
 /// failure mode this whole loader is written against.
-const FOREIGN_RULE_DIRECTORIES: &[&str] = &["masking"];
+///
+/// Visible to the crate because the embedded rule set carries the same tree and
+/// has to skip the same directories. Two lists would let the disk walk and the
+/// compiled-in copy disagree about what a detector rule is.
+pub(crate) const FOREIGN_RULE_DIRECTORIES: &[&str] = &["masking"];
 
 /// Whether this directory belongs to another component's rule language.
 ///

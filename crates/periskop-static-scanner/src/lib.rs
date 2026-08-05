@@ -13,4 +13,4 @@ pub mod rules;
 pub use discovery::{discover, DiscoveredFile, Discovery, DiscoveryOptions, SkippedFile};
 pub use language::Language;
 pub use parser::{parse, parse_as, ParseFailure, ParsedFile};
-pub use rules::{compile, load_directory, CompiledRules, RuleFile};
+pub use rules::{compile, load_directory, load_embedded, CompiledRules, RuleFile, RuleSource};

@@ -71,6 +71,7 @@ use periskop_network_sensor::{Flow, FlowScope, ScopePolicy};
 use periskop_reconcile::settings::ReconcileSettings;
 
 use periskop_cli::scan;
+use periskop_cli::scan::RuleSource;
 
 /// Minimum provider directed flows a cell needs before it may report a rate.
 ///
@@ -350,7 +351,7 @@ impl ScanTree {
         scan::run_with_sources(
             scan::ScanRequest {
                 project_root: &self.root.join("project"),
-                rules_root: &repo_root().join("rules"),
+                rules: RuleSource::Directory(&repo_root().join("rules")),
                 tool_version: "0.0.0-test",
                 generated_at: "2026-08-04T09:00:00Z".to_owned(),
             },

@@ -19,6 +19,7 @@ use periskop_report::{to_canonical_json, Verdict};
 // day that module touched something only `main.rs` provides they would have
 // stopped compiling for a reason that reads as unrelated.
 use periskop_cli::scan;
+use periskop_cli::scan::RuleSource;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -30,13 +31,17 @@ fn fixtures() -> PathBuf {
 
 fn run(generated_at: &str) -> scan::ScanOutcome {
     let root = repo_root();
-    run_in(&fixtures(), &root.join("rules"), generated_at)
+    run_in(
+        &fixtures(),
+        RuleSource::Directory(&root.join("rules")),
+        generated_at,
+    )
 }
 
-fn run_in(project_root: &Path, rules_root: &Path, generated_at: &str) -> scan::ScanOutcome {
+fn run_in(project_root: &Path, rules: RuleSource<'_>, generated_at: &str) -> scan::ScanOutcome {
     scan::run(scan::ScanRequest {
         project_root,
-        rules_root,
+        rules,
         tool_version: "0.0.0-test",
         generated_at: generated_at.to_owned(),
     })
@@ -204,7 +209,7 @@ fn a_call_whose_destination_cannot_be_read_is_declared_unresolved() {
 
     let outcome = run_in(
         &tree.path("project"),
-        &repo_root().join("rules"),
+        RuleSource::Directory(&repo_root().join("rules")),
         "2026-08-04T09:00:00Z",
     );
     let report = &outcome.report;
@@ -245,7 +250,7 @@ fn a_destination_the_scanner_can_read_stays_confirmed() {
 
     let outcome = run_in(
         &tree.path("project"),
-        &repo_root().join("rules"),
+        RuleSource::Directory(&repo_root().join("rules")),
         "2026-08-04T09:00:00Z",
     );
 
@@ -285,7 +290,7 @@ fn a_rule_set_that_does_not_load_is_reported_and_denied_a_pass() {
 
     let outcome = run_in(
         &tree.path("project"),
-        &tree.path("rules"),
+        RuleSource::Directory(&tree.path("rules")),
         "2026-08-04T09:00:00Z",
     );
     let report = &outcome.report;
@@ -354,7 +359,7 @@ fn a_rule_set_that_loads_nothing_at_all_is_denied_a_pass() {
 
     let outcome = run_in(
         &tree.path("project"),
-        &tree.path("rules"),
+        RuleSource::Directory(&tree.path("rules")),
         "2026-08-04T09:00:00Z",
     );
 
@@ -402,7 +407,7 @@ fn files_of_a_language_with_no_rules_are_declared_unparsed_not_counted_as_scanne
 
     let outcome = run_in(
         &tree.path("project"),
-        &tree.path("rules"),
+        RuleSource::Directory(&tree.path("rules")),
         "2026-08-04T09:00:00Z",
     );
     let coverage = &outcome.report.coverage;

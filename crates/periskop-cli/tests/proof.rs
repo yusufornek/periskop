@@ -30,6 +30,7 @@ use periskop_runtime_collector::event::{Language, Mechanism};
 use periskop_runtime_collector::{collect, EgressEvent};
 
 use periskop_cli::scan;
+use periskop_cli::scan::RuleSource;
 
 /// Destination the application reaches, supplied through the environment.
 ///
@@ -329,7 +330,7 @@ fn f2_gate_the_hook_records_a_call_the_static_scanner_cannot_see() {
     }
     let outcome = scan::run(scan::ScanRequest {
         project_root: &project,
-        rules_root: &repo_root().join("rules"),
+        rules: RuleSource::Directory(&repo_root().join("rules")),
         tool_version: "0.0.0-test",
         generated_at: "2026-08-04T09:00:00Z".to_owned(),
     });

@@ -62,6 +62,7 @@ use periskop_reconcile::settings::ReconcileSettings;
 use periskop_runtime_collector::collect;
 
 use periskop_cli::scan;
+use periskop_cli::scan::RuleSource;
 
 /// Set this in continuous integration so a machine without python3 fails the
 /// gate rather than skipping it. The same switch the F2 gate uses, and the same
@@ -516,7 +517,7 @@ fn f3_gate_the_sensor_records_a_call_neither_the_scanner_nor_the_hook_can_see() 
     }
     let outcome = scan::run(scan::ScanRequest {
         project_root: &project,
-        rules_root: &repo_root().join("rules"),
+        rules: RuleSource::Directory(&repo_root().join("rules")),
         tool_version: "0.0.0-test",
         generated_at: "2026-08-04T09:00:00Z".to_owned(),
     });
@@ -605,7 +606,7 @@ fn f3_gate_the_sensor_records_a_call_neither_the_scanner_nor_the_hook_can_see() 
     let reconciled = scan::run_with_sources(
         scan::ScanRequest {
             project_root: &project,
-            rules_root: &repo_root().join("rules"),
+            rules: RuleSource::Directory(&repo_root().join("rules")),
             tool_version: "0.0.0-test",
             generated_at: "2026-08-04T09:00:00Z".to_owned(),
         },
@@ -729,7 +730,7 @@ fn f3_gate_traffic_from_a_process_outside_the_codebase_is_counted_and_never_accu
     let reconciled = scan::run_with_sources(
         scan::ScanRequest {
             project_root: &project,
-            rules_root: &repo_root().join("rules"),
+            rules: RuleSource::Directory(&repo_root().join("rules")),
             tool_version: "0.0.0-test",
             generated_at: "2026-08-04T09:00:00Z".to_owned(),
         },

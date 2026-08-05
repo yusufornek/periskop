@@ -34,6 +34,7 @@ use periskop_runtime_collector::event::{
 };
 
 use periskop_cli::scan;
+use periskop_cli::scan::RuleSource;
 
 /// A code point that names where it goes.
 ///
@@ -293,7 +294,7 @@ impl Fixture {
         scan::run_with_sources(
             scan::ScanRequest {
                 project_root: &self.project(),
-                rules_root: &repo_root().join("rules"),
+                rules: RuleSource::Directory(&repo_root().join("rules")),
                 tool_version: "0.0.0-test",
                 generated_at: GENERATED_AT.to_owned(),
             },
@@ -313,7 +314,7 @@ impl Fixture {
         scan::run_with_events_and_settings(
             scan::ScanRequest {
                 project_root: &self.project(),
-                rules_root: &repo_root().join("rules"),
+                rules: RuleSource::Directory(&repo_root().join("rules")),
                 tool_version: "0.0.0-test",
                 generated_at: GENERATED_AT.to_owned(),
             },
@@ -334,7 +335,7 @@ fn run_with(project_root: &Path, event_dir: Option<&Path>) -> scan::ScanOutcome 
     scan::run_with_events(
         scan::ScanRequest {
             project_root,
-            rules_root: &repo_root().join("rules"),
+            rules: RuleSource::Directory(&repo_root().join("rules")),
             tool_version: "0.0.0-test",
             generated_at: GENERATED_AT.to_owned(),
         },

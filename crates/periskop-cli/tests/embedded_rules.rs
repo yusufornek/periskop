@@ -1,0 +1,226 @@
+#![allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
+//! The scenario a downloaded binary is actually run in.
+//!
+//! Copy one file somewhere, put some code next to it, run `periskop scan .`. That
+//! is the command the README prints and it did not work: the binary looked for a
+//! `rules` directory beside itself and then in the working directory, found
+//! neither, and stopped with
+//! `no rule directory at rules. Pass --rules to point at one.` and exit code 2.
+//! Nothing in the test suite ran the binary from outside the checkout, so the
+//! defect sat where no test could see it, and the packaging document had written
+//! it down as a shipping requirement rather than as a bug.
+//!
+//! Everything here runs the real executable from a directory that has no rule
+//! tree anywhere above it, because that is the only way to check the thing that
+//! was broken. A test calling the scan library would pass with the rule set the
+//! library was handed.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// A directory outside the repository, holding nothing but what the test puts in
+/// it.
+///
+/// The system temporary directory rather than a path under `target/`: a rule
+/// tree in an ancestor is exactly what these tests have to be free of.
+struct Elsewhere {
+    root: PathBuf,
+}
+
+impl Elsewhere {
+    fn new(name: &str) -> Self {
+        let root =
+            std::env::temp_dir().join(format!("periskop-embedded-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a working directory");
+        Self { root }
+    }
+
+    /// Copies the built executable in, the way a release archive is unpacked.
+    fn install_binary(&self) -> PathBuf {
+        let installed = self
+            .root
+            .join(format!("periskop{}", std::env::consts::EXE_SUFFIX));
+        std::fs::copy(env!("CARGO_BIN_EXE_periskop"), &installed).expect("the executable");
+        installed
+    }
+
+    fn write(&self, name: &str, contents: &str) {
+        std::fs::write(self.root.join(name), contents).expect("a source file");
+    }
+}
+
+impl Drop for Elsewhere {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// A call the shipped Python rules confirm.
+const PYTHON_EGRESS: &str = "from openai import OpenAI\n\nclient = OpenAI()\n\n\ndef ask(record):\n    return client.chat.completions.create(model=\"gpt-4\", messages=[{\"content\": record}])\n";
+
+fn scan_json(binary: &Path, working_directory: &Path, extra: &[&str]) -> (i32, String, String) {
+    let output = Command::new(binary)
+        .arg("scan")
+        .arg(".")
+        .arg("--json")
+        .args(extra)
+        .current_dir(working_directory)
+        .output()
+        .expect("the scan ran");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn a_binary_on_its_own_in_an_empty_directory_finds_egress() {
+    let elsewhere = Elsewhere::new("alone");
+    let binary = elsewhere.install_binary();
+    elsewhere.write("app.py", PYTHON_EGRESS);
+
+    let (code, stdout, stderr) = scan_json(&binary, &elsewhere.root, &[]);
+
+    assert_ne!(code, 2, "the scan refused to run: {stderr}");
+    assert!(
+        !stderr.contains("no rule directory"),
+        "the binary still wants a rule directory beside it: {stderr}"
+    );
+
+    let report: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("the report is not JSON ({e}): {stdout}"));
+    let findings = report["findings"].as_array().expect("a findings array");
+    assert_eq!(findings.len(), 1, "{stdout}");
+    assert_eq!(
+        findings[0]["detector"]["rule_id"], "python.static.openai-client-call",
+        "{stdout}"
+    );
+
+    // No diagnostics about the rule set, which is the other half of the claim:
+    // the rules did not merely exist, they loaded clean.
+    let diagnostics = report["diagnostics"]
+        .as_array()
+        .expect("a diagnostics array");
+    assert!(
+        !diagnostics.iter().any(|d| d["code"] == "RULE_LOAD_ERROR"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn the_run_says_which_rule_set_decided_it() {
+    // A reader told a tree is clean has to be able to ask "according to what".
+    // The embedded set and an operator's own directory produce different
+    // answers, and a run that does not say which one it used leaves the reader
+    // to guess from the working directory.
+    let elsewhere = Elsewhere::new("announce");
+    let binary = elsewhere.install_binary();
+    elsewhere.write("app.py", PYTHON_EGRESS);
+
+    let (_, _, stderr) = scan_json(&binary, &elsewhere.root, &[]);
+    assert!(
+        stderr.contains("periskop: rules built into this binary"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_named_rule_directory_wins_over_the_embedded_set() {
+    // The operator's guarantee. Their directory holds one rule, and it is a rule
+    // the shipped set does not have, so the finding it produces could not have
+    // come from the embedded copy. If the two sets were merged, the shipped
+    // OpenAI rule would fire on the same file as well and there would be two
+    // findings rather than one.
+    let elsewhere = Elsewhere::new("override");
+    let binary = elsewhere.install_binary();
+    elsewhere.write("app.py", PYTHON_EGRESS);
+
+    let rules = elsewhere.root.join("own-rules").join("python");
+    std::fs::create_dir_all(&rules).expect("a rule directory");
+    std::fs::write(
+        rules.join("house-style.toml"),
+        "schema_version = \"1.0\"\n\
+         language = \"python\"\n\
+         provider = \"in-house\"\n\
+         rule_id = \"python.static.house-style\"\n\
+         rule_version = \"1.0.0\"\n\n\
+         [[match]]\n\
+         kind = \"call\"\n\
+         query = '''\n(call function: (attribute attribute: (identifier) @method)) @call\n'''\n\
+         [match.method]\n\
+         capture = \"method\"\n\
+         one_of = [\"create\"]\n\n\
+         [classify]\n\
+         egress_kind = \"llm_chat\"\n\
+         default_confidence = \"confirmed\"\n",
+    )
+    .expect("a rule file");
+
+    let (code, stdout, stderr) = scan_json(
+        &binary,
+        &elsewhere.root,
+        &[
+            "--rules",
+            &elsewhere.root.join("own-rules").to_string_lossy(),
+        ],
+    );
+
+    assert_ne!(code, 2, "{stderr}");
+    assert!(stderr.contains("periskop: rules read from"), "{stderr}");
+
+    let report: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("the report is not JSON ({e}): {stdout}"));
+    let ids: Vec<&str> = report["findings"]
+        .as_array()
+        .expect("a findings array")
+        .iter()
+        .filter_map(|f| f["detector"]["rule_id"].as_str())
+        .collect();
+    assert_eq!(ids, vec!["python.static.house-style"], "{stdout}");
+}
+
+#[test]
+fn a_rules_flag_pointing_nowhere_stops_the_run() {
+    // Falling back to the embedded set here would be the worst answer available:
+    // the operator asked for their detectors and would be handed somebody else's
+    // with a zero exit code on top.
+    let elsewhere = Elsewhere::new("missing");
+    let binary = elsewhere.install_binary();
+    elsewhere.write("app.py", PYTHON_EGRESS);
+
+    let (code, _, stderr) = scan_json(&binary, &elsewhere.root, &["--rules", "no-such-directory"]);
+
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("no rule directory at"), "{stderr}");
+}
+
+#[test]
+fn a_stray_rules_directory_in_the_working_directory_is_not_picked_up() {
+    // The other half of the defect, and the quieter half. The old resolution
+    // read `rules` relative to the working directory, so any project that
+    // happened to have a directory by that name replaced the shipped detectors
+    // without saying so, and the same command produced different results from
+    // two different directories.
+    let elsewhere = Elsewhere::new("stray");
+    let binary = elsewhere.install_binary();
+    elsewhere.write("app.py", PYTHON_EGRESS);
+    std::fs::create_dir_all(elsewhere.root.join("rules")).expect("a decoy directory");
+    std::fs::write(
+        elsewhere.root.join("rules/not-a-rule.toml"),
+        "nonsense = [\n",
+    )
+    .expect("a decoy file");
+
+    let (code, stdout, stderr) = scan_json(&binary, &elsewhere.root, &[]);
+
+    assert_ne!(code, 2, "{stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("the report is not JSON ({e}): {stdout}"));
+    assert_eq!(
+        report["findings"].as_array().map(Vec::len),
+        Some(1),
+        "the decoy directory decided the run: {stdout}"
+    );
+}

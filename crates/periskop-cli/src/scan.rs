@@ -41,11 +41,14 @@ use periskop_static_scanner::engine::detect;
 use periskop_static_scanner::language::Language;
 use periskop_static_scanner::parser::parse_as;
 use periskop_static_scanner::rules::compiler::compile_partial;
-use periskop_static_scanner::rules::{load_directory, CompiledRules, RuleFile};
+use periskop_static_scanner::rules::{CompiledRules, RuleFile};
 
 use crate::policy::ScanPolicy;
 
 pub use reconcile::ScanSources;
+// Re-exported so that a caller stating where a scan's rules come from and a
+// caller stating where its events come from reach for the same module.
+pub use periskop_static_scanner::rules::RuleSource;
 
 /// Policy rule id recorded when the rule set did not load cleanly.
 ///
@@ -56,7 +59,11 @@ const RULE_SET_GATE: &str = "engine.rule-set-loaded";
 /// Everything the scan needs to know about where things live.
 pub struct ScanRequest<'a> {
     pub project_root: &'a Path,
-    pub rules_root: &'a Path,
+    /// Which detector set decides this run: the one compiled into the binary, or
+    /// a directory the caller named. Not a path, because the shipped set has no
+    /// path, and a scan that needed one was a scan that could only run from a
+    /// checkout.
+    pub rules: RuleSource<'a>,
     pub tool_version: &'a str,
     /// Supplied by the caller rather than read here, so this function stays
     /// deterministic and testable. The clock belongs in the envelope, which is
@@ -151,10 +158,10 @@ pub fn run_with_events_and_settings(
 /// The walk itself, with whatever observation sources the caller stated.
 fn scan(request: ScanRequest<'_>, sources: ScanSources<'_>, policy: ScanPolicy) -> ScanOutcome {
     let settings = policy.settings().clone();
-    let (rules, load_errors) = load_directory(request.rules_root);
+    let (rules, load_errors) = request.rules.load();
     let mut rule_errors: Vec<String> = load_errors.iter().map(|e| e.to_string()).collect();
 
-    // A rule set with nothing in it is not a clean rule set. `load_directory`
+    // A rule set with nothing in it is not a clean rule set. The loader
     // reports the files it could not read and has nothing to say about a
     // directory that held no rule at all, so a scan pointed at an empty or wrong
     // path walked the whole tree with no detector loaded, found nothing, and
