@@ -308,6 +308,125 @@ jobs:
         env:
           PERISKOP_EBPF_OBJECT: ""
 
+  # F4 exit criterion 2, and the only job in this file that can close it.
+  #
+  # The measurement itself has run on every push for several waves, inside
+  # `cargo test --workspace` in the Rust job above, and it closed nothing: with no
+  # environment declared it wrote `budget_verdict: null`, an empty `measurements`
+  # array and `measurement_is_comparable: false`, which is the correct behaviour
+  # and not a gate. `perf-budgets.md` section 4 declares exactly one reference
+  # environment and forbids publishing a number taken anywhere else, so the
+  # criterion needed a job that runs on that environment and says so. This is it.
+  #
+  # `PERISKOP_PERF_ENVIRONMENT_ID` is a claim this file makes, and the runner
+  # checks it rather than trusting it: latency_gate.rs parses the declaration out
+  # of perf-budgets.md section 4 and compares it with the machine's own cores,
+  # memory, architecture and operating system. Three things therefore fail here
+  # rather than passing quietly: an identity this file invents that the document
+  # does not declare, a runner class that moved under the declaration, and a
+  # measurement over the budget.
+  #
+  # Fail closed, like the kernel job. No `continue-on-error` and no `|| true`
+  # (CLAUDE.md O6b): a run that cannot measure, cannot publish, or publishes a
+  # number over the budget fails the workflow. The 150 ms itself is not written
+  # here and cannot be relaxed from this file: it lives in the runner, which
+  # checks it against docs/05-quality/performance-budgets.md on every tree that
+  # carries that document. `docs/` is unpublished, so this checkout is not one of
+  # them, and the artefact says so in `budget_source`.
+  latency:
+    name: Added latency budget (reference environment)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ajv, for validating the perf-budgets.json this job produces. The schema
+      # has only ever seen hand written examples; this is the first thing that
+      # validates what the runner actually writes.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Printed, not asserted. The assertions are in the Rust, which compares
+      # these same facts with the declaration; this is so that a reader of a
+      # failed run can see what the machine offered without rerunning anything.
+      # If the hosted runner class ever moves, this block is the evidence for the
+      # correction perf-budgets.md section 4 then needs.
+      - name: What this runner offers
+        run: |
+          uname -a
+          echo "cores: $(nproc)"
+          grep -m1 'model name' /proc/cpuinfo
+          grep MemTotal /proc/meminfo
+          grep -E '^(ID|VERSION_ID)=' /etc/os-release
+
+      # The whole test binary rather than one named test, for the reason O6b
+      # gives: a gate pinned to a single name stops covering everything added
+      # beside it. --test-threads=4 matches the workspace runs; the other tests in
+      # this binary are microsecond scale assertions over parsed documents, and
+      # the measurement discards ten warmup requests per phase before it times
+      # anything.
+      - name: Added latency gate on the reference environment
+        env:
+          PERISKOP_PERF_ENVIRONMENT_ID: ci-linux-4vcpu
+        run: |
+          cargo test -p periskop-proxy --test latency_gate -- --test-threads=4 \
+            && cat target/f4-latency-gate.json \
+            && cat perf-budgets.json
+
+      - name: perf-budgets.json conforms to the contract
+        run: |
+          npx --no-install ajv validate --spec=draft2020 -c ajv-formats --strict=false \
+            -s schemas/perf-budgets.schema.json \
+            -d perf-budgets.json
+
+      # A passing test is not the claim; the artefact is. This is the line that
+      # makes a refused measurement fail the job, so that a run which measured
+      # nothing it was allowed to publish cannot be read as one that passed the
+      # budget.
+      - name: The artefact carries a verdict
+        run: |
+          python3 - <<'CHECK'
+          import json, sys
+          path = "target/f4-latency-gate.json"
+          try:
+              gate = json.load(open(path))
+          except Exception as error:
+              sys.exit(f"{path} was not produced or is not readable: {error}")
+          declared, reference = gate.get("declared_environment_id"), gate.get("reference_environment_id")
+          if declared != reference:
+              sys.exit(f"this job declared {declared!r} and perf-budgets.md section 4 declares {reference!r}: nothing measured here is comparable with the budget")
+          if not gate.get("runner_matches_declaration"):
+              sys.exit(f"the runner is not the declared environment: {gate.get('runner_mismatches')!r}")
+          if gate.get("status") != "measured" or not gate.get("measurement_is_comparable"):
+              sys.exit(f"F4 exit criterion 2 is open: status={gate.get('status')!r}")
+          verdict = gate.get("budget_verdict") or {}
+          if verdict.get("verdict") != "pass":
+              sys.exit(f"the added latency budget was not met: {verdict!r}")
+          if not gate.get("measurements"):
+              sys.exit("no measurement was written into the series")
+          if not gate.get("perf_budgets_json_written"):
+              sys.exit("perf-budgets.json was not written, so the threshold file records no run")
+          print(f"added p95 latency {verdict['value_ms']} ms against a budget of {verdict['limit_ms']} ms from {gate['budget_source']['document']}")
+          CHECK
+
+      # if: always() so that a refused or failing measurement is still readable
+      # afterwards. It does not soften the gate: the steps above have already
+      # decided the job, and this one only carries their evidence out.
+      - name: Publish the latency gate
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: f4-latency-gate
+          path: |
+            target/f4-latency-gate.json
+            perf-budgets.json
+          if-no-files-found: error
+
   # The two hooks are the second detection source, and neither is compiled by
   # cargo. They carry their own blake3, written out because a hook may not add a
   # dependency to somebody else's interpreter, and the whole point of that code

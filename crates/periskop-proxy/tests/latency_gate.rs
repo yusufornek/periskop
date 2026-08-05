@@ -45,6 +45,30 @@
 //! the job that runs on that hardware. A run that sets it on a laptop is somebody
 //! writing a false statement, not somebody forgetting a flag.
 //!
+//! Setting it is not sufficient, and that is the second half of this file. The run
+//! reads the machine's own cores, memory, architecture and operating system and
+//! compares them with the declaration; a run that claims the reference environment
+//! on a machine that does not match it **fails**, and publishes nothing. An
+//! environment variable is a claim, and a claim nothing checks is how a two core
+//! runner ends up owning the number a release note quotes.
+//!
+//! # Where the two numbers come from
+//!
+//! Neither the threshold nor the environment is written down in this file.
+//!
+//! - The **150 ms** is read at run time from
+//!   `docs/05-quality/performance-budgets.md`, which `perf-budgets.md` names as the
+//!   document that wins on what a budget is.
+//! - The **environment** is read from `perf-budgets.md` section 4, which owns where
+//!   a budget is measured.
+//!
+//! A constant here would be a second source. Relaxing a budget takes a document
+//! edit and an ADR reference (`performance-budgets.md`, "CI'da bütçe aşımı kuralı"
+//! item 4); a copy in this file would keep gating on the old number while the
+//! document said otherwise, and nothing would report the disagreement. Both
+//! readers fail loudly rather than falling back to a default: a gate that invents
+//! its own threshold when the document moves is a gate nobody is maintaining.
+//!
 //! # The budget rows
 //!
 //! Four, in `perf-budgets.json`'s own field names so they can be lifted verbatim
@@ -76,17 +100,20 @@ use periskop_proxy::http::AllowList;
 use periskop_proxy::policy::Policy;
 use periskop_proxy::vault::{Backing, OpenRequest, Passphrase, ProfileName, Vault};
 
-/// The environment every budget number in `perf-budgets.md` belongs to.
-const REFERENCE_ENVIRONMENT: &str = "ci-linux-4vcpu";
-
 /// How a run says which environment it is on.
 const ENVIRONMENT_VARIABLE: &str = "PERISKOP_PERF_ENVIRONMENT_ID";
 
 /// What a run that did not say is called.
 const UNDECLARED_ENVIRONMENT: &str = "local-undeclared";
 
-/// The binding budget: `performance-budgets.md`, proxy core profile.
-const ADDED_LATENCY_BUDGET_MS: f64 = 150.0;
+/// The document that owns what the budget is.
+const BUDGET_DOCUMENT: &str = "docs/05-quality/performance-budgets.md";
+
+/// The document that owns where the budget is measured.
+const ENVIRONMENT_DOCUMENT: &str = "docs/06-delivery/perf-budgets.md";
+
+/// Where a passing reference run writes the threshold and measurement file.
+const PERF_BUDGETS_JSON: &str = "perf-budgets.json";
 
 /// Requests per phase, per run. Enough that the 95th percentile is a percentile
 /// rather than the second worst of a handful.
@@ -105,6 +132,331 @@ const ROUNDS: usize = 3;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// A document under `docs/`, if this tree has one.
+///
+/// `Option` and not a panic, and this is the constraint the whole of the next two
+/// sections is shaped around: `.gitignore` excludes `docs/`, so a published clone
+/// and every CI checkout carry none of it. A gate that read its threshold from
+/// there could not run in the one place it has to run, which is exactly the state
+/// this file was in when the criterion was audited as never having run.
+fn read_document(relative: &str) -> Option<String> {
+    std::fs::read_to_string(repo_root().join(relative)).ok()
+}
+
+/// Whether this is a tree that carries its internal documents at all.
+///
+/// A missing document in a tree that has `docs/` is a moved or renamed document,
+/// which is a defect. A missing document in a tree that has no `docs/` is a
+/// published clone. The two are told apart here rather than by a skip, the same
+/// way `periskop-cli`'s command surface test tells them apart.
+fn docs_are_present() -> bool {
+    repo_root().join("docs").exists()
+}
+
+// ---------------------------------------------------------------------------
+// The threshold
+// ---------------------------------------------------------------------------
+
+/// The binding budget: `performance-budgets.md`, proxy core profile.
+///
+/// A copy, and the reason it is one is `docs/` being unpublished rather than
+/// anything about the number. It is not a copy that can drift: on any tree that
+/// carries the document, `the_carried_numbers_agree_with_the_documents_that_own_them`
+/// reads the row and fails if the two disagree. That is every developer machine
+/// and every orchestrator run, which is where a budget is actually edited. What
+/// closes the remaining gap is publishing `perf-budgets.json` with these rows in
+/// it, so a published tree has something normative to read; that file is declared
+/// in `perf-budgets.md` section 1 and nothing writes it yet except a passing
+/// reference run.
+const ADDED_LATENCY_BUDGET_MS: f64 = 150.0;
+
+/// The same number as the document states it, or `None` if this tree has no
+/// document to state it.
+///
+/// The row is found by what it says rather than by where it sits, so that adding
+/// a component above it does not silently move the check onto another line.
+fn budget_ms_in_document() -> Option<f64> {
+    let text = read_document(BUDGET_DOCUMENT)?;
+    let row = text
+        .lines()
+        .find(|line| {
+            line.starts_with('|')
+                && line.contains("çekirdek profil")
+                && line.contains("Ek gecikme (p95)")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "{BUDGET_DOCUMENT} no longer carries a proxy core profile row naming \
+                 `Ek gecikme (p95)`, so the number this runner carries agrees with nothing"
+            )
+        });
+    // Cell 3 of `| component | metric | budget | method |`: the leading pipe makes
+    // the first split empty, so the budget cell is the fourth piece.
+    let cell = row.split('|').nth(3).unwrap_or_else(|| {
+        panic!("the proxy core profile row in {BUDGET_DOCUMENT} has no budget column: {row}")
+    });
+    Some(budget_ms_in(cell).unwrap_or_else(|| {
+        panic!(
+            "the proxy core profile budget in {BUDGET_DOCUMENT} is no longer written as \
+             `**< N ms**`, so it cannot be compared with the number this runner carries: {cell}"
+        )
+    }))
+}
+
+/// `**< 150 ms**` becomes `150.0`.
+fn budget_ms_in(cell: &str) -> Option<f64> {
+    let (_, after) = cell.split_once("**<")?;
+    let (number, _) = after.split_once("ms**")?;
+    number.trim().parse().ok()
+}
+
+// ---------------------------------------------------------------------------
+// The reference environment
+// ---------------------------------------------------------------------------
+
+/// The reference environment as `perf-budgets.md` section 4 declares it.
+#[derive(PartialEq, Eq, Debug)]
+struct Declaration {
+    environment_id: String,
+    cpu_arch: String,
+    cpu_cores: usize,
+    memory_mib_min: u64,
+    memory_mib_max: u64,
+    os_id: String,
+    os_version: String,
+    vault_profile: String,
+}
+
+/// Every key section 4 is required to carry, and the whole of what it may carry.
+///
+/// Unknown keys are rejected rather than ignored, for the reason
+/// `perf-budgets.schema.json` sets `additionalProperties: false`: a row nothing
+/// reads looks like a declaration and constrains nothing.
+const DECLARED_KEYS: [&str; 8] = [
+    "environment_id",
+    "cpu_arch",
+    "cpu_cores",
+    "memory_mib_min",
+    "memory_mib_max",
+    "os_id",
+    "os_version",
+    "vault_profile",
+];
+
+/// The declaration this runner carries, for the same reason the threshold is
+/// carried: a published tree has no `perf-budgets.md` to read it from.
+///
+/// Every value here is checked twice. Against the document, wherever the document
+/// exists, so an edit to section 4 that is not mirrored here turns the gate red on
+/// the machine doing the editing. And against the machine, on every run, which is
+/// what stops the identity in the workflow from being taken at its word.
+fn declaration() -> Declaration {
+    Declaration {
+        environment_id: "ci-linux-4vcpu".to_owned(),
+        cpu_arch: "x86_64".to_owned(),
+        cpu_cores: 4,
+        memory_mib_min: 15_000,
+        memory_mib_max: 16_384,
+        os_id: "ubuntu".to_owned(),
+        os_version: "24.04".to_owned(),
+        vault_profile: "ci".to_owned(),
+    }
+}
+
+/// The same declaration as section 4 states it, or `None` in a published tree.
+fn declaration_in_document() -> Option<Declaration> {
+    let text = read_document(ENVIRONMENT_DOCUMENT)?;
+    let mut rows: Vec<(String, String)> = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            // Matched on what the section is called rather than on its number, so
+            // that inserting a section ahead of it does not point this at another
+            // table. If it is renamed, nothing is found and the panic below says so.
+            inside = heading.contains("Referans ortam beyanı");
+            continue;
+        }
+        if !inside || !line.starts_with('|') {
+            continue;
+        }
+        let mut cells = line.split('|').skip(1);
+        let (Some(key), Some(value)) = (cells.next(), cells.next()) else {
+            continue;
+        };
+        // The header and the separator carry no backticks, so they fall out here
+        // without being named. A backticked key is the declaration's own shape.
+        let (Some(key), Some(value)) = (backticked(key), backticked(value)) else {
+            continue;
+        };
+        assert!(
+            DECLARED_KEYS.contains(&key.as_str()),
+            "{ENVIRONMENT_DOCUMENT} section 4 declares `{key}`, which nothing here reads. \
+             A declared field the gate ignores constrains nothing"
+        );
+        rows.push((key, value));
+    }
+
+    let field = |name: &str| -> String {
+        rows.iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{ENVIRONMENT_DOCUMENT} section 4 no longer declares `{name}`. The gate \
+                     refuses to guess it: an environment that is half declared is one whose \
+                     measurements are not comparable with anything"
+                )
+            })
+    };
+    let number = |name: &str| -> u64 {
+        let raw = field(name);
+        raw.parse().unwrap_or_else(|why| {
+            panic!("{ENVIRONMENT_DOCUMENT} section 4 declares `{name}` as `{raw}`: {why}")
+        })
+    };
+
+    Some(Declaration {
+        environment_id: field("environment_id"),
+        cpu_arch: field("cpu_arch"),
+        cpu_cores: usize::try_from(number("cpu_cores")).unwrap_or(usize::MAX),
+        memory_mib_min: number("memory_mib_min"),
+        memory_mib_max: number("memory_mib_max"),
+        os_id: field("os_id"),
+        os_version: field("os_version"),
+        vault_profile: field("vault_profile"),
+    })
+}
+
+fn backticked(cell: &str) -> Option<String> {
+    let trimmed = cell.trim();
+    let inner = trimmed.strip_prefix('`')?.strip_suffix('`')?;
+    (!inner.is_empty()).then(|| inner.to_owned())
+}
+
+// ---------------------------------------------------------------------------
+// The machine, as it actually is
+// ---------------------------------------------------------------------------
+
+/// What could be read about this machine without adding a dependency to the
+/// workspace.
+///
+/// Every field is optional because a fact that could not be read is not a fact
+/// that matched. On the reference environment all of them are readable; anywhere
+/// else the absence is what the artefact reports.
+struct Runner {
+    cpu_model: Option<String>,
+    cpu_cores: Option<usize>,
+    memory_mib: Option<u64>,
+    os_id: Option<String>,
+    os_version: Option<String>,
+    cpu_arch: &'static str,
+}
+
+fn observe_runner() -> Runner {
+    Runner {
+        // Read at measurement time and never declared, which is what
+        // `perf-budgets.md` section 4 requires: on a shared runner the processor
+        // model can change between jobs, and writing one into the document would
+        // be declaring something nobody measured.
+        cpu_model: proc_cpuinfo_field("model name"),
+        // Parallelism rather than a core count out of a file: it follows the cgroup
+        // limit and the affinity mask, which is what a measurement on a shared
+        // runner is actually running on.
+        cpu_cores: std::thread::available_parallelism().ok().map(|n| n.get()),
+        memory_mib: proc_meminfo_total_mib(),
+        os_id: os_release_field("ID"),
+        os_version: os_release_field("VERSION_ID"),
+        cpu_arch: std::env::consts::ARCH,
+    }
+}
+
+fn proc_cpuinfo_field(name: &str) -> Option<String> {
+    let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    text.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == name).then(|| value.trim().to_owned())
+    })
+}
+
+fn proc_meminfo_total_mib() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    text.lines().find_map(|line| {
+        let rest = line.strip_prefix("MemTotal:")?;
+        let kib: u64 = rest.trim().strip_suffix(" kB")?.trim().parse().ok()?;
+        Some(kib / 1024)
+    })
+}
+
+fn os_release_field(name: &str) -> Option<String> {
+    let text = std::fs::read_to_string("/etc/os-release").ok()?;
+    text.lines().find_map(|line| {
+        let value = line.strip_prefix(name)?.strip_prefix('=')?;
+        Some(value.trim().trim_matches('"').to_owned())
+    })
+}
+
+/// Every way this machine is not the machine the declaration describes.
+///
+/// The list is returned rather than a boolean because the artefact prints it: a
+/// run that refused to publish and does not say which fact was wrong sends the
+/// next person to read the runner image release notes.
+fn mismatches(declared: &Declaration, runner: &Runner) -> Vec<String> {
+    let mut found = Vec::new();
+
+    if runner.cpu_arch != declared.cpu_arch {
+        found.push(format!(
+            "architecture: declared `{}`, built for `{}`",
+            declared.cpu_arch, runner.cpu_arch
+        ));
+    }
+    match runner.cpu_cores {
+        Some(cores) if cores == declared.cpu_cores => {}
+        Some(cores) => found.push(format!(
+            "cores: declared {}, this machine offers {cores}",
+            declared.cpu_cores
+        )),
+        None => found.push("cores: this machine would not say how many it offers".to_owned()),
+    }
+    // A band and not an equality. The kernel reserves part of the installed
+    // memory before `MemTotal` is written, so a runner advertised as 16 GiB
+    // reports a little under it; an equality here would make the gate red on the
+    // very hardware the declaration names, and the usual repair for that is to
+    // widen the check until it stops meaning anything.
+    match runner.memory_mib {
+        Some(mib) if mib >= declared.memory_mib_min && mib <= declared.memory_mib_max => {}
+        Some(mib) => found.push(format!(
+            "memory: declared between {} and {} MiB, this machine reports {mib} MiB",
+            declared.memory_mib_min, declared.memory_mib_max
+        )),
+        None => {
+            found.push("memory: /proc/meminfo carried no MemTotal this run could read".to_owned())
+        }
+    }
+    match runner.os_id.as_deref() {
+        Some(id) if id == declared.os_id => {}
+        Some(id) => found.push(format!(
+            "operating system: declared `{}`, this machine says `{id}`",
+            declared.os_id
+        )),
+        None => found.push("operating system: /etc/os-release carried no ID".to_owned()),
+    }
+    // Prefix rather than equality: the runner image reports a point release
+    // (`24.04.4`) against a declared series (`24.04`), and the budget belongs to
+    // the series. A point release that moved the series would fail this.
+    match runner.os_version.as_deref() {
+        Some(version) if version.starts_with(&declared.os_version) => {}
+        Some(version) => found.push(format!(
+            "operating system version: declared `{}`, this machine says `{version}`",
+            declared.os_version
+        )),
+        None => {
+            found.push("operating system version: /etc/os-release carried no VERSION_ID".to_owned())
+        }
+    }
+
+    found
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +482,8 @@ fn budgets() -> Vec<Budget> {
             metric: "added latency, p95, end to end, against a proxy free baseline",
             unit: "ms",
             comparison: Some("at_most"),
+            // One place in this runner holds this number, and it is checked
+            // against the document that owns it wherever that document exists.
             limit: Some(ADDED_LATENCY_BUDGET_MS),
             masking_profile: "pattern+dictionary",
             status: "binding",
@@ -489,11 +843,20 @@ fn phase(address: SocketAddr, payload: &[u8], session: &str) -> Vec<u64> {
 
 #[test]
 fn the_added_latency_is_measured_and_is_published_only_where_it_is_comparable() {
+    let reference = declaration();
+    let budget_ms = ADDED_LATENCY_BUDGET_MS;
     let declared = std::env::var(ENVIRONMENT_VARIABLE)
         .ok()
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| UNDECLARED_ENVIRONMENT.to_owned());
-    let on_reference_hardware = declared == REFERENCE_ENVIRONMENT;
+
+    // Two separate questions, and collapsing them is the failure this replaced.
+    // The first is what the run claims; the second is whether the machine bears
+    // the claim out. Only a run where both hold may publish a number.
+    let claims_reference = declared == reference.environment_id;
+    let runner = observe_runner();
+    let mismatches = mismatches(&reference, &runner);
+    let on_reference_hardware = claims_reference && mismatches.is_empty();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -571,14 +934,33 @@ fn the_added_latency_is_measured_and_is_published_only_where_it_is_comparable() 
     assert_eq!(leaked, 0, "an alias in an answer could not be restored");
 
     let mut added: Vec<f64> = rounds.iter().map(|round| round.added_ms()).collect();
+    let mut samples: Vec<f64> = added.iter().map(|value| round(*value)).collect();
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let measured = median(&mut added);
+    let outcome = verdict("at_most", budget_ms, measured);
+
+    // Written before the artefact, so that `perf_budgets_json_written` states what
+    // happened rather than what was intended. It is written for a failing verdict
+    // too: the measurement was comparable, and a series that keeps only the runs
+    // that passed cannot show a budget being approached.
+    let published = on_reference_hardware;
+    if published {
+        write_perf_budgets_json(&reference, &runner, &samples, measured, outcome);
+    }
 
     let written = write_artefact(&Artefact {
+        reference: &reference,
+        runner: &runner,
         declared_environment: &declared,
         on_reference_hardware,
+        mismatches: &mismatches,
         rounds: &rounds,
         streaming,
         measured_added_ms: measured,
+        samples: &samples,
+        budget_ms,
+        outcome,
+        published,
         requests_per_phase: SAMPLES_PER_PHASE,
     });
     nothing_is_published_that_was_not_earned(&written, on_reference_hardware);
@@ -589,19 +971,37 @@ fn the_added_latency_is_measured_and_is_published_only_where_it_is_comparable() 
     // ends up deciding whether a release ships.
     if on_reference_hardware {
         assert_eq!(
-            verdict("at_most", ADDED_LATENCY_BUDGET_MS, measured),
-            "pass",
-            "the added p95 latency was {measured:.3} ms against a budget of \
-             {ADDED_LATENCY_BUDGET_MS} ms"
+            outcome, "pass",
+            "the added p95 latency was {measured:.3} ms against a budget of {budget_ms} ms \
+             ({BUDGET_DOCUMENT}, proxy core profile)"
+        );
+        println!(
+            "\n  MEASURED ON `{}`.\n  Added p95 latency {measured:.3} ms against a budget of \
+             {budget_ms} ms: {outcome}.\n  Written to {PERF_BUDGETS_JSON} and to \
+             target/f4-latency-gate.json.\n",
+            reference.environment_id
+        );
+    } else if claims_reference {
+        // A declared environment the machine does not match is a false statement,
+        // and the one thing it may not do is pass quietly. The artefact above
+        // already carries the reason and a null verdict; this is what keeps the
+        // job from going green having measured nothing it was allowed to publish.
+        panic!(
+            "this run declared `{declared}` and the machine is not that environment, so nothing \
+             was published. {ENVIRONMENT_DOCUMENT} section 4 is the declaration; either the job \
+             is running somewhere else, or the runner changed under it and section 4 has to be \
+             corrected before any number here is comparable again.\n  {}",
+            mismatches.join("\n  ")
         );
     } else {
         println!(
             "\n  NOT A MEASUREMENT OF THE REFERENCE ENVIRONMENT.\n  \
              This run declared `{declared}`; every budget number in \
-             docs/06-delivery/perf-budgets.md belongs to `{REFERENCE_ENVIRONMENT}`.\n  \
+             {ENVIRONMENT_DOCUMENT} belongs to `{}`.\n  \
              The added p95 latency here was {measured:.3} ms. It is a signal, not evidence, it \
-             closes no criterion, and it was not written into perf-budgets.json.\n  \
-             F4 exit criterion 2 stays open until the job on that hardware runs this.\n"
+             closes no criterion, and it was not written into {PERF_BUDGETS_JSON}.\n  \
+             F4 exit criterion 2 stays open until the job on that hardware runs this.\n",
+            reference.environment_id
         );
     }
 }
@@ -676,6 +1076,96 @@ fn the_budget_verdict_has_one_threshold_and_no_warning_band() {
 }
 
 #[test]
+fn the_carried_numbers_agree_with_the_documents_that_own_them() {
+    // What the runner carries has to be usable as a gate on its own, because in a
+    // published tree it is all there is.
+    let reference = declaration();
+    assert!(!reference.environment_id.is_empty());
+    assert!(reference.cpu_cores >= 1);
+    assert!(
+        reference.memory_mib_min <= reference.memory_mib_max,
+        "the declared memory band is empty, so no machine can ever match it"
+    );
+    // A band and not a wildcard. A declaration wide enough to accept any machine
+    // is the same as no declaration, and it would fail open rather than closed.
+    assert!(
+        reference.memory_mib_max - reference.memory_mib_min <= 4096,
+        "the declared memory band spans more than one runner class, so matching it proves \
+         nothing about which machine took the number"
+    );
+    let binding = budgets()
+        .into_iter()
+        .find(|budget| budget.budget_id == "proxy.added_latency_p95")
+        .unwrap_or_else(|| panic!("the binding budget row is gone"));
+    assert_eq!(binding.limit, Some(ADDED_LATENCY_BUDGET_MS));
+
+    // And where the owning documents exist, the carried copies have to equal them.
+    // This is the half that keeps the copies from being a second source: a budget
+    // relaxed in performance-budgets.md or a runner class corrected in
+    // perf-budgets.md section 4 turns this red on the machine doing the editing,
+    // which is the only machine where either edit happens.
+    let Some(documented_budget) = budget_ms_in_document() else {
+        // Not a silent skip. `docs/` is unpublished, so its absence is the normal
+        // state of a clone and the expected state in CI. What would be a defect is
+        // the directory being there with the row missing from it, and that is the
+        // case this asserts rather than passes over.
+        assert!(
+            !docs_are_present(),
+            "docs/ is present and {BUDGET_DOCUMENT} does not state the proxy core profile \
+             budget, which means the budget moved rather than that this is a published tree"
+        );
+        return;
+    };
+    assert_eq!(
+        documented_budget, ADDED_LATENCY_BUDGET_MS,
+        "{BUDGET_DOCUMENT} states a budget this runner does not carry. The document wins \
+         (perf-budgets.md preamble); update the constant and the reason for the change belongs \
+         in the document with an ADR beside it"
+    );
+
+    let documented_environment = declaration_in_document().unwrap_or_else(|| {
+        panic!("{ENVIRONMENT_DOCUMENT} is missing from a tree that carries docs/")
+    });
+    assert_eq!(
+        documented_environment, reference,
+        "{ENVIRONMENT_DOCUMENT} section 4 declares an environment this runner does not carry, \
+         so the machine check would be comparing against the wrong hardware"
+    );
+}
+
+#[test]
+fn a_machine_that_is_not_the_declared_environment_is_reported_field_by_field() {
+    // The check that decides whether a number may be published, exercised without
+    // needing the hardware. A runner that differs in every readable respect has to
+    // produce a reason per field: one boolean would tell a reader that the machine
+    // was wrong and not which part of it, and the repair for that is usually to
+    // widen the declaration until it matches.
+    let reference = declaration();
+    let wrong = Runner {
+        cpu_model: Some("a processor".to_owned()),
+        cpu_cores: Some(reference.cpu_cores + 1),
+        memory_mib: Some(reference.memory_mib_min - 1),
+        os_id: Some("not-the-declared-os".to_owned()),
+        os_version: Some("0.0".to_owned()),
+        cpu_arch: "an-architecture-nothing-builds-for",
+    };
+    assert_eq!(mismatches(&reference, &wrong).len(), 5);
+
+    let unreadable = Runner {
+        cpu_model: None,
+        cpu_cores: None,
+        memory_mib: None,
+        os_id: None,
+        os_version: None,
+        cpu_arch: "an-architecture-nothing-builds-for",
+    };
+    // A fact that could not be read is not a fact that matched. The alternative,
+    // treating an unreadable field as agreement, is what would let a runner with
+    // no /proc publish a number against a budget written for one that has it.
+    assert_eq!(mismatches(&reference, &unreadable).len(), 5);
+}
+
+#[test]
 fn the_percentile_is_the_ninety_fifth_and_not_the_worst() {
     // A p95 implemented as `max` passes every plausible sanity check and reports
     // the slowest request in the run as the typical one. Twenty samples, one
@@ -692,11 +1182,18 @@ fn the_percentile_is_the_ninety_fifth_and_not_the_worst() {
 // ---------------------------------------------------------------------------
 
 struct Artefact<'a> {
+    reference: &'a Declaration,
+    runner: &'a Runner,
     declared_environment: &'a str,
     on_reference_hardware: bool,
+    mismatches: &'a [String],
     rounds: &'a [Round],
     streaming: Round,
     measured_added_ms: f64,
+    samples: &'a [f64],
+    budget_ms: f64,
+    outcome: &'static str,
+    published: bool,
     requests_per_phase: usize,
 }
 
@@ -716,6 +1213,27 @@ fn nothing_is_published_that_was_not_earned(document: &Value, on_reference_hardw
         "the artefact carries no measurement at all, so this check is vacuous: {document}"
     );
     if on_reference_hardware {
+        // The mirror image, and the half that was missing while the gate never
+        // ran: a reference run that leaves the verdict null and the series empty
+        // has produced an artefact indistinguishable from a laptop's, and the
+        // criterion would stay open with a green job beside it.
+        assert!(
+            document["budget_verdict"]["verdict"].is_string(),
+            "a reference run published no budget verdict: {document}"
+        );
+        assert!(
+            document["measurements"]
+                .as_array()
+                .is_some_and(|series| !series.is_empty()),
+            "a reference run wrote no measurement into the series: {document}"
+        );
+        assert_eq!(document["measurement_is_comparable"], Value::Bool(true));
+        assert_eq!(document["perf_budgets_json_written"], Value::Bool(true));
+        assert!(
+            document["not_measured"]["proxy.added_latency_p95"].is_null(),
+            "the binding budget is listed as not measured by the run that measured it: {document}"
+        );
+        assert_eq!(document["status"], "measured");
         return;
     }
     assert!(
@@ -740,12 +1258,72 @@ fn nothing_is_published_that_was_not_earned(document: &Value, on_reference_hardw
     assert_eq!(document["status"], "not_measured_on_reference_environment");
 }
 
+/// One `measurements[]` row, in `perf-budgets.schema.json`'s field names.
+///
+/// Built once and written into both files, so that the number a reviewer reads in
+/// the job log and the number the series keeps are the same number rather than two
+/// roundings of it.
+fn measurement_row(environment_id: &str, samples: &[f64], value: f64, outcome: &str) -> Value {
+    json!({
+        "budget_id": "proxy.added_latency_p95",
+        "component": "proxy",
+        "environment_id": environment_id,
+        "masking_profile": "pattern+dictionary",
+        "samples": samples,
+        "value": round(value),
+        "verdict": outcome,
+    })
+}
+
+/// The reference environment record, half declared and half measured.
+///
+/// `cpu_model` comes off the machine because `perf-budgets.md` section 4 refuses
+/// to declare it: on a shared runner the model changes between jobs, and a
+/// declared model would be a statement nobody checked. Everything else is the
+/// declaration, which this run has already confirmed the machine matches.
+fn environment_record(reference: &Declaration, runner: &Runner) -> Value {
+    json!({
+        "environment_id": reference.environment_id,
+        "cpu_model": runner.cpu_model.clone().unwrap_or_else(|| "unreadable".to_owned()),
+        "cpu_cores": runner.cpu_cores.unwrap_or(0),
+        "memory_mib": runner.memory_mib.unwrap_or(0),
+        "os": format!(
+            "{} {}",
+            runner.os_id.clone().unwrap_or_else(|| reference.os_id.clone()),
+            runner.os_version.clone().unwrap_or_else(|| reference.os_version.clone())
+        ),
+        "vault_profile": reference.vault_profile,
+    })
+}
+
+/// `perf-budgets.json` itself, written only by a run that earned it.
+///
+/// The whole file rather than an append: the budget rows are derived from the
+/// documents on every run, so a stale row cannot survive by being in the file
+/// already. The time series this feeds is the artefact store, not this path.
+fn write_perf_budgets_json(
+    reference: &Declaration,
+    runner: &Runner,
+    samples: &[f64],
+    value: f64,
+    outcome: &'static str,
+) {
+    let document = json!({
+        "schema_version": "1.0",
+        "reference_environments": [environment_record(reference, runner)],
+        "budgets": budgets().iter().map(Budget::to_value).collect::<Vec<Value>>(),
+        "measurements": [measurement_row(&reference.environment_id, samples, value, outcome)],
+    });
+
+    let out = repo_root().join(PERF_BUDGETS_JSON);
+    let mut rendered = serde_json::to_string_pretty(&document).unwrap();
+    rendered.push('\n');
+    std::fs::write(&out, &rendered)
+        .unwrap_or_else(|why| panic!("{} could not be written: {why}", out.display()));
+}
+
 fn write_artefact(artefact: &Artefact<'_>) -> Value {
-    let samples: Vec<Value> = artefact
-        .rounds
-        .iter()
-        .map(|measured| json!(round(measured.added_ms())))
-        .collect();
+    let samples: Vec<Value> = artefact.samples.iter().map(|value| json!(value)).collect();
 
     let mut not_measured = serde_json::Map::new();
     if !artefact.on_reference_hardware {
@@ -753,13 +1331,13 @@ fn write_artefact(artefact: &Artefact<'_>) -> Value {
             "proxy.added_latency_p95".to_owned(),
             json!(format!(
                 "measured, and not comparable. Every budget number belongs to the reference \
-                 environment `{REFERENCE_ENVIRONMENT}` (docs/06-delivery/perf-budgets.md section \
-                 4), and this run declared `{}`. A development machine is not a reference \
-                 environment: perf-budgets.md says a measurement taken on one is a signal and not \
-                 evidence, and is not written to perf-budgets.json. The number this run took is \
-                 under local_signal, where the name says what it is not. F4 exit criterion 2 is \
-                 closed by the job on that hardware and by nothing here",
-                artefact.declared_environment
+                 environment `{}` ({ENVIRONMENT_DOCUMENT} section 4), and this run declared `{}`. \
+                 A development machine is not a reference environment: perf-budgets.md says a \
+                 measurement taken on one is a signal and not evidence, and is not written to \
+                 perf-budgets.json. The number this run took is under local_signal, where the name \
+                 says what it is not. F4 exit criterion 2 is closed by the job on that hardware \
+                 and by nothing here",
+                artefact.reference.environment_id, artefact.declared_environment
             )),
         );
     }
@@ -802,12 +1380,39 @@ fn write_artefact(artefact: &Artefact<'_>) -> Value {
         "gate": "F4-95",
         "criterion": "roadmap.md F4 exit criterion 2",
         "status": if artefact.on_reference_hardware { "measured" } else { "not_measured_on_reference_environment" },
-        "reference_environment_id": REFERENCE_ENVIRONMENT,
+        "reference_environment_id": artefact.reference.environment_id,
         "declared_environment_id": artefact.declared_environment,
         "measurement_is_comparable": artefact.on_reference_hardware,
-        "perf_budgets_json_written": false,
-        "vault_profile": "ci",
+        "perf_budgets_json_written": artefact.published,
+        // Repo relative and never the path that was written. CLAUDE.md forbids an
+        // absolute path in emitted output: it makes the artefact of two identical
+        // runs differ by the name of the machine that took them.
+        "perf_budgets_json_path": artefact.published.then_some(PERF_BUDGETS_JSON),
+        "vault_profile": artefact.reference.vault_profile,
         "masking_profile": "pattern+dictionary",
+        "budget_source": {
+            "limit_ms": artefact.budget_ms,
+            "document": BUDGET_DOCUMENT,
+            // Whether this run was able to check the number against its owner.
+            // False in a published tree, which is every CI checkout: docs/ is
+            // unpublished, so the agreement is asserted where the document is
+            // edited rather than where the gate runs. A reader of this artefact
+            // is entitled to know which of the two it is looking at.
+            "agreement_with_document_checked": docs_are_present(),
+        },
+        // What the machine turned out to be, printed whether or not it matched.
+        // A run that refused to publish and did not say which fact was wrong
+        // sends the next reader to the runner image release notes.
+        "observed_environment": {
+            "cpu_model": artefact.runner.cpu_model,
+            "cpu_cores": artefact.runner.cpu_cores,
+            "cpu_arch": artefact.runner.cpu_arch,
+            "memory_mib": artefact.runner.memory_mib,
+            "os_id": artefact.runner.os_id,
+            "os_version": artefact.runner.os_version,
+        },
+        "runner_matches_declaration": artefact.mismatches.is_empty(),
+        "runner_mismatches": artefact.mismatches,
         "method": {
             "shape": "p95(through the proxy) - p95(straight to the stub), end to end, one \
                       percentile and never a sum of sub items",
@@ -822,8 +1427,27 @@ fn write_artefact(artefact: &Artefact<'_>) -> Value {
         // Empty, always, off the reference environment. `perf-budgets.md` section
         // 2.3: a measurement with no reference environment is not comparable, is
         // written to no series, and is evidence for nothing.
-        "measurements": Vec::<Value>::new(),
-        "budget_verdict": Value::Null,
+        "measurements": if artefact.on_reference_hardware {
+            vec![measurement_row(
+                &artefact.reference.environment_id,
+                artefact.samples,
+                artefact.measured_added_ms,
+                artefact.outcome,
+            )]
+        } else {
+            Vec::<Value>::new()
+        },
+        "budget_verdict": if artefact.on_reference_hardware {
+            json!({
+                "budget_id": "proxy.added_latency_p95",
+                "comparison": "at_most",
+                "limit_ms": artefact.budget_ms,
+                "value_ms": round(artefact.measured_added_ms),
+                "verdict": artefact.outcome,
+            })
+        } else {
+            Value::Null
+        },
         "local_signal": {
             "budget_id": "proxy.added_latency_p95",
             "added_latency_p95_ms": round(artefact.measured_added_ms),
