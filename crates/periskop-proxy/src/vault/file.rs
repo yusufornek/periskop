@@ -72,7 +72,7 @@ use std::path::{Path, PathBuf};
 use super::chain::{ChainMac, ChainTag};
 use super::error::{Integrity, VaultError};
 use super::key::{self, KdfProfile, ProfileName, Salt};
-use super::layout::{Frame, Header, HEADER_BYTES, PREFIX_BYTES};
+use super::layout::{Frame, FrameError, Header, HEADER_BYTES, PREFIX_BYTES};
 use super::secret::{MasterKey, Passphrase};
 
 /// The most `vault.psk` this process will read into memory before anything in it
@@ -632,10 +632,17 @@ fn load(
 
 /// Walks exactly the frames the header authenticates.
 ///
-/// Every structural failure in here becomes `chain_mismatch` rather than a format
-/// error: the header has already authenticated, so these bytes were written by
-/// this product or by somebody who edited them, and the second is what the chain
-/// is for. Bytes past the last authenticated frame are left alone; see the module
+/// Two failures live in this loop and they are not the same fact, so they are not
+/// answered with the same word. A frame the header counted whose bytes are not all
+/// there is a record removed or truncated away: the header is authentic by now, so
+/// the file provably no longer holds the record set the header signed, and that is
+/// `chain_mismatch`. A frame whose bytes are all present but whose own fields
+/// contradict them is a corrupt file, and calling that tampering sends an operator
+/// to preserve evidence of an intrusion that never happened while the backup that
+/// would actually fix it goes unrestored. The field name travels with the second
+/// one, because it is the only part of the failure anybody can act on.
+///
+/// Bytes past the last authenticated frame are left alone; see the module
 /// documentation.
 fn walk(
     chain: &ChainMac,
@@ -650,8 +657,11 @@ fn walk(
         let rest = bytes.get(at..).ok_or(VaultError::IntegrityFailed {
             integrity: Integrity::ChainMismatch,
         })?;
-        let (frame, used) = Frame::decode(rest).map_err(|_| VaultError::IntegrityFailed {
-            integrity: Integrity::ChainMismatch,
+        let (frame, used) = Frame::decode(rest).map_err(|refusal| match refusal {
+            FrameError::Truncated => VaultError::IntegrityFailed {
+                integrity: Integrity::ChainMismatch,
+            },
+            FrameError::Malformed(malformed) => malformed,
         })?;
         tail = chain.link(&tail, used)?;
         at += used.len();

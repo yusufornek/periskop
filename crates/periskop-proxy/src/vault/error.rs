@@ -45,6 +45,22 @@ pub enum VaultError {
     #[error("the vault key could not be derived; the vault stays sealed")]
     KeyDerivationFailed,
 
+    /// The record cipher refused, with the key already derived and in hand.
+    ///
+    /// Deliberately not [`VaultError::KeyDerivationFailed`], which is what this
+    /// used to be reported as. By the time a seal can fail the derivation has
+    /// already succeeded, so the only remaining causes are an output buffer that
+    /// could not be produced or a length invariant inside the cipher. An operator
+    /// who reads "the vault key could not be derived" retypes and re-enters a
+    /// passphrase that is the one part of the system already known to work, and a
+    /// refusal that names the wrong remedy is slower to resolve than one that
+    /// names none. Carries the stage rather than the value: what was being sealed
+    /// is a plaintext and never appears here.
+    #[error(
+        "the vault could not run its record cipher while {stage}; the key was already in hand, so this is a buffer or memory failure; the vault stays sealed"
+    )]
+    SealFailed { stage: &'static str },
+
     /// The operating system would not give us random bytes.
     ///
     /// A refusal rather than a fallback. A nonce from a weaker source is the one
@@ -217,6 +233,7 @@ impl VaultError {
             Self::PassphraseMissing
             | Self::KdfParameterOutOfRange { .. }
             | Self::KeyDerivationFailed
+            | Self::SealFailed { .. }
             | Self::EntropyUnavailable
             | Self::RecordTamper
             | Self::AliasCollision
@@ -251,6 +268,10 @@ mod tests {
         // property so that a new variant has to be added here on purpose.
         assert_eq!(VaultError::PassphraseMissing.http_status(), 503);
         assert_eq!(VaultError::KeyDerivationFailed.http_status(), 503);
+        assert_eq!(
+            VaultError::SealFailed { stage: "sealing" }.http_status(),
+            503
+        );
         assert_eq!(VaultError::EntropyUnavailable.http_status(), 503);
         assert_eq!(VaultError::RecordTamper.http_status(), 503);
         assert_eq!(VaultError::AliasCollision.http_status(), 503);
@@ -321,6 +342,30 @@ mod tests {
         };
         assert_eq!(unsupported.http_status(), 503);
         assert_eq!(unsupported.integrity(), None);
+    }
+
+    /// The two refusals an operator must not confuse, side by side.
+    ///
+    /// One of them means "the passphrase or the profile is wrong"; the other means
+    /// "the key was fine and the machine could not finish the work". They were the
+    /// same variant once, and the first sentence an operator read pointed at the
+    /// only component that had already proved itself healthy.
+    #[test]
+    fn a_seal_failure_and_a_derivation_failure_name_different_remedies() {
+        let derivation = VaultError::KeyDerivationFailed.to_string();
+        let seal = VaultError::SealFailed {
+            stage: "sealing a record body",
+        };
+
+        assert_eq!(seal.integrity(), None);
+        let rendered = seal.to_string();
+        assert_ne!(rendered, derivation);
+        assert!(rendered.contains("sealing a record body"), "{rendered}");
+        assert!(rendered.contains("buffer or memory"), "{rendered}");
+        // The words that send an operator to the passphrase belong to the other
+        // refusal and to nothing else.
+        assert!(!rendered.contains("could not be derived"), "{rendered}");
+        assert!(!rendered.contains("passphrase"), "{rendered}");
     }
 
     #[test]

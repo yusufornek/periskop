@@ -240,6 +240,25 @@ impl Header {
     }
 }
 
+/// Why one frame could not be read, split by the remedy it implies.
+///
+/// The split exists because the caller answers the two with different words. A
+/// frame whose bytes are simply not all there is a record the header counted and
+/// the file does not hold, which is the chain's business; a frame whose bytes are
+/// present but whose own fields do not describe them is a corrupt file, which is
+/// not. `proxy/spec.md` section 10 gives those two rows opposite instructions
+/// ("dur, ortamı düzelt" against "durdur ve incele"), so collapsing them here
+/// would decide the operator's next move wrongly one row at a time.
+#[derive(Debug)]
+pub(super) enum FrameError {
+    /// Fewer bytes remain than this frame needs, so a record the header counted
+    /// is missing from the file.
+    Truncated,
+    /// The bytes are all there and a field in them is wrong. Carries the field,
+    /// because the field name is the only part of this an operator can act on.
+    Malformed(VaultError),
+}
+
 /// One record on disk.
 #[derive(Clone)]
 pub(super) struct Frame {
@@ -317,55 +336,68 @@ impl Frame {
     /// The frame's own bytes come back because the chain is computed over them
     /// verbatim: re-encoding a decoded frame to hash it would let a difference
     /// between the reader and the writer pass unnoticed.
-    pub(super) fn decode(bytes: &[u8]) -> Result<(Self, &[u8]), VaultError> {
+    /// The order of the checks is what separates a corrupt frame from a missing
+    /// one. Everything the fixed head can be judged on is judged first, on bytes
+    /// that are known to be present; only then is the declared length compared
+    /// with what remains. A length word that disagrees with the two length fields
+    /// beside it is wrong wherever the file ends, so it is answered as a corrupt
+    /// field rather than as a short file.
+    pub(super) fn decode(bytes: &[u8]) -> Result<(Self, &[u8]), FrameError> {
         if bytes.len() < FRAME_HEAD_BYTES {
-            return Err(VaultError::VaultFileMalformed {
-                field: VaultField::FrameLength,
-            });
+            return Err(FrameError::Truncated);
         }
 
-        let length = read_u32(bytes, 0)? as usize;
+        // Every offset below is inside the fixed head, which the check above
+        // proved is present, so none of these reads can run off the end.
+        let length = read_u32(bytes, 0).map_err(FrameError::Malformed)? as usize;
         if bytes[4] != FRAME_VERSION {
-            return Err(VaultError::VaultFileUnsupported {
+            return Err(FrameError::Malformed(VaultError::VaultFileUnsupported {
                 field: VaultField::FrameVersion,
                 found: u32::from(bytes[4]),
-            });
+            }));
         }
         let Some(record_type) = super::record::RecordType::from_tag(bytes[5]) else {
-            return Err(VaultError::VaultFileUnsupported {
+            return Err(FrameError::Malformed(VaultError::VaultFileUnsupported {
                 field: VaultField::RecordType,
                 found: u32::from(bytes[5]),
-            });
+            }));
         };
         // One variant today, and the binding exists so that adding a second one
         // has to decide what a reader older than it should do.
         let super::record::RecordType::Alias = record_type;
 
-        if read_u16(bytes, 6)? != 0 || read_u16(bytes, 90)? != 0 {
-            return Err(VaultError::VaultFileMalformed {
+        if read_u16(bytes, 6).map_err(FrameError::Malformed)? != 0
+            || read_u16(bytes, 90).map_err(FrameError::Malformed)? != 0
+        {
+            return Err(FrameError::Malformed(VaultError::VaultFileMalformed {
                 field: VaultField::FrameReserved,
-            });
+            }));
         }
 
-        let alias_len = read_u16(bytes, 88)? as usize;
-        let body_len = read_u32(bytes, 92)? as usize;
+        let alias_len = read_u16(bytes, 88).map_err(FrameError::Malformed)? as usize;
+        let body_len = read_u32(bytes, 92).map_err(FrameError::Malformed)? as usize;
         if alias_len > ALIAS_CEILING_BYTES {
-            return Err(VaultError::VaultFileMalformed {
+            return Err(FrameError::Malformed(VaultError::VaultFileMalformed {
                 field: VaultField::AliasLength,
-            });
+            }));
         }
         if body_len > BODY_CEILING_BYTES {
-            return Err(VaultError::VaultFileMalformed {
+            return Err(FrameError::Malformed(VaultError::VaultFileMalformed {
                 field: VaultField::BodyLength,
-            });
+            }));
         }
         // The declared length has to be exactly what the two variable fields add
         // up to. Accepting a longer one would leave bytes inside a frame that
         // nothing describes, which is where a second record could hide.
-        if length != FRAME_HEAD_BYTES + alias_len + body_len || length > bytes.len() {
-            return Err(VaultError::VaultFileMalformed {
+        if length != FRAME_HEAD_BYTES + alias_len + body_len {
+            return Err(FrameError::Malformed(VaultError::VaultFileMalformed {
                 field: VaultField::FrameLength,
-            });
+            }));
+        }
+        // Self consistent, and longer than what is left: the frame is described
+        // correctly and its bytes were cut off.
+        if length > bytes.len() {
+            return Err(FrameError::Truncated);
         }
 
         let mut session = [0u8; SESSION_ID_BYTES];
@@ -380,13 +412,13 @@ impl Frame {
         let Ok(alias) = std::str::from_utf8(&bytes[alias_at..body_at]) else {
             // An alias is a string the proxy published; bytes that are not text
             // did not come from this product.
-            return Err(VaultError::VaultFileMalformed {
+            return Err(FrameError::Malformed(VaultError::VaultFileMalformed {
                 field: VaultField::Alias,
-            });
+            }));
         };
 
         let frame = Self {
-            stored_at_ms: read_u64(bytes, 8)?,
+            stored_at_ms: read_u64(bytes, 8).map_err(FrameError::Malformed)?,
             session: SessionId::from_bytes(session),
             alias_seed: AliasSeed::from_bytes(alias_seed),
             alias: alias.to_owned(),
@@ -592,9 +624,9 @@ mod tests {
         encoded[..4].copy_from_slice(&(honest + 1).to_le_bytes());
         assert!(matches!(
             Frame::decode(&encoded),
-            Err(VaultError::VaultFileMalformed {
+            Err(FrameError::Malformed(VaultError::VaultFileMalformed {
                 field: VaultField::FrameLength
-            })
+            }))
         ));
 
         // Shorter: the tail of the body would be read as the start of the next
@@ -602,9 +634,32 @@ mod tests {
         encoded[..4].copy_from_slice(&(honest - 1).to_le_bytes());
         assert!(matches!(
             Frame::decode(&encoded),
-            Err(VaultError::VaultFileMalformed {
+            Err(FrameError::Malformed(VaultError::VaultFileMalformed {
                 field: VaultField::FrameLength
-            })
+            }))
+        ));
+    }
+
+    /// The length word is judged against the fields beside it, not against where
+    /// the file happens to end.
+    ///
+    /// A frame whose length disagrees with its own two length fields is corrupt
+    /// even when there are plenty of bytes after it, and it stays corrupt when
+    /// there are not: `Truncated` would send the caller to the chain, which
+    /// answers "somebody wrote to this vault" for a fault nobody wrote.
+    #[test]
+    fn a_length_that_disagrees_with_its_fields_is_corrupt_and_not_merely_short() {
+        let mut encoded = frame().encode().unwrap();
+        let honest = encoded.len() as u32;
+        // Longer than the fields describe *and* longer than the buffer, so the
+        // only thing that can tell the two verdicts apart is which check runs
+        // first.
+        encoded[..4].copy_from_slice(&(honest + 4096).to_le_bytes());
+        assert!(matches!(
+            Frame::decode(&encoded),
+            Err(FrameError::Malformed(VaultError::VaultFileMalformed {
+                field: VaultField::FrameLength
+            }))
         ));
     }
 
@@ -618,9 +673,9 @@ mod tests {
             assert!(
                 matches!(
                     Frame::decode(&tampered),
-                    Err(VaultError::VaultFileMalformed {
+                    Err(FrameError::Malformed(VaultError::VaultFileMalformed {
                         field: VaultField::FrameReserved
-                    })
+                    }))
                 ),
                 "reserved byte {at} was accepted"
             );
@@ -630,20 +685,20 @@ mod tests {
         tampered[4] = 2;
         assert!(matches!(
             Frame::decode(&tampered),
-            Err(VaultError::VaultFileUnsupported {
+            Err(FrameError::Malformed(VaultError::VaultFileUnsupported {
                 field: VaultField::FrameVersion,
                 ..
-            })
+            }))
         ));
 
         let mut tampered = encoded;
         tampered[5] = 7;
         assert!(matches!(
             Frame::decode(&tampered),
-            Err(VaultError::VaultFileUnsupported {
+            Err(FrameError::Malformed(VaultError::VaultFileUnsupported {
                 field: VaultField::RecordType,
                 ..
-            })
+            }))
         ));
     }
 
@@ -655,28 +710,35 @@ mod tests {
         encoded[92..96].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(matches!(
             Frame::decode(&encoded),
-            Err(VaultError::VaultFileMalformed {
+            Err(FrameError::Malformed(VaultError::VaultFileMalformed {
                 field: VaultField::BodyLength
-            })
+            }))
         ));
 
         encoded[92..96].copy_from_slice(&12u32.to_le_bytes());
         encoded[88..90].copy_from_slice(&u16::MAX.to_le_bytes());
         assert!(matches!(
             Frame::decode(&encoded),
-            Err(VaultError::VaultFileMalformed {
+            Err(FrameError::Malformed(VaultError::VaultFileMalformed {
                 field: VaultField::AliasLength
-            })
+            }))
         ));
     }
 
+    /// Bytes cut off the end are a record that is not there, which is the chain's
+    /// business and not the format's.
     #[test]
-    fn a_frame_that_runs_past_the_end_of_the_file_is_refused() {
+    fn a_frame_that_runs_past_the_end_of_the_file_is_refused_as_a_short_frame() {
         let encoded = frame().encode().unwrap();
-        for cut in [FRAME_HEAD_BYTES, encoded.len() - 1] {
+        for cut in [
+            0usize,
+            FRAME_HEAD_BYTES - 1,
+            FRAME_HEAD_BYTES,
+            encoded.len() - 1,
+        ] {
             assert!(
-                Frame::decode(&encoded[..cut]).is_err(),
-                "a frame truncated to {cut} bytes was accepted"
+                matches!(Frame::decode(&encoded[..cut]), Err(FrameError::Truncated)),
+                "a frame truncated to {cut} bytes was not reported as short"
             );
         }
     }
@@ -687,9 +749,9 @@ mod tests {
         encoded[FRAME_HEAD_BYTES] = 0xFF;
         assert!(matches!(
             Frame::decode(&encoded),
-            Err(VaultError::VaultFileMalformed {
+            Err(FrameError::Malformed(VaultError::VaultFileMalformed {
                 field: VaultField::Alias
-            })
+            }))
         ));
     }
 

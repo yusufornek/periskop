@@ -1032,6 +1032,9 @@ fn refusals() -> Vec<VaultError> {
     vec![
         VaultError::PassphraseMissing,
         VaultError::KeyDerivationFailed,
+        VaultError::SealFailed {
+            stage: "sealing a record body",
+        },
         VaultError::EntropyUnavailable,
         VaultError::RecordTamper,
         VaultError::AliasCollision,

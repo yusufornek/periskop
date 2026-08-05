@@ -18,7 +18,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use periskop_proxy::vault::{
     AliasSeed, Backing, CounterFloor, Integrity, OpenRequest, Passphrase, ProfileName, Restored,
-    SessionId, Storage, UnresolvedReason, Vault, VaultError, VaultState,
+    SessionId, Storage, UnresolvedReason, Vault, VaultError, VaultField, VaultState,
 };
 
 const AHMET: &[u8] = b"Ahmet Yilmaz";
@@ -96,6 +96,34 @@ fn one_derivation_at_a_time() -> MutexGuard<'static, ()> {
 
 fn seed(byte: u8) -> AliasSeed {
     AliasSeed::from_bytes([byte; 32])
+}
+
+/// Where each frame really starts and ends, read the way the reader reads it:
+/// from each frame's own length word.
+///
+/// Written out because the records in these files are **not** the same size. The
+/// values behind them differ in length, so dividing the record region by the
+/// number of records lands in the middle of a frame, and a test that moved such a
+/// slice was corrupting a frame while claiming to move a whole record. That
+/// difference was invisible while every structural failure was answered with
+/// `chain_mismatch`, and it is the reason these two tests are written this way.
+fn frame_bounds(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
+    const HEADER_BYTES: usize = 128;
+    const FRAME_HEAD_BYTES: usize = 96;
+
+    let mut bounds = Vec::new();
+    let mut at = HEADER_BYTES;
+    while at + FRAME_HEAD_BYTES <= bytes.len() {
+        let length = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        assert!(
+            length >= FRAME_HEAD_BYTES,
+            "frame at {at} declares {length}"
+        );
+        bounds.push(at..at + length);
+        at += length;
+    }
+    assert_eq!(at, bytes.len(), "the frames do not tile the file");
+    bounds
 }
 
 /// Two records, and the bytes of the honest file they produce.
@@ -247,12 +275,14 @@ fn chain_mismatch_does_not_open_the_vault_and_repairs_nothing() {
     assert_eq!(refusal.http_status(), 503);
     no_recovery_was_attempted(&scratch, &edited, CounterFloor::Unknown);
 
-    // Shape three: two records exchanged. Same bytes, same length, different
-    // order, and nothing but the chain can tell.
-    let record_bytes = (honest.len() - 128) / 2;
+    // Shape three: two records exchanged, on their real boundaries, so that both
+    // frames still decode perfectly and the chain is once again the only thing
+    // that can tell.
+    let frames = frame_bounds(&honest);
+    assert_eq!(frames.len(), 2);
     let mut swapped = honest[..128].to_vec();
-    swapped.extend_from_slice(&honest[128 + record_bytes..]);
-    swapped.extend_from_slice(&honest[128..128 + record_bytes]);
+    swapped.extend_from_slice(&honest[frames[1].clone()]);
+    swapped.extend_from_slice(&honest[frames[0].clone()]);
     assert_eq!(swapped.len(), honest.len());
     assert_ne!(swapped, honest);
     std::fs::write(scratch.vault(), &swapped).unwrap();
@@ -285,15 +315,63 @@ fn chain_mismatch_a_record_removed_from_the_middle_does_not_open_the_vault() {
     drop(vault);
 
     let honest = std::fs::read(scratch.vault()).unwrap();
-    let record_bytes = (honest.len() - 128) / 3;
-    let mut without_the_middle = honest[..128 + record_bytes].to_vec();
-    without_the_middle.extend_from_slice(&honest[128 + 2 * record_bytes..]);
+    let frames = frame_bounds(&honest);
+    assert_eq!(frames.len(), 3);
+    let mut without_the_middle = honest[..frames[1].start].to_vec();
+    without_the_middle.extend_from_slice(&honest[frames[2].clone()]);
     std::fs::write(scratch.vault(), &without_the_middle).unwrap();
 
     let refusal = on_file(&scratch.vault(), CounterFloor::Unknown).unwrap_err();
     assert_eq!(refusal.integrity(), Some(Integrity::ChainMismatch));
     assert_eq!(refusal.http_status(), 503);
     no_recovery_was_attempted(&scratch, &without_the_middle, CounterFloor::Unknown);
+}
+
+/// A length field that no longer describes its own frame is a corrupt file, and
+/// reporting `chain_mismatch` for it hands the operator the wrong remedy.
+///
+/// The two failures need opposite moves. A corrupt file is restored from a backup
+/// and the machine keeps working; a chain violation means somebody wrote to the
+/// vault and the machine is evidence that must not be touched. `proxy/spec.md`
+/// section 10 keeps them in two rows for that reason ("dur, ortamı düzelt" against
+/// "durdur ve incele"), and `integrity` is how a client tells the rows apart.
+///
+/// Nothing is missing here: every byte the header counted is still on disk, and
+/// only the field that describes them disagrees with them.
+#[test]
+fn a_corrupt_frame_length_is_a_malformed_file_and_not_a_tampering_report() {
+    let scratch = Scratch::new("frame-length");
+    let session = SessionId::from_bytes([0x48; 16]);
+    let honest = seeded(&scratch, &session);
+
+    // The first frame's own length word, one byte longer than the fields inside
+    // the frame add up to.
+    let declared = u32::from_le_bytes(honest[128..132].try_into().unwrap());
+    let mut corrupt = honest.clone();
+    corrupt[128..132].copy_from_slice(&(declared + 1).to_le_bytes());
+    assert_eq!(corrupt.len(), honest.len());
+    std::fs::write(scratch.vault(), &corrupt).unwrap();
+
+    let refusal = on_file(&scratch.vault(), CounterFloor::Unknown).unwrap_err();
+    assert_eq!(refusal.http_status(), 503);
+    assert_eq!(
+        refusal.integrity(),
+        None,
+        "a corrupt length field was reported as one of the three integrity violations"
+    );
+    assert!(
+        matches!(
+            refusal,
+            VaultError::VaultFileMalformed {
+                field: VaultField::FrameLength
+            }
+        ),
+        "{refusal:?}"
+    );
+    // The reason the old mapping threw away: an operator who is not told which
+    // field is wrong has nowhere to look.
+    assert!(refusal.to_string().contains("frame length"), "{refusal}");
+    no_recovery_was_attempted(&scratch, &corrupt, CounterFloor::Unknown);
 }
 
 /// Violation two of three: an older copy of the file is put back.

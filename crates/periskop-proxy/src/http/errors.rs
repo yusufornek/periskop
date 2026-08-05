@@ -118,10 +118,14 @@ impl From<&VaultError> for ProxyError {
             VaultError::RecordTamper => Self::VaultRecordTamper,
             VaultError::IntegrityFailed { .. } => Self::VaultIntegrityFailed,
             // Everything else a vault can refuse with means the vault cannot be
-            // used: no passphrase, no entropy, parameters out of range, a file
-            // that will not open or does not have this layout. All of them are
-            // "stop and fix the environment", which is what `vault_unavailable`
-            // tells a caller.
+            // used: no passphrase, no entropy, parameters out of range, a cipher
+            // that could not produce a sealed body, a file that will not open or
+            // does not have this layout. All of them are "stop and fix the
+            // environment", which is what `vault_unavailable` tells a caller, and
+            // it is the row `proxy/spec.md` section 10 puts them in. A corrupt
+            // file belongs here rather than under `vault_integrity_failed`: that
+            // value's row says "durdur ve incele" and is reserved for the three
+            // violations section 9 enumerates.
             _ => Self::VaultUnavailable,
         }
     }
@@ -272,6 +276,24 @@ mod tests {
             ),
             (
                 VaultError::EntropyUnavailable,
+                ProxyError::VaultUnavailable,
+                503,
+            ),
+            // A cipher that could not seal, and a file whose frames do not parse.
+            // Both are outages rather than intrusions, and neither may borrow
+            // `vault_integrity_failed`, whose row instructs an operator to stop
+            // and investigate a break-in.
+            (
+                VaultError::SealFailed {
+                    stage: "sealing a record body",
+                },
+                ProxyError::VaultUnavailable,
+                503,
+            ),
+            (
+                VaultError::VaultFileMalformed {
+                    field: crate::vault::VaultField::FrameLength,
+                },
                 ProxyError::VaultUnavailable,
                 503,
             ),

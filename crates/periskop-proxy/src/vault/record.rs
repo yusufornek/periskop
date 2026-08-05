@@ -244,7 +244,7 @@ pub(super) fn seal(
         )
         // The AEAD's encrypt fails only when the buffer cannot be produced. A
         // vault that cannot seal must not carry on with the value in the clear.
-        .map_err(|_| VaultError::KeyDerivationFailed)?;
+        .map_err(|_| seal_refusal(STAGE_SEALING))?;
 
     Ok(SealedRecord { nonce, body })
 }
@@ -277,7 +277,25 @@ fn cipher(key: &RecordKey) -> Result<XChaCha20Poly1305, VaultError> {
     // The key is a fixed 32 bytes by construction, so the length check cannot
     // fail; it is mapped rather than unwrapped because a panic inside the vault
     // is an outage with no diagnosis.
-    XChaCha20Poly1305::new_from_slice(key.as_bytes()).map_err(|_| VaultError::KeyDerivationFailed)
+    XChaCha20Poly1305::new_from_slice(key.as_bytes()).map_err(|_| seal_refusal(STAGE_BUILDING))
+}
+
+/// The two moments the record cipher can refuse, named so that the refusal says
+/// which one it was.
+const STAGE_BUILDING: &str = "building the record cipher";
+const STAGE_SEALING: &str = "sealing a record body";
+
+/// The class an AEAD refusal on the sealing side belongs to.
+///
+/// Both call sites run with the key already derived and in hand, so neither can be
+/// a key derivation failure: XChaCha20-Poly1305 refuses to be constructed only on
+/// a wrong key length, which [`RecordKey`] makes impossible, and refuses a seal
+/// only when it cannot produce the output buffer. Telling an operator that the key
+/// could not be derived sends them to the passphrase, which is the one part of the
+/// system already known to have worked, and a refusal that names the wrong remedy
+/// costs more time to resolve than one that names none.
+fn seal_refusal(stage: &'static str) -> VaultError {
+    VaultError::SealFailed { stage }
 }
 
 /// What the vault has to report about record authentication.
@@ -540,5 +558,35 @@ mod tests {
             .body
             .windows(AHMET.len())
             .any(|window| window == AHMET));
+    }
+
+    /// A cipher failure is not a passphrase failure, and the message decides which
+    /// one an operator goes looking for.
+    ///
+    /// Neither call site can be driven to fail from here: the key is 32 bytes by
+    /// construction and the AEAD refuses a seal only when it cannot produce the
+    /// output buffer. What is testable is the class the two sites assign, which is
+    /// the whole of what reaches the operator, so that is asserted directly.
+    #[test]
+    fn a_cipher_refusal_is_not_reported_as_a_key_derivation_failure() {
+        for stage in [STAGE_BUILDING, STAGE_SEALING] {
+            let refusal = seal_refusal(stage);
+            assert_ne!(
+                refusal,
+                VaultError::KeyDerivationFailed,
+                "a seal that failed with the key in hand blamed the key derivation"
+            );
+            // Still a vault outage, so still 503: the class changed, the answer
+            // did not (`proxy/spec.md` section 10, "Kasa kullanılamaz").
+            assert_eq!(refusal.http_status(), 503);
+            // Not one of the three integrity violations either; nothing was
+            // tampered with.
+            assert_eq!(refusal.integrity(), None);
+
+            let rendered = refusal.to_string();
+            assert!(rendered.contains(stage), "{rendered}");
+            assert!(!rendered.contains("passphrase"), "{rendered}");
+            assert!(!rendered.contains("could not be derived"), "{rendered}");
+        }
     }
 }
