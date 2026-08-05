@@ -49,3 +49,10 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 periskop-static-scanner = { workspace = true }
+# The F4 proxy gate (`tests/proof_f4.rs`) runs the shipped listener, which is a
+# `hyper` server on a `tokio` runtime. A test dependency only: nothing in this
+# crate's own code path is asynchronous, and the gate has to drive the real
+# server rather than a synchronous stand-in for it, or it would prove a program
+# nobody ships. The feature set is the workspace one, decided in the root
+# manifest.
+tokio = { workspace = true }

@@ -122,6 +122,26 @@ jobs:
           cargo test -p periskop-cli --test reconcile_benchmark
           cat target/reconcile-benchmark.json
 
+      # The F4 proxy gate. Same reason for the environment variable: a run that
+      # skipped the gate did not pass it. The artefact separates what it proves
+      # from what it does not, and printing it here keeps the second list from
+      # living only on the machine that produced the file.
+      - name: F4 proxy gate proof
+        env:
+          PERISKOP_REQUIRE_PROOF: 1
+        run: |
+          cargo test -p periskop-cli --test proof_f4
+          cat target/f4-proof.json
+
+      # The vault plaintext gate, which is F4 exit criterion 3. It runs both KDF
+      # profiles and a skipped profile is a failure rather than a smaller run.
+      - name: Vault plaintext gate
+        env:
+          PERISKOP_REQUIRE_PROOF: 1
+        run: |
+          cargo test -p periskop-proxy --test vault_no_plaintext
+          cat target/f4-vault-no-plaintext-proof.json
+
       # The F3 gate itself. PERISKOP_REQUIRE_PROOF is set for the reason it is
       # set on the test steps: a run that skipped the gate did not pass it. The
       # artefact carries a caveat saying the eBPF capture path did not run, and

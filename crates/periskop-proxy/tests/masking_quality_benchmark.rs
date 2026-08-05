@@ -392,16 +392,15 @@ struct Mechanical {
 }
 
 fn run_offline(class: &TaskClass) -> Mechanical {
-    // `DATE` is allowed by an explicit rule rather than left to the default.
-    // `EntityType::Date` mints no alias (K-18: `date_policy = "shift"` is not
-    // implemented and `allow` is the default), so a date under `[default] mode =
-    // "mask"` refuses the whole request. A benchmark corpus without a date in it
-    // would be a corpus written around the tool, so the rule is written instead
-    // and the artefact carries it.
+    // No rule about dates. The corpus has an invoice with a date on it, and a
+    // benchmark that had to write a rule to survive its own corpus would be
+    // measuring a configuration nobody deploys: `date_policy` defaults to
+    // `allow` (`proxy-policy.md` section 4, K-18), so the default policy is what
+    // this runs under. The rule that used to be here was a workaround for a
+    // defect in the request path, and it is gone with the defect.
     let policy = Policy::load(
         &format!(
             "policy_id = \"benchmark\"\npolicy_version = \"1\"\n{}\n\
-             [[rule]]\nentity = \"DATE\"\nmode = \"allow\"\n\
              [default]\nmode = \"mask\"\n",
             class.policy
         ),

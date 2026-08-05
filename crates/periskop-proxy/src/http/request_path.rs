@@ -23,7 +23,7 @@ use crate::detect::{
     merge, owning_layer, pattern, Candidate, DegradedReason, Detection, DetectionLayer,
 };
 use crate::policy::scope::{layers_for, string_values};
-use crate::policy::{decide, Mode, Policy, Step};
+use crate::policy::{decide, DatePolicy, Decision, Mode, Policy, Rule, Step};
 use crate::vault::{SessionId, Vault, VaultError};
 
 use super::errors::{ProxyError, Refusal};
@@ -292,11 +292,16 @@ fn apply(
     let mut out = text.to_owned();
 
     for candidate in detection.candidates.iter().rev() {
-        let decision = decide(
-            pass.policy.rules(),
-            pass.policy.default_mode(),
+        let decision = date_aware(
+            pass.policy,
             path,
             candidate.entity,
+            decide(
+                pass.policy.rules(),
+                pass.policy.default_mode(),
+                path,
+                candidate.entity,
+            ),
         );
         let Some(original) = candidate.text_of(text) else {
             continue;
@@ -327,6 +332,67 @@ fn apply(
     }
 
     Ok(out)
+}
+
+/// What `entities_allowed[].rule_scope` says when `date_policy` decided.
+///
+/// Parenthesised, in the shape [`Decision::DEFAULT_SCOPE`] already uses, because
+/// it is not a scope expression somebody can go and find in a `[[rule]]` block.
+/// It names the key the operator has to edit, which is the whole reason
+/// `proxy-events.md` carries the deciding expression beside the count.
+const DATE_POLICY_SCOPE: &str = "(date_policy)";
+
+/// Lets `date_policy` answer for a `DATE` that would otherwise be masked.
+///
+/// This build mints no date alias. F4's scope boundary 2 struck date shifting
+/// out entirely, so [`EntityType::Date`] is `Minting::NotMinted`, and until this
+/// function existed a date under the default `[default] mode = "mask"` refused
+/// the **whole request** with `endpoint_unsupported`. A meeting date, a release
+/// day or a date in a SQL query is an ordinary thing to write to a model, so the
+/// default configuration refused ordinary prompts, and the operator had no way
+/// to read the reason off the refusal. `proxy-policy.md` section 4 defaults
+/// `date_policy` to `allow` and `proxy/spec.md` section 4.5 spends a section on
+/// why, so the refusal was this build ignoring a key rather than the contract
+/// asking for it.
+///
+/// Only `mask` is redirected, and only when no rule named `DATE`:
+///
+/// - a rule that names `entity = "DATE"` is the operator speaking about dates,
+///   and it is honoured exactly as written. `proxy/spec.md` section 8's own
+///   example writes that rule to block them, and a `mask` written there still
+///   refuses the request rather than being quietly turned into a pass;
+/// - an `allow` or a `block` from anywhere else is honoured too.
+///   `proxy-policy.md` section 3 forbids a precedence rule in the relaxing
+///   direction, and letting a date through a scope the operator blocked would be
+///   one.
+///
+/// What is left is the one mode this build provably cannot honour for a date,
+/// and `date_policy` is the key the contract put there to answer it.
+fn date_aware(policy: &Policy, path: &[Step], entity: EntityType, decision: Decision) -> Decision {
+    if entity != EntityType::Date
+        || decision.mode != Mode::Mask
+        || names_dates(policy.rules(), path)
+    {
+        return decision;
+    }
+    Decision {
+        mode: match policy.date_policy() {
+            DatePolicy::Allow => Mode::Allow,
+            DatePolicy::Block => Mode::Block,
+        },
+        rule_scope: DATE_POLICY_SCOPE.to_owned(),
+    }
+}
+
+/// Whether a rule at this path names `DATE` itself.
+///
+/// Only the naming matters, not which mode it chose: a rule that says `DATE` is
+/// an operator who has thought about dates, and their sentence is not rewritten
+/// by a key that exists to answer for the ones who have not.
+fn names_dates(rules: &[Rule], path: &[Step]) -> bool {
+    rules
+        .iter()
+        .any(|rule| rule.entity == Some(EntityType::Date) && rule.scope.covers(path))
 }
 
 /// Mints an alias and files the original under it, in that order.
@@ -643,6 +709,140 @@ mod tests {
         let (masked, _) = run(&policy, &body);
         assert_eq!(masked.body, body);
         assert_eq!(masked.masked_entities, 0);
+    }
+
+    /// A prompt with a date in it.
+    ///
+    /// The shortest policy the loader accepts is `[default] mode = "mask"`, and
+    /// under it this body used to come back as a `400`, because `DATE` mints
+    /// nothing and nothing read `date_policy`. Meeting dates, release days and
+    /// dates inside SQL are ordinary things to write to a model, so that refusal
+    /// made the default configuration refuse ordinary work.
+    #[test]
+    fn a_date_crosses_under_the_default_policy_instead_of_refusing_the_request() {
+        let policy = policy("");
+        let body =
+            json!({"messages": [{"role": "user", "content": "toplanti 2026-03-11 tarihinde"}]});
+        let (masked, _) = run(&policy, &body);
+
+        assert_eq!(masked.body, body, "the date did not cross unchanged");
+        assert_eq!(masked.masked_entities, 0);
+        // Crossing is not silence (`proxy-events.md`): the date is counted, and
+        // the count names the key an operator would edit rather than a rule
+        // expression they would go looking for and not find.
+        assert_eq!(masked.allowed.len(), 1, "{:?}", masked.allowed);
+        assert_eq!(masked.allowed[0].entity, EntityType::Date);
+        assert_eq!(masked.allowed[0].count, 1);
+        // Written out rather than compared against the constant it came from: a
+        // comparison with `DATE_POLICY_SCOPE` would pass whatever that constant
+        // said, including an empty string, which reads in a record as a missing
+        // field rather than as the key that decided.
+        assert_eq!(masked.allowed[0].rule_scope, "(date_policy)");
+    }
+
+    /// The other value of the key, and the whole reason it is a key.
+    #[test]
+    fn date_policy_block_refuses_the_request_that_carries_a_date() {
+        let policy = policy("date_policy = \"block\"");
+        let mut vault = vault();
+        let mut minter = minter(&mut vault);
+        let mut pass = Pass {
+            policy: &policy,
+            session: SESSION,
+            minter: &mut minter,
+            vault: &mut vault,
+            now: &|| NOW,
+        };
+        let body = json!({"messages": [{"role": "user", "content": "teslim 2026-03-11"}]});
+
+        let refusal = mask(&mut pass, &body).expect_err("a date crossed under date_policy block");
+        assert_eq!(refusal.error(), ProxyError::EntityBlocked);
+        assert_eq!(refusal.status(), 400);
+        assert!(refusal.detail().contains("DATE"), "{}", refusal.detail());
+    }
+
+    /// `proxy/spec.md` section 8 writes this rule as the correct way to keep
+    /// dates out of a flow, so the key may not overrule it in either direction.
+    #[test]
+    fn a_rule_that_names_dates_decides_and_the_key_does_not_overrule_it() {
+        let blocking = policy("[[rule]]\nentity = \"DATE\"\nmode = \"block\"");
+        let mut vault = vault();
+        let mut minter = minter(&mut vault);
+        let mut pass = Pass {
+            policy: &blocking,
+            session: SESSION,
+            minter: &mut minter,
+            vault: &mut vault,
+            now: &|| NOW,
+        };
+        let body = json!({"messages": [{"role": "user", "content": "teslim 2026-03-11"}]});
+        let refusal = mask(&mut pass, &body).expect_err("a rule naming DATE was overruled");
+        assert_eq!(refusal.error(), ProxyError::EntityBlocked);
+
+        // And the reverse: the key refuses dates, the rule permits them, and the
+        // rule is the narrower sentence so it wins. The record names the rule's
+        // own expression rather than the key.
+        let permitting = policy(
+            "date_policy = \"block\"\n[[rule]]\nentity = \"DATE\"\nscope = \"messages[*].content\"\nmode = \"allow\"",
+        );
+        let (masked, _) = run(&permitting, &body);
+        assert_eq!(masked.body, body);
+        assert_eq!(masked.allowed.len(), 1, "{:?}", masked.allowed);
+        assert_eq!(masked.allowed[0].rule_scope, "messages[*].content");
+    }
+
+    /// The relaxation that may not happen.
+    ///
+    /// `proxy-policy.md` section 3: no precedence rule in the relaxing
+    /// direction. An operator who blocked a field blocked it for every type, and
+    /// a date is not an exception carved out by the key that answers for the
+    /// default.
+    #[test]
+    fn a_date_in_a_scope_the_operator_blocked_is_still_refused() {
+        let policy = policy("[[rule]]\nscope = \"messages[*].content\"\nmode = \"block\"");
+        let mut vault = vault();
+        let mut minter = minter(&mut vault);
+        let mut pass = Pass {
+            policy: &policy,
+            session: SESSION,
+            minter: &mut minter,
+            vault: &mut vault,
+            now: &|| NOW,
+        };
+        let body = json!({"messages": [{"role": "user", "content": "teslim 2026-03-11"}]});
+
+        let refusal = mask(&mut pass, &body).expect_err("a blocked scope let a date through");
+        assert_eq!(refusal.error(), ProxyError::EntityBlocked);
+    }
+
+    /// An operator who asks for a masked date is told, rather than quietly given
+    /// the opposite.
+    ///
+    /// `mask` is the one mode this build cannot honour for a date, and a rule
+    /// that names `DATE` is somebody who meant it. Turning that into a pass would
+    /// be a rule dropped in silence, which is the failure the whole policy loader
+    /// is built to avoid.
+    #[test]
+    fn a_rule_that_asks_for_a_masked_date_refuses_rather_than_being_relaxed() {
+        let policy = policy("[[rule]]\nentity = \"DATE\"\nmode = \"mask\"");
+        let mut vault = vault();
+        let mut minter = minter(&mut vault);
+        let mut pass = Pass {
+            policy: &policy,
+            session: SESSION,
+            minter: &mut minter,
+            vault: &mut vault,
+            now: &|| NOW,
+        };
+        let body = json!({"messages": [{"role": "user", "content": "teslim 2026-03-11"}]});
+
+        let refusal = mask(&mut pass, &body).expect_err("a date was masked");
+        assert_eq!(refusal.error(), ProxyError::EndpointUnsupported);
+        assert!(
+            refusal.detail().contains("date policy"),
+            "the refusal does not point at the key that answers dates: {}",
+            refusal.detail()
+        );
     }
 
     /// `proxy/spec.md` section 10: a vault that cannot take the record refuses the
