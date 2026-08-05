@@ -125,6 +125,29 @@ pub struct Relay {
     ended: bool,
 }
 
+/// `l_max_static` and `l_max_session` for one conversation.
+///
+/// Shared by [`Relay::new`] and by the gateway's buffered path, because these
+/// two are facts about the **conversation** rather than about the stream: a JSON
+/// answer that never held a byte has the same window as a server sent one, and
+/// `proxy-event.schema.json` rejects the zero a second, forgetful computation
+/// would leave behind.
+pub fn window_stats(
+    snapshot: &Snapshot,
+    style: AliasStyle,
+    declared_l_max_session: Option<usize>,
+) -> (u32, u32) {
+    let window = Window::of(
+        Some(snapshot.longest()).filter(|_| !snapshot.is_empty()),
+        declared_l_max_session,
+        style,
+    );
+    (
+        u32::try_from(l_max_static(style)).unwrap_or(u32::MAX),
+        u32::try_from(window.l_max_session()).unwrap_or(u32::MAX),
+    )
+}
+
 impl Relay {
     pub fn new(settings: &Settings) -> Self {
         let window = Window::of(
@@ -132,9 +155,14 @@ impl Relay {
             settings.declared_l_max_session,
             settings.style,
         );
+        let (l_max_static, l_max_session) = window_stats(
+            &settings.snapshot,
+            settings.style,
+            settings.declared_l_max_session,
+        );
         let stats = StreamStats {
-            l_max_static: u32::try_from(l_max_static(settings.style)).unwrap_or(u32::MAX),
-            l_max_session: u32::try_from(window.l_max_session()).unwrap_or(u32::MAX),
+            l_max_static,
+            l_max_session,
             ..StreamStats::default()
         };
 

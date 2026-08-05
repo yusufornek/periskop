@@ -31,4 +31,4 @@ pub mod scope;
 
 pub use error::{PolicyError, PolicyWarning, POLICY_UNLOADABLE};
 pub use load::{CodeBlockPolicy, DatePolicy, HoldTimeout, Policy, ToolCallPolicy};
-pub use scope::{resolve, Mode, Rule, Scope, Step};
+pub use scope::{decide, resolve, Decision, Mode, Rule, Scope, Step};

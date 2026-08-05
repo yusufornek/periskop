@@ -212,7 +212,40 @@ impl Rule {
 /// not "the first match", which would make it depend on the same thing in
 /// reverse.
 pub fn resolve(rules: &[Rule], default_mode: Mode, path: &[Step], entity: EntityType) -> Mode {
-    let mut best: Option<(usize, usize, Mode)> = None;
+    decide(rules, default_mode, path, entity).mode
+}
+
+/// What a policy decided, **and** which expression decided it.
+///
+/// `ProxyEvent.entities_allowed[].rule_scope` needs the second half.
+/// `proxy-events.md` is explicit that `mode = "allow"` is not silent: every
+/// entity that crossed the boundary unmasked is counted. A count on its own is
+/// not actionable, though. The operator's next move is to find the line of
+/// policy that let it through, so the line travels with the count. The
+/// **expression** travels, never the text it matched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Decision {
+    pub mode: Mode,
+    /// The deciding rule's `scope` expression, or [`Decision::DEFAULT_SCOPE`]
+    /// when no rule matched and `[default] mode` answered.
+    pub rule_scope: String,
+}
+
+impl Decision {
+    /// What `rule_scope` says when the default answered.
+    ///
+    /// Neither an empty string nor `*`: both read as scope expressions somebody
+    /// could go looking for in the policy file, and this is the absence of one.
+    pub const DEFAULT_SCOPE: &'static str = "(default)";
+}
+
+/// [`resolve`], with the deciding rule kept.
+///
+/// One function rather than two so that the mode in the response and the
+/// expression in the event record can never come from different readings of the
+/// same policy.
+pub fn decide(rules: &[Rule], default_mode: Mode, path: &[Step], entity: EntityType) -> Decision {
+    let mut best: Option<(usize, usize, Mode, String)> = None;
     for rule in rules {
         if rule.entity.is_some_and(|wanted| wanted != entity) {
             continue;
@@ -222,21 +255,54 @@ pub fn resolve(rules: &[Rule], default_mode: Mode, path: &[Step], entity: Entity
         }
         let (breadth, typed) = rule.specificity();
         best = Some(match best {
-            None => (breadth, typed, rule.mode),
-            Some((held_breadth, held_typed, held_mode)) => {
+            None => (breadth, typed, rule.mode, expression_of(&rule.scope)),
+            Some((held_breadth, held_typed, held_mode, held_scope)) => {
                 match (breadth, typed).cmp(&(held_breadth, held_typed)) {
-                    std::cmp::Ordering::Greater => (breadth, typed, rule.mode),
-                    std::cmp::Ordering::Less => (held_breadth, held_typed, held_mode),
+                    std::cmp::Ordering::Greater => {
+                        (breadth, typed, rule.mode, expression_of(&rule.scope))
+                    }
+                    std::cmp::Ordering::Less => (held_breadth, held_typed, held_mode, held_scope),
                     // Equal narrowness: the conservative mode wins, and `Ord` on
-                    // `Mode` is what says which that is.
+                    // `Mode` is what says which that is. The expression follows
+                    // the mode, so the record names the rule that actually
+                    // decided rather than whichever one was read first.
                     std::cmp::Ordering::Equal => {
-                        (held_breadth, held_typed, held_mode.max(rule.mode))
+                        if rule.mode > held_mode {
+                            (
+                                held_breadth,
+                                held_typed,
+                                rule.mode,
+                                expression_of(&rule.scope),
+                            )
+                        } else {
+                            (held_breadth, held_typed, held_mode, held_scope)
+                        }
                     }
                 }
             }
         });
     }
-    best.map_or(default_mode, |(_, _, mode)| mode)
+    best.map_or(
+        Decision {
+            mode: default_mode,
+            rule_scope: Decision::DEFAULT_SCOPE.to_owned(),
+        },
+        |(_, _, mode, rule_scope)| Decision { mode, rule_scope },
+    )
+}
+
+/// A rule's scope as an expression a reader can go and find.
+///
+/// [`Scope::everything`] renders as the empty string, which in a record reads as
+/// a missing field rather than as "every scanned field". `*` is the spelling
+/// `proxy-policy.md` already uses for a wildcard, so the widest scope says so.
+fn expression_of(scope: &Scope) -> String {
+    let rendered = scope.render();
+    if rendered.is_empty() {
+        "*".to_owned()
+    } else {
+        rendered
+    }
 }
 
 /// Every string **value** in a JSON body, with its path.

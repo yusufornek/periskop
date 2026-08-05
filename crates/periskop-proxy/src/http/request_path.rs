@@ -12,17 +12,46 @@
 //! (`proxy-api.md`, "Streaming SSE" point 1: the body is taken **in full**, masked,
 //! and only then sent), and the response side's state machine is tasks 89 to 93.
 
+use std::collections::BTreeMap;
+
 use serde_json::Value;
 
-use crate::alias::mint::Reservation;
-use crate::alias::{AliasKey, EntityType, Minter};
+use crate::alias::mint::{AliasStats, Minted, Reservation};
+use crate::alias::{AliasKey, EntityType, LadderRung, Minter};
 use crate::detect::segment::{segments, SegmentKind};
-use crate::detect::{merge, pattern, Candidate, DegradedReason, Detection};
+use crate::detect::{
+    merge, owning_layer, pattern, Candidate, DegradedReason, Detection, DetectionLayer,
+};
 use crate::policy::scope::{layers_for, string_values};
-use crate::policy::{resolve, Mode, Policy, Step};
+use crate::policy::{decide, Mode, Policy, Step};
 use crate::vault::{SessionId, Vault, VaultError};
 
 use super::errors::{ProxyError, Refusal};
+
+/// One entity type's masked count, in the shape `ProxyEvent.entities_masked[]`
+/// carries it.
+///
+/// The type, how many of them, which layer claimed them. No offset and no text:
+/// an offset plus a body somebody else has is the value, and this record is
+/// written on the assumption that nobody has the body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaskedType {
+    pub entity: EntityType,
+    pub count: u32,
+    pub layer: DetectionLayer,
+}
+
+/// One entity type that crossed unmasked because the policy said so.
+///
+/// `proxy-events.md`: "mode=allow is not silent: every one of them is counted
+/// here". The scope expression rides along so the count can be traced back to
+/// the line that produced it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllowedType {
+    pub entity: EntityType,
+    pub count: u32,
+    pub rule_scope: String,
+}
 
 /// What one masked request produced.
 #[derive(Debug)]
@@ -33,7 +62,31 @@ pub struct Masked {
     pub masked_entities: u32,
     /// Everything this scan admits it did not look for.
     pub degraded: Vec<DegradedReason>,
+    /// Per type masked counts, sorted by type.
+    pub by_type: Vec<MaskedType>,
+    /// Per type allowed counts, sorted by type.
+    pub allowed: Vec<AllowedType>,
+    /// Alias generation counters **for this request**, not for the session.
+    ///
+    /// The minter's own [`AliasStats`] accumulate over a conversation, and an
+    /// event record is written per request and response pair, so the two are
+    /// taken apart here rather than at the reader's end.
+    pub alias_stats: AliasStats,
+    /// Milliseconds spent deciding what to mask (`latency_ms.detect`).
+    pub detect_ms: u64,
+    /// Milliseconds spent minting aliases and filing records
+    /// (`latency_ms.alias`).
+    pub alias_ms: u64,
 }
+
+/// Where the masking pass reads the clock.
+///
+/// A function rather than a single timestamp because the pass is now measured in
+/// two parts (`latency_ms.detect` and `latency_ms.alias`), and injected rather
+/// than taken from the system so that a fixed clock produces a byte identical
+/// event record. `proxy-events.md`'s determinism rule is what makes that a
+/// requirement rather than a convenience.
+pub type Now<'a> = &'a dyn Fn() -> u64;
 
 /// Everything the masking pass needs that is not the body.
 pub struct Pass<'a> {
@@ -41,7 +94,9 @@ pub struct Pass<'a> {
     pub session: SessionId,
     pub minter: &'a mut Minter,
     pub vault: &'a mut Vault,
-    pub now_ms: u64,
+    /// The one clock. Vault record expiry and the phase timings read the same
+    /// function, so a test that pins it pins both.
+    pub now: Now<'a>,
 }
 
 /// Masks one request body in place.
@@ -57,7 +112,10 @@ pub fn mask(pass: &mut Pass<'_>, body: &Value) -> Result<Masked, Refusal> {
     // order they were found.
     let mut replacements: Vec<(Vec<Step>, String)> = Vec::new();
     let mut degraded: Vec<DegradedReason> = Vec::new();
-    let mut minted = 0u32;
+    let mut tally = Tally::default();
+    // The session's counters as they stood before this request, so that what is
+    // reported below is this request's share and not the conversation's total.
+    let before = pass.minter.stats();
 
     // A literal in the prompt that is already shaped like one of our aliases is
     // withheld before anything is minted, so that a value cannot be given a name
@@ -67,11 +125,18 @@ pub fn mask(pass: &mut Pass<'_>, body: &Value) -> Result<Masked, Refusal> {
     }
 
     for (path, text) in string_values(body) {
+        let at = (pass.now)();
         let detection = scan(pass.policy, &text);
+        tally.detect_ms = tally
+            .detect_ms
+            .saturating_add((pass.now)().saturating_sub(at));
         degraded.extend(detection.degraded_reasons.iter().copied());
 
-        let (masked_text, count) = apply(pass, &path, &text, &detection)?;
-        minted += count;
+        let at = (pass.now)();
+        let masked_text = apply(pass, &path, &text, &detection, &mut tally)?;
+        tally.alias_ms = tally
+            .alias_ms
+            .saturating_add((pass.now)().saturating_sub(at));
         if masked_text != text {
             replacements.push((path, masked_text));
         }
@@ -80,11 +145,88 @@ pub fn mask(pass: &mut Pass<'_>, body: &Value) -> Result<Masked, Refusal> {
     degraded.sort_unstable();
     degraded.dedup();
 
+    let after = pass.minter.stats();
     Ok(Masked {
         body: rewrite(body, &replacements),
-        masked_entities: minted,
+        masked_entities: tally.minted,
         degraded,
+        by_type: tally.masked_by_type(),
+        allowed: tally.allowed_by_type(),
+        alias_stats: AliasStats {
+            by_type: tally.aliases.by_type.clone(),
+            // A difference rather than the session total. The two scalars are
+            // kept on the minter because they are properties of generation, so
+            // this request's share is what generation did while it ran.
+            alias_pool_exhausted: after
+                .alias_pool_exhausted
+                .saturating_sub(before.alias_pool_exhausted),
+            alias_length_class_capped: after
+                .alias_length_class_capped
+                .saturating_sub(before.alias_length_class_capped),
+        },
+        detect_ms: tally.detect_ms,
+        alias_ms: tally.alias_ms,
     })
+}
+
+/// What one request's masking pass counted, before it becomes an event record.
+///
+/// Kept as maps keyed by type so the output is sorted by type on every run, and
+/// as counts alone so there is nothing here that a value could be recovered
+/// from. This is the whole of what [`Masked`] reports beyond the body.
+#[derive(Debug, Default)]
+struct Tally {
+    minted: u32,
+    /// Occurrences replaced, per type. Not the same number as the alias count
+    /// below and deliberately so: one value written twice in one prompt is two
+    /// masked entities and one alias, and `proxy-events.md` reports both.
+    masked: BTreeMap<EntityType, u32>,
+    /// Distinct aliases and their rungs, folded through the one implementation
+    /// of the R14 downgrade.
+    aliases: AliasStats,
+    /// Count, and the expression of the rule that let them through.
+    allowed: BTreeMap<EntityType, (u32, String)>,
+    detect_ms: u64,
+    alias_ms: u64,
+}
+
+impl Tally {
+    fn masked(&mut self, entity: EntityType, rung: LadderRung, reused: bool) {
+        self.minted = self.minted.saturating_add(1);
+        *self.masked.entry(entity).or_insert(0) += 1;
+        if !reused {
+            self.aliases.fold(entity, rung);
+        }
+    }
+
+    fn allowed(&mut self, entity: EntityType, rule_scope: String) {
+        self.allowed
+            .entry(entity)
+            .and_modify(|(count, _)| *count += 1)
+            .or_insert((1, rule_scope));
+    }
+
+    fn masked_by_type(&self) -> Vec<MaskedType> {
+        self.masked
+            .iter()
+            .map(|(entity, count)| MaskedType {
+                entity: *entity,
+                count: *count,
+                layer: owning_layer(*entity),
+            })
+            .collect()
+    }
+
+    fn allowed_by_type(&self) -> Vec<AllowedType> {
+        self.allowed
+            .iter()
+            .map(|(entity, (count, rule_scope))| AllowedType {
+                entity: *entity,
+                count: *count,
+                rule_scope: rule_scope.clone(),
+            })
+            .collect()
+    }
 }
 
 /// Runs the layers the policy enables over one string, segment by segment.
@@ -145,12 +287,12 @@ fn apply(
     path: &[Step],
     text: &str,
     detection: &Detection,
-) -> Result<(String, u32), Refusal> {
+    tally: &mut Tally,
+) -> Result<String, Refusal> {
     let mut out = text.to_owned();
-    let mut minted = 0u32;
 
     for candidate in detection.candidates.iter().rev() {
-        let mode = resolve(
+        let decision = decide(
             pass.policy.rules(),
             pass.policy.default_mode(),
             path,
@@ -160,10 +302,12 @@ fn apply(
             continue;
         };
 
-        match mode {
-            // Crosses unchanged. Not "no record": the count belongs to the event
-            // record, and the caller is told what was let through.
-            Mode::Allow => {}
+        match decision.mode {
+            // Crosses unchanged. Not "no record": `proxy-events.md` puts every
+            // one of these in `entities_allowed[]` with the expression of the
+            // rule that decided, because an allowance nobody can trace back to a
+            // line of policy is indistinguishable from a detector that missed.
+            Mode::Allow => tally.allowed(candidate.entity, decision.rule_scope),
             Mode::Block => {
                 return Err(Refusal::new(
                     ProxyError::EntityBlocked,
@@ -175,14 +319,14 @@ fn apply(
                 ))
             }
             Mode::Mask => {
-                let alias = mint_and_file(pass, candidate.entity, original)?;
-                out.replace_range(candidate.start..candidate.end, &alias);
-                minted += 1;
+                let minted = mint_and_file(pass, candidate.entity, original)?;
+                out.replace_range(candidate.start..candidate.end, &minted.alias);
+                tally.masked(candidate.entity, minted.rung, minted.reused);
             }
         }
     }
 
-    Ok((out, minted))
+    Ok(out)
 }
 
 /// Mints an alias and files the original under it, in that order.
@@ -195,7 +339,7 @@ fn mint_and_file(
     pass: &mut Pass<'_>,
     entity: EntityType,
     original: &str,
-) -> Result<String, Refusal> {
+) -> Result<Minted, Refusal> {
     let minted = pass
         .minter
         .mint(entity, original)
@@ -206,10 +350,10 @@ fn mint_and_file(
         minted.seed.to_vault_seed(),
         &minted.alias,
         original.as_bytes(),
-        pass.now_ms,
+        (pass.now)(),
     )?;
 
-    Ok(minted.alias)
+    Ok(minted)
 }
 
 /// Which closed value an alias generation failure reports under.
@@ -397,7 +541,7 @@ mod tests {
                 session: SESSION,
                 minter: &mut minter,
                 vault: &mut vault,
-                now_ms: NOW,
+                now: &|| NOW,
             };
             mask(&mut pass, body).unwrap_or_else(|refusal| panic!("{}", refusal.detail()))
         };
@@ -477,7 +621,7 @@ mod tests {
             session: SESSION,
             minter: &mut minter,
             vault: &mut vault,
-            now_ms: NOW,
+            now: &|| NOW,
         };
         let body = json!({"messages": [{"role": "user", "content": iban()}]});
 
@@ -518,7 +662,7 @@ mod tests {
             session: SESSION,
             minter: &mut minter,
             vault: &mut vault,
-            now_ms: NOW,
+            now: &|| NOW,
         };
         let body = json!({"messages": [{"role": "user", "content": iban()}]});
 

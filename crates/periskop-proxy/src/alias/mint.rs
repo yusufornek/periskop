@@ -115,6 +115,33 @@ pub struct AliasStats {
     pub alias_length_class_capped: u32,
 }
 
+impl AliasStats {
+    /// Folds one newly issued alias of `entity`, produced at `rung`.
+    ///
+    /// Two rules live here rather than at the call sites. The reported rung is
+    /// the **weakest** one this type reached, so a session where the card pool
+    /// ran out reads as `I` rather than as `R` with a footnote; and
+    /// [`EntityType::reported_rung`] then downgrades the types whose evidence is
+    /// entropy, which is threat model R14.
+    ///
+    /// Public because a second set of counters folds the same aliases: a
+    /// [`Minter`] accumulates over a conversation and `ProxyEvent` is written per
+    /// request, so `http::request_path` keeps a request scoped copy. A second
+    /// implementation of the two rules above is a second thing to get wrong, and
+    /// the one that would be wrong is the one nobody reads.
+    pub fn fold(&mut self, entity: EntityType, rung: LadderRung) {
+        let reported = entity.reported_rung(rung);
+        let slot = self.by_type.entry(entity).or_insert(TypeStat {
+            count: 0,
+            ladder_rung: reported,
+        });
+        slot.count = slot.count.saturating_add(1);
+        if evidence_rank(reported) > evidence_rank(slot.ladder_rung) {
+            slot.ladder_rung = reported;
+        }
+    }
+}
+
 /// What happened to a literal the user wrote that looks like an alias.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reservation {
@@ -331,19 +358,7 @@ impl Minter {
                 self.stats.alias_length_class_capped.saturating_add(1);
         }
 
-        // The reported rung is the weakest one this type reached, so that a
-        // session where the card pool ran out reads as `I` rather than as `R`
-        // with a footnote. `reported_rung` then downgrades the entropic types,
-        // which is threat model R14.
-        let reported = entity.reported_rung(rendered.rung);
-        let slot = self.stats.by_type.entry(entity).or_insert(TypeStat {
-            count: 0,
-            ladder_rung: reported,
-        });
-        slot.count = slot.count.saturating_add(1);
-        if evidence_rank(reported) > evidence_rank(slot.ladder_rung) {
-            slot.ladder_rung = reported;
-        }
+        self.stats.fold(entity, rendered.rung);
     }
 }
 

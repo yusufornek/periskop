@@ -463,6 +463,47 @@ impl Policy {
     pub fn masking_profile(&self) -> MaskingProfile {
         MaskingProfile::derived_from(false)
     }
+
+    /// `ProxyEvent.ruleset_hash`: **which** detection ruleset was in force.
+    ///
+    /// Derived from the ruleset's identity and never from its contents, which is
+    /// the contract rather than a shortcut. `proxy-policy.md` section 10 says it
+    /// in as many words: the word list "hiçbir zaman `/admin/*` yanıtına,
+    /// `ProxyEvent`'e veya günlüğe yazılmaz; `ruleset_hash` yalnız **hangi**
+    /// listenin yürürlükte olduğunu söyler, ne içerdiğini değil", and
+    /// `proxy-dictionary.schema.json` says `dictionary_id` is what feeds this
+    /// field. A hash over the entries would read as the same 64 characters and
+    /// be a different object: an organisation's word list is a few thousand short
+    /// strings, so a digest of it is a value somebody with the report can guess
+    /// their way back into, one name at a time.
+    ///
+    /// What goes in, therefore, is what a reader needs to tell two runs apart
+    /// without learning anything about either: the list's declared identity, the
+    /// affix languages that change how it matches, and the layers this build
+    /// actually runs. The cost is stated rather than hidden: a list edited
+    /// **without** changing its `dictionary_id` produces the same hash, so the
+    /// identity is only as trustworthy as the operator's own versioning. That is
+    /// the trade the contract already made.
+    pub fn ruleset_hash(&self) -> String {
+        let layers: Vec<&str> = self
+            .masking_profile()
+            .layers()
+            .iter()
+            .map(|layer| layer.as_str())
+            .collect();
+        // A JSON object rather than a joined string: the field names make the
+        // input readable, and `serde_json`'s map is key sorted, so two builds
+        // agree byte for byte the way `policy_hash` does.
+        let identity = serde_json::json!({
+            "dictionary_id": self.dictionary.id(),
+            "dictionary_available": self.dictionary_available,
+            "affix_languages": self.affix_languages,
+            "layers": layers,
+        });
+        blake3::hash(identity.to_string().as_bytes())
+            .to_hex()
+            .to_string()
+    }
 }
 
 /// Converts a TOML document to the canonical JSON projection the schema

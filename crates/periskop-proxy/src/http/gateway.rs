@@ -34,6 +34,7 @@ use crate::vault::{SessionId, Vault, VaultError};
 use super::admin::{Metrics, PolicyProjection};
 use super::declare::{rejected, Declared, Gap};
 use super::errors::{ProxyError, Refusal};
+use super::event::{Measurement, Parts, ProxyEvent};
 use super::headers::{HeaderList, Marks, SESSION_HEADER};
 use super::observe::RequestRecord;
 use super::passthrough::{shipped_base, AllowList, BaseUrl};
@@ -42,7 +43,9 @@ use super::route::{self, Admin, Periskop, Provider, Resolved, Route, Treatment};
 use super::session::Binding;
 use super::stream::automaton::Snapshot;
 use super::stream::restore::{Lookup, SessionLookup};
-use super::stream::{is_event_stream, is_json, restore_body, Measured, Relay, Settings};
+use super::stream::{
+    is_event_stream, is_json, restore_body, window_stats, Measured, Relay, Settings,
+};
 use super::upstream::{Answer, Call, Upstream};
 
 /// How many conversations keep a minter in memory.
@@ -164,9 +167,23 @@ pub struct Gateway {
     minters: Mutex<BTreeMap<SessionId, Slot>>,
     metrics: Mutex<Metrics>,
     log: Mutex<Vec<RequestRecord>>,
+    /// The measurement records, kept in this process and written nowhere.
+    ///
+    /// `proxy-events.md`: "Olay kayıtları hiçbir koşulda dışarı gönderilmez."
+    /// A bounded vector rather than a sink, for the same reason [`MINTERS_KEPT`]
+    /// exists: this is a long lived process, and an unbounded list of anything
+    /// per request is a leak that grows at the rate the organisation talks to its
+    /// models.
+    events: Mutex<Vec<ProxyEvent>>,
     upstream: Arc<dyn Upstream>,
     clock: Clock,
 }
+
+/// How many event records stay in memory.
+///
+/// The oldest are dropped first. Losing an old measurement costs a data point in
+/// a local benchmark; keeping every one of them costs the process.
+const EVENTS_KEPT: usize = 4096;
 
 impl Gateway {
     /// Builds a gateway around a loaded policy and an open vault.
@@ -202,6 +219,7 @@ impl Gateway {
             minters: Mutex::new(BTreeMap::new()),
             metrics: Mutex::new(Metrics::default()),
             log: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             upstream,
             clock,
         })
@@ -243,6 +261,16 @@ impl Gateway {
         lock(&self.metrics).clone()
     }
 
+    /// Every `ProxyEvent` this gateway has measured, oldest first.
+    ///
+    /// The only way out of the process, and it is a caller in this process
+    /// asking. There is no sink, no writer and no exporter: `proxy-events.md`
+    /// keeps these local, and `tests/proxy_event.rs` fails if a third source file
+    /// in `src/` learns the type's name.
+    pub fn events(&self) -> Vec<ProxyEvent> {
+        lock(&self.events).clone()
+    }
+
     /// Handles one request.
     pub async fn handle(&self, incoming: Incoming) -> Outgoing {
         let started = self.clock.now_ms();
@@ -257,8 +285,37 @@ impl Gateway {
                 metrics.record_request(record.masked_entities, record.added_latency_ms);
             }
         }
+        if let Some(event) = self.event_for(&record) {
+            let mut events = lock(&self.events);
+            while events.len() >= EVENTS_KEPT {
+                events.remove(0);
+            }
+            events.push(event);
+        }
         lock(&self.log).push(record);
         outgoing
+    }
+
+    /// The measurement record for one finished request, when there is one.
+    ///
+    /// `None` for a request that never reached a conversation, which
+    /// [`ProxyEvent::of`] decides rather than this function: the rule belongs to
+    /// the record's own contract, not to the caller that happens to build it.
+    fn event_for(&self, record: &RequestRecord) -> Option<ProxyEvent> {
+        ProxyEvent::of(&Parts {
+            session_scope: &record.alias_scope,
+            policy_version: self.policy.policy_version(),
+            policy_hash: self.policy.policy_hash(),
+            ruleset_hash: self.policy.ruleset_hash(),
+            masking_profile: record.masking_profile,
+            alias_style: self.policy.alias_style(),
+            measurement: &record.measurement,
+            stream: record.measured.stream,
+            restore: record.measured.restore,
+            record_tamper: record.measured.record_tamper,
+            degraded: &record.degraded,
+            total_ms: record.added_latency_ms,
+        })
     }
 
     async fn dispatch(&self, incoming: Incoming) -> (Outgoing, RequestRecord) {
@@ -329,6 +386,7 @@ impl Gateway {
             error: None,
             added_latency_ms: 0,
             measured: Measured::default(),
+            measurement: Measurement::default(),
         }
     }
 
@@ -529,6 +587,21 @@ impl Gateway {
         record.status = answer.status;
         let body = self.restore_answer(&answer, &snapshot, &identity, &mut record);
 
+        // The two window facts, written whether or not a stream ran. They are
+        // configuration rather than outcome: `l_max_static` is the compile time
+        // constant this alias style chose, `l_max_session` is what this
+        // conversation's frozen set makes of it, and both are as true of a
+        // buffered JSON answer that never held a byte as of a streamed one. Left
+        // at their defaults they are zeros, and `proxy-event.schema.json` rejects
+        // a zero here because a zero reads as a window of nothing.
+        let (l_max_static, l_max_session) = window_stats(
+            &snapshot,
+            self.policy.alias_style(),
+            self.policy.l_max_session(),
+        );
+        record.measured.stream.l_max_static = l_max_static;
+        record.measured.stream.l_max_session = l_max_session;
+
         let marks = Marks {
             masked_entities: record.masked_entities,
             policy_id: self.policy.policy_id().to_owned(),
@@ -659,12 +732,16 @@ impl Gateway {
         slot.last_used_ms = now_ms;
 
         let masked = {
+            let clock = self.clock;
             let mut pass = Pass {
                 policy: &self.policy,
                 session: *session,
                 minter: &mut slot.minter,
                 vault: &mut vault,
-                now_ms,
+                // The gateway's own clock, so that a pinned clock pins the phase
+                // timings in the event record too and the same request twice
+                // produces the same bytes.
+                now: &move || clock.now_ms(),
             };
             mask(&mut pass, &parsed)
         };
@@ -685,6 +762,13 @@ impl Gateway {
         record.degraded.extend(masked.degraded.iter().copied());
         record.degraded.sort_unstable();
         record.degraded.dedup();
+        record.measurement = Measurement {
+            masked: masked.by_type.clone(),
+            allowed: masked.allowed.clone(),
+            aliases: masked.alias_stats.clone(),
+            detect_ms: masked.detect_ms,
+            alias_ms: masked.alias_ms,
+        };
 
         let snapshot = {
             let Some(slot) = minters.get_mut(session) else {

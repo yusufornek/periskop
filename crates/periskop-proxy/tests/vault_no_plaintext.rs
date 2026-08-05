@@ -21,6 +21,7 @@
 //! | the request record | the line the proxy leaves behind for one request |
 //! | the **streamed** response body | the server sent events of a real answer whose aliases could not be resolved |
 //! | the **streamed** request record | the line left behind by a request whose answer *was* restored |
+//! | the `ProxyEvent` document | the measurement record of a real masked request, and of a streamed one |
 //!
 //! Rows seven and eight arrived with task 85, in the same change that opened a
 //! port. Before it there was nothing outside this process to reach; after it there
@@ -49,6 +50,14 @@
 //! crate level `deny` in `src/lib.rs`, because a leak on a code path this lifecycle
 //! does not reach would still be a leak.
 //!
+//! The last row arrived with task 94, in the change that gave this crate a
+//! `ProxyEvent` type. Until then the fifth row of the table above was an
+//! **approximation**: the record did not exist, so its vault contribution stood
+//! in for it as the counters, and this file said so. Now the document itself is
+//! rendered, from the same two runs the stream rows come from, and searched byte
+//! by byte. That is the chain the note at the bottom of this file describes: a
+//! wave that opens an output surface widens this list in the same change.
+//!
 //! # Two profiles, because one would prove something narrower
 //!
 //! `milestones.md` is explicit: the run has to happen under the shipped Argon2id
@@ -60,14 +69,20 @@
 //!
 //! # What this test cannot cover yet, said out loud
 //!
-//! Two of the five surfaces do not exist as running code in this crate. There is
-//! no logging framework, so "every `TRACE` line" is approximated by every
-//! rendering a log line could contain, and there is no `ProxyEvent` type, so its
-//! vault contribution is approximated by the counters. Approximations rot, so both
-//! are backed by a structural guard: this test reads the crate's own manifest and
-//! its own sources, and it **fails** the moment a logging dependency or a
-//! serialisation derive appears on a vault type. Whoever adds either has to widen
-//! the surface list here in the same change.
+//! One of the surfaces still does not exist as running code in this crate. There
+//! is no logging framework, so "every `TRACE` line" is approximated by every
+//! rendering a log line could contain. Approximations rot, so it is backed by a
+//! structural guard: this test reads the crate's own manifest and it **fails** the
+//! moment a logging dependency appears. Whoever adds one has to widen the surface
+//! list here in the same change.
+//!
+//! The second guard outlived the approximation it was written for. No vault type
+//! may derive `Serialize`, and the reason used to be that an event record could
+//! then carry one without anybody deciding to. The record exists now and is built
+//! field by field from a literal list, so that particular accident is no longer
+//! available — but the guard is kept, because the property it enforces is the one
+//! that made the record safe to write in the first place, and dropping it would
+//! reopen the door the moment somebody reaches for a derive.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -376,9 +391,26 @@ fn http_surfaces() -> Result<Vec<(String, Vec<u8>)>, String> {
         ("http_admin_policy".to_owned(), render(&policy_body)),
         ("http_admin_vault_status".to_owned(), render(&status_body)),
         ("http_admin_metrics".to_owned(), render(&metrics_body)),
+        ("proxy_event".to_owned(), events_of(&gateway)),
     ];
     surfaces.extend(stream_surfaces(&prompt, &render)?);
     Ok(surfaces)
+}
+
+/// Every `ProxyEvent` a gateway measured, as the documents they render to.
+///
+/// Task 94's surface. The record is a projection of counters by construction, so
+/// this search should find nothing; that is exactly why it is run, because the
+/// field that starts carrying a value will be added by somebody who believes the
+/// same thing.
+fn events_of(gateway: &periskop_proxy::http::gateway::Gateway) -> Vec<u8> {
+    gateway
+        .events()
+        .iter()
+        .map(periskop_proxy::http::ProxyEvent::to_json)
+        .collect::<Vec<String>>()
+        .join("")
+        .into_bytes()
 }
 
 /// The two surfaces the response state machine added (tasks 89 to 93).
@@ -523,6 +555,14 @@ fn stream_surfaces(
         (
             "http_stream_request_record".to_owned(),
             line(&restoring_gateway),
+        ),
+        // The event record of the run that restored everything, for the same
+        // reason its log line is here: the plaintext is in this process while
+        // the record is written, so a counter that started carrying the value it
+        // counts is found on this surface and on no other.
+        (
+            "http_stream_proxy_event".to_owned(),
+            events_of(&restoring_gateway),
         ),
     ])
 }
@@ -715,6 +755,11 @@ fn check(profile: ProfileName, surfaces: &BTreeMap<String, Vec<u8>>) {
         // or neither is the surface it claims to be.
         ("http_stream_response", b"data: "),
         ("http_stream_request_record", b"aliases_restored="),
+        // The event rows. A record that measured nothing would pass every search
+        // below without having had anything to leak, so the control is a field
+        // only a request that actually masked something can fill.
+        ("proxy_event", b"\"ladder_rung\""),
+        ("http_stream_proxy_event", b"\"aliases_restored\""),
     ] {
         let surface = surfaces
             .get(name)
@@ -1269,13 +1314,14 @@ fn record_outcome(covered: &[&str], skipped: &[&str]) {
         "{{\n  \"gate\": \"F4-73\",\n  \"criterion\": \"roadmap.md F4 exit criterion 3\",\n  \
          \"status\": \"{status}\",\n  \"profiles_covered\": [{}],\n  \"profiles_skipped\": [{}],\n  \
          \"planted_values\": {},\n  \"surfaces\": [\"vault_file\",\"temporary_files\",\
-         \"renderings\",\"admin_vault_status\",\"proxy_event_counters\",\
+         \"renderings\",\"admin_vault_status\",\"proxy_event_counters\",\"proxy_event\",\
          \"process_stdout_and_stderr\",\"http_response\",\"http_request_record\",\
-         \"http_stream_response\",\"http_stream_request_record\"],\n  \
-         \"caveat\": \"There is no logging framework and no ProxyEvent type in this crate yet. \
-         The TRACE surface is approximated by every Debug and Display rendering a log line could \
-         contain, and the event surface by the counters the vault contributes. Both are held in \
-         place by structural guards that fail when a logger or a serialisation derive appears.\"\n}}\n",
+         \"http_stream_response\",\"http_stream_request_record\",\"http_stream_proxy_event\"],\n  \
+         \"caveat\": \"There is no logging framework in this crate, so the TRACE surface is \
+         approximated by every Debug and Display rendering a log line could contain, and it is \
+         held in place by a structural guard that fails when a logging dependency appears. The \
+         ProxyEvent surface is no longer an approximation: task 94 wrote the type and the \
+         rendered documents of two real masked requests are searched here.\"\n}}\n",
         list(covered),
         list(skipped),
         PLANTED.len()

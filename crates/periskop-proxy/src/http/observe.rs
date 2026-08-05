@@ -16,6 +16,7 @@
 use crate::detect::{DegradedReason, MaskingProfile};
 
 use super::errors::ProxyError;
+use super::event::Measurement;
 use super::session::Origin;
 use super::stream::{Measured, Warning};
 
@@ -51,6 +52,15 @@ pub struct RequestRecord {
     /// `proxy-events.md` names. No alias string and no value has a field here,
     /// which is why this whole struct can be written to a log line.
     pub measured: Measured,
+    /// What the **request** side measured: per type counts and two phase
+    /// durations, for the event record.
+    ///
+    /// Not on the line, and that is the split rather than an oversight. A line is
+    /// flat, one key per field, and these are nested aggregates; folding them in
+    /// would turn `to_line` into a place somebody could add a per type map. What
+    /// reads this is [`super::event::ProxyEvent`], and the byte sweep searches
+    /// both surfaces.
+    pub measurement: Measurement,
 }
 
 impl RequestRecord {
@@ -180,6 +190,7 @@ mod tests {
             error: None,
             added_latency_ms: 7,
             measured: Measured::default(),
+            measurement: Measurement::default(),
         }
     }
 

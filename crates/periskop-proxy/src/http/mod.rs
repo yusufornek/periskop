@@ -21,6 +21,7 @@
 //! | [`errors`] | the closed error vocabulary and the fail closed matrix |
 //! | [`declare`] | the three legged declaration for what is not masked |
 //! | [`observe`] | what one request may leave behind |
+//! | [`event`] | the measurement record, and what it may never carry |
 //! | [`stream`] | the response side: frames, the hold buffer and alias restoration |
 //! | [`gateway`] | the order all of the above run in |
 //! | [`serve`] | the translation between `hyper` and the types above |
@@ -36,6 +37,7 @@
 pub mod admin;
 pub mod declare;
 pub mod errors;
+pub mod event;
 pub mod gateway;
 pub mod headers;
 pub mod json;
@@ -50,6 +52,7 @@ pub mod stream;
 pub mod upstream;
 
 pub use errors::{ProxyError, Refusal};
+pub use event::ProxyEvent;
 pub use gateway::{Clock, Gateway, Incoming, Outgoing, VaultAccess};
 pub use headers::{HeaderList, Marks};
 pub use listen::{Exposure, ListenAddress};
