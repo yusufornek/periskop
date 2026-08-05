@@ -1167,13 +1167,12 @@ mod tests {
         // elapsed time at five seconds, which passed here and failed on a CI
         // runner where other threads were holding Argon2's memory: the clock was
         // measuring the machine, not the ordering this test is about.
-        use std::sync::atomic::Ordering;
-        let before = super::key::DERIVATIONS_ENTERED.load(Ordering::SeqCst);
+        let before = super::key::DERIVATIONS_ENTERED.with(std::cell::Cell::get);
         let refusal = reopen(&path, CounterFloor::Unknown).unwrap_err();
         assert!(matches!(refusal, VaultError::KdfParameterOutOfRange { .. }));
         assert_eq!(refusal.integrity(), None);
         assert_eq!(
-            super::key::DERIVATIONS_ENTERED.load(Ordering::SeqCst),
+            super::key::DERIVATIONS_ENTERED.with(std::cell::Cell::get),
             before,
             "the header claimed 3.8 GiB and a derivation was entered anyway, which is the \
              resource exhaustion the bound exists to refuse"

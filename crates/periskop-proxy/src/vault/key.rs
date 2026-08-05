@@ -299,23 +299,29 @@ fn check(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread has entered a derivation.
+    ///
+    /// Exists so that "the parameters were refused before any key was derived"
+    /// can be asserted as a fact rather than inferred from a stopwatch. That
+    /// test first bounded the elapsed time at five seconds, which held on a
+    /// quiet laptop and failed on a loaded CI runner where other threads were
+    /// each holding Argon2's memory: the clock was measuring the machine, not
+    /// the ordering.
+    ///
+    /// Thread local rather than process wide, because the suite runs in
+    /// parallel and a shared counter moved between the two reads for reasons
+    /// that had nothing to do with the test holding it. That is the same
+    /// substitution as the stopwatch wearing different clothes.
+    pub(crate) static DERIVATIONS_ENTERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Derives the master key from the operator's passphrase.
 ///
 /// The only way into the vault in F4: ADR-016 section 4 struck the operating
 /// system keyring path, so there is no passwordless mode and no key file to read.
 /// The cost is written down in KG-020 rather than worked around here.
-/// How many times a derivation has actually been entered.
-///
-/// Exists so that "the parameters were refused before any key was derived" can
-/// be asserted as a fact rather than inferred from a stopwatch. The first
-/// version of that test bounded the elapsed time at five seconds, which held on
-/// a quiet laptop and failed on a loaded CI runner where other threads were each
-/// holding Argon2's memory. Duration was standing in for the thing actually
-/// being claimed, and duration is a property of the machine.
-#[cfg(test)]
-pub(crate) static DERIVATIONS_ENTERED: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 pub fn derive_master_key(
     profile: &KdfProfile,
     passphrase: &Passphrase,
@@ -328,7 +334,7 @@ pub fn derive_master_key(
     }
 
     #[cfg(test)]
-    DERIVATIONS_ENTERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    DERIVATIONS_ENTERED.with(|count| count.set(count.get() + 1));
 
     let params = Params::new(
         profile.memory_kib,
