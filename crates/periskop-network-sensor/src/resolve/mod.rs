@@ -100,7 +100,17 @@ mod tests {
             DnsObservation::Available,
             DnsObservation::UnavailableEncryptedDns,
         ];
-        assert_eq!(written.len(), allowed.len());
+        // A subset, and named as one. The contract carries a third value,
+        // `not_observed`, which no sensor can write: it is the statement that
+        // nothing watched a resolver at all, so it is produced by the absence of
+        // this component rather than by anything inside it. Asserting equal
+        // lengths, which is what stood here, made a value that exists precisely
+        // because the sensor did not run look like a bug in the sensor.
+        assert!(written.len() < allowed.len());
+        assert!(
+            allowed.contains(&"not_observed"),
+            "the contract lost the value that says nothing looked: {allowed:?}"
+        );
         for value in written {
             assert!(
                 allowed.contains(&value.as_str()),

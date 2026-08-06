@@ -86,8 +86,14 @@ impl ScanSources<'_> {
 pub(super) struct ReconciledStage {
     pub findings: Vec<Finding>,
     pub diagnostics: Vec<Diagnostic>,
-    pub dropped_events: u64,
+    /// Event records the collector could not read, or `None` when no runtime
+    /// source fed the run so nothing counted them.
+    pub dropped_events: Option<u64>,
     pub unlinked_events: u64,
+    /// Derived kinds this run could not produce, straight from the capability
+    /// evaluation. Also rendered into diagnostics for a human reader; this is
+    /// the copy a consumer can branch on.
+    pub suppressed_derived_kinds: Vec<Suppression>,
     /// Observed calls whose destination the hook could not read. A coverage
     /// counter, and the reason an unexplained traffic claim in the same report
     /// may be stated as suspected rather than confirmed.
@@ -115,8 +121,14 @@ pub(super) fn run(
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
 
     let (runtime, dropped_events, window) = match sources.event_dir {
-        Some(event_dir) => read_events(event_dir, &mut diagnostics),
-        None => (RuntimeSource::Absent, 0, ObservationWindow::NONE),
+        Some(event_dir) => {
+            let (source, dropped, window) = read_events(event_dir, &mut diagnostics);
+            (source, Some(dropped), window)
+        }
+        // `None` rather than `0`. No hook fed this run, so nothing counted a
+        // lost record, and a zero here would be the report stating that the
+        // event stream arrived whole when there was no event stream at all.
+        None => (RuntimeSource::Absent, None, ObservationWindow::NONE),
     };
     let (wire, platform) = match sources.flow_dir {
         Some(flow_dir) => read_flows(flow_dir, &mut diagnostics),
@@ -161,6 +173,7 @@ pub(super) fn run(
         diagnostics,
         dropped_events,
         unlinked_events: outcome.unlinked_events,
+        suppressed_derived_kinds: outcome.suppressed.clone(),
         unresolved_event_targets: outcome.unresolved_event_targets,
         observation_window_ms: outcome.observation_window_ms,
         reconciliation_mode: outcome.reconciliation_mode,

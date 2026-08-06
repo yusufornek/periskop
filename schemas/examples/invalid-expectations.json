@@ -37,11 +37,25 @@
       "rationale": "Every other field here counts something the scan could not see. This one names the detectors that decided what counted as seen at all, and it is required for the same reason the block is: a report that omits it reads as if the shipped detectors produced it. An operator can pass --rules at a narrow directory, get a clean PASS, and archive it; six months later nobody can tell that run apart from one made with the set we ship. rule_set_hash pins the content of the rules and says nothing about where they came from, so leaving the field optional would make the honest answer the one a producer has to remember rather than one the schema enforces."
     },
     {
+      "file": "coverage-statement.unknown-suppression-reason.invalid.json",
+      "schema": "coverage-statement.schema.json",
+      "violates": "the suppression reason vocabulary is closed",
+      "expected_error_contains": "/suppressed_derived_kinds/0/reason",
+      "rationale": "Before this field existed the same fact lived in diagnostics free text, where any wording at all was accepted and a consumer asking which derived kind could not be produced had to parse English. Moving it into the statement is worth nothing if the vocabulary is open: a producer writing sensor_crashed would validate, and a CI script branching on the reason would fall through to its default and report the run as fully capable. The closed enum is what makes the field answerable by machine, and it is closed on purpose at six values that all name something the run did not have. A derivation that ran and broke is an engine fault and belongs in the diagnostics block, so there is no value here for it."
+    },
+    {
       "file": "egress-event.invalid.json",
       "schema": "egress-event.schema.json",
       "violates": "payload shape may not carry content",
       "expected_error_contains": "raw_body",
       "rationale": "The hook records structure, never content. A raw_body field would turn an observation tool into a copy of the data it was deployed to protect, so the schema refuses the field outright rather than trusting every caller to leave it out."
+    },
+    {
+      "file": "egress-event.absolute-entrypoint.invalid.json",
+      "schema": "egress-event.schema.json",
+      "violates": "process.entrypoint_hint is a bare name, never a path",
+      "expected_error_contains": "/process/entrypoint_hint",
+      "rationale": "The field carried the sentence \"Never an absolute path\" and nothing rejected one, so the rule was upheld only by the courtesy of the two hooks that happen to reduce the value to a basename. A hook launched with PERISKOP_HOOK_ENTRYPOINT=/srv/app/billing-worker.py wrote one machine's deployment layout into every event it recorded and the validator passed it. That breaks byte identical output for the same run on two machines, copies a deployment directory into an archived record, and splits one service into a distinct display group per host. The pattern rejects every separator rather than only a leading one, and Windows drive prefixes too, because the producer need not have run the reader's operating system."
     },
     {
       "file": "hook-status.invalid.json",

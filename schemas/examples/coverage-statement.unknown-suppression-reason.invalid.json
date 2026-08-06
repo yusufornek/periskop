@@ -46,32 +46,8 @@
   "rule_set_source": "embedded",
   "suppressed_derived_kinds": [
     {
-      "kind": "unmatched_wire_traffic",
-      "reason": "wire_source_absent"
-    },
-    {
       "kind": "dormant_egress_point",
-      "reason": "runtime_source_absent"
-    },
-    {
-      "kind": "dormant_egress_point",
-      "reason": "observation_window_too_short"
-    },
-    {
-      "kind": "target_drift",
-      "reason": "runtime_source_absent"
-    },
-    {
-      "kind": "volume_anomaly",
-      "reason": "runtime_source_absent"
-    },
-    {
-      "kind": "volume_anomaly",
-      "reason": "wire_source_absent"
-    },
-    {
-      "kind": "volume_anomaly",
-      "reason": "volume_band_not_declared"
+      "reason": "sensor_crashed"
     }
   ]
 }

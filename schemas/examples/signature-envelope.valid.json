@@ -1,9 +1,9 @@
 {
   "algorithm": "ed25519",
-  "body_hash": "f4ff9f850a74b95f2a9839cb62bf35387773a8f086d2a9670bd96117231ab2d8",
+  "body_hash": "dd359d544b96b1e246c1d29173dae2f82a1ee28540a226113dbef30657933b00",
   "key_id": "key_654fc2c8231f0a7a",
   "report_id": "rpt_a04f27c9b1e35d8a",
   "schema_version": "1.0",
   "signed_at": "2026-08-04T09:00:03Z",
-  "value": "CFGjodQfxQfOhYgyyvnykAt-k0RcxVYYENRIkhZc6c9zUvwW_vyOxfF0jaytVJh9ARmvqDX2h1hgWabjurxLAw"
+  "value": "QTFjYqHXS79Kw3YEwkDVYfCWisB0vqdhhpbOKJnFq3l-Vq5VMWJFh91Yk04Kh0XrCzTBkqUrU_X4yb0pMV68DQ"
 }

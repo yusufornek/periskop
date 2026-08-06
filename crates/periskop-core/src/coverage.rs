@@ -198,6 +198,92 @@ pub fn unparsed_ratio_basis_points(parsed_files: u64, unparsed_counting: u64) ->
     ratio.min(u128::from(BASIS_POINTS)) as u64
 }
 
+/// The four findings no single source can produce.
+///
+/// Lives here rather than in the crate that evaluates them because two crates
+/// need the same words: reconciliation decides which kinds are out of reach, and
+/// the coverage statement carries that decision into the report. Two copies of a
+/// closed vocabulary drift the moment one side gains a value, and the drift
+/// shows up as a suppression a consumer cannot match rather than as a compile
+/// error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DerivedKind {
+    UnmatchedWireTraffic,
+    DormantEgressPoint,
+    TargetDrift,
+    VolumeAnomaly,
+}
+
+impl DerivedKind {
+    pub const ALL: [Self; 4] = [
+        Self::UnmatchedWireTraffic,
+        Self::DormantEgressPoint,
+        Self::TargetDrift,
+        Self::VolumeAnomaly,
+    ];
+
+    /// The finding kind this maps to in the contract vocabulary.
+    ///
+    /// Taken from the shared enum rather than spelled again here, so a rename in
+    /// the contract cannot leave a suppression naming a kind that no longer
+    /// exists.
+    pub fn kind(self) -> crate::finding::Kind {
+        use crate::finding::Kind;
+        match self {
+            Self::UnmatchedWireTraffic => Kind::UnmatchedWireTraffic,
+            Self::DormantEgressPoint => Kind::DormantEgressPoint,
+            Self::TargetDrift => Kind::TargetDrift,
+            Self::VolumeAnomaly => Kind::VolumeAnomaly,
+        }
+    }
+}
+
+/// Why a derived kind was not produced.
+///
+/// Every value names something the run did not have, never something that
+/// failed. A derivation that ran and broke is an engine fault and travels in the
+/// report diagnostics block; folding the two together would make a policy
+/// threshold over either of them meaningless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SuppressionReason {
+    /// No static scan fed the run, so there is no code side to compare against.
+    DeclaredSourceAbsent,
+    /// No hook was installed. Without it every egress point looks unexecuted,
+    /// which is the compensation `reconciliation/spec.md` §7 forbids.
+    RuntimeSourceAbsent,
+    /// No network sensor ran. This is the one that keeps a two source run from
+    /// making a three source claim.
+    WireSourceAbsent,
+    /// The window was too short for an absence to mean anything.
+    ObservationWindowTooShort,
+    /// No policy declared the band an observed volume is compared against.
+    ///
+    /// The one threshold the engine refuses to invent. Any constant would be
+    /// wrong for most workloads while looking authoritative in every report, so
+    /// a run without a declared band derives nothing and says why.
+    VolumeBandNotDeclared,
+    /// A sensor fed the run and not one of its records counted a byte.
+    ///
+    /// The difference this exists to keep: a rule that ran and found nothing
+    /// reads exactly like a rule that could not look, and a capture mechanism
+    /// that reports connections without volume makes every volume comparison
+    /// impossible while leaving the report looking complete.
+    VolumeNotMeasured,
+}
+
+/// One derived kind that will not appear in this report, and why.
+///
+/// A kind may appear more than once in a list of these. Collapsing the repeats
+/// would say that supplying the one named source is enough to make the kind
+/// derivable, when a second reason is still standing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Suppression {
+    pub kind: DerivedKind,
+    pub reason: SuppressionReason,
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {

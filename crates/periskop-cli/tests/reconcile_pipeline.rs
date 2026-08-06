@@ -26,7 +26,9 @@ use periskop_network_sensor::observation::Observation;
 use periskop_network_sensor::scope::FlowScope;
 use periskop_network_sensor::Flow;
 use periskop_reconcile::settings::{ReconcileSettings, VolumeBand};
-use periskop_report::coverage::{ReconciliationMode, SensorPlatformClass};
+use periskop_report::coverage::{
+    DerivedKind, ReconciliationMode, SensorPlatformClass, SuppressionReason,
+};
 use periskop_report::report::DiagnosticComponent;
 use periskop_report::to_canonical_json;
 use periskop_runtime_collector::event::{
@@ -455,7 +457,10 @@ fn a_scan_with_no_event_directory_reports_exactly_what_it_always_did() {
 
     assert_eq!(coverage.reconciliation_mode, ReconciliationMode::StaticOnly);
     assert_eq!(coverage.observation_window_ms, 0);
-    assert_eq!(coverage.dropped_events, 0);
+    // `None`, not zero: no hook fed this run, so nothing was in a position
+    // to count a lost record. A zero here would state that the event stream
+    // arrived whole when there was no event stream at all.
+    assert_eq!(coverage.dropped_events, None);
     assert_eq!(coverage.unlinked_events, 0);
     assert!(
         derived(&outcome).is_empty(),
@@ -489,7 +494,7 @@ fn an_event_directory_is_read_and_the_report_says_which_sources_fed_it() {
     // The call went where the code said it would, so nothing was left
     // unattributed and nothing drifted.
     assert_eq!(outcome.report.coverage.unlinked_events, 0);
-    assert_eq!(outcome.report.coverage.dropped_events, 0);
+    assert_eq!(outcome.report.coverage.dropped_events, Some(0));
     assert!(derived(&outcome).is_empty(), "{:?}", derived(&outcome));
 }
 
@@ -565,7 +570,7 @@ fn a_call_whose_destination_the_hook_could_not_read_produces_no_drift() {
     // The observation is not discarded either: the operation still attributes
     // it to the code point, so it is not counted as reaching nothing.
     assert_eq!(outcome.report.coverage.unlinked_events, 0);
-    assert_eq!(outcome.report.coverage.dropped_events, 0);
+    assert_eq!(outcome.report.coverage.dropped_events, Some(0));
     // And the run reports no internal disagreement over the record itself. The
     // stream is named in a diagnostic only when something in it was lost, and
     // a call whose destination the hook could not read is not a loss. The run
@@ -620,7 +625,7 @@ fn a_damaged_event_line_is_counted_and_does_not_cost_the_scan() {
 
     let outcome = fixture.scan();
 
-    assert_eq!(outcome.report.coverage.dropped_events, 1);
+    assert_eq!(outcome.report.coverage.dropped_events, Some(1));
     // The readable record still did its work.
     assert_eq!(
         derived(&outcome).len(),
@@ -887,6 +892,71 @@ fn the_flow_buckets_are_written_with_the_denominator_they_are_read_against() {
     assert_eq!(coverage.out_of_scope_flows, 1);
     assert_eq!(coverage.known_benign_flows, 1);
     assert_eq!(coverage.unattributed_flows, 0);
+}
+
+#[test]
+fn a_run_with_no_hook_says_nobody_counted_losses_rather_than_counting_zero() {
+    // The distinction the whole coverage block exists for, at the one field that
+    // could not carry it. A sensor fed this run and no hook did, so the event
+    // stream was never watched and no component was in a position to count a
+    // lost record. Writing 0 would put the strongest claim the report can make
+    // about capture, nothing was lost, on a run that never looked; an operator
+    // reading that beside flows their code never explains concludes the
+    // application did not make those calls.
+    let fixture = Fixture::new("dropped-events-unknown");
+    fixture.write_flows(
+        "sensor-1.jsonl",
+        &[connection(
+            "api.openai.com",
+            "openai",
+            FlowScope::InScope,
+            54_321,
+        )],
+    );
+
+    let coverage = fixture.scan_with_flows_only().report.coverage;
+
+    assert_eq!(coverage.dropped_events, None);
+    // And the neighbouring counter still says zero, so this is not a test that
+    // would pass on a statement where every number went missing.
+    assert_eq!(coverage.unlinked_events, 0);
+}
+
+#[test]
+fn the_kinds_this_run_could_not_derive_are_a_field_rather_than_prose() {
+    // The engine has always computed this list; until it had a field it was
+    // flattened into diagnostic English, where a consumer asking which derived
+    // kind was out of reach had to parse prose and would get it wrong the first
+    // time the wording changed. No hook fed this run, so the three kinds that
+    // rest on observed calls cannot be derived, and the statement has to say so
+    // in the vocabulary the contract closes.
+    let fixture = Fixture::new("suppressed-kinds-field");
+    fixture.write_flows(
+        "sensor-1.jsonl",
+        &[connection(
+            "api.openai.com",
+            "openai",
+            FlowScope::InScope,
+            54_321,
+        )],
+    );
+
+    let coverage = fixture.scan_with_flows_only().report.coverage;
+
+    assert!(
+        coverage.suppressed_derived_kinds.iter().any(|suppression| {
+            suppression.kind == DerivedKind::DormantEgressPoint
+                && suppression.reason == SuppressionReason::RuntimeSourceAbsent
+        }),
+        "{:?}",
+        coverage.suppressed_derived_kinds
+    );
+    // Sorted and deduplicated at build time, so two runs over the same sources
+    // serialize byte for byte.
+    let mut sorted = coverage.suppressed_derived_kinds.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted, coverage.suppressed_derived_kinds);
 }
 
 #[test]
@@ -1336,7 +1406,7 @@ fn an_empty_event_directory_is_an_observation_rather_than_an_absent_source() {
         unwatched.report.coverage.reconciliation_mode,
         ReconciliationMode::StaticOnly
     );
-    assert_eq!(watched.report.coverage.dropped_events, 0);
+    assert_eq!(watched.report.coverage.dropped_events, Some(0));
     assert_eq!(watched.report.coverage.unlinked_events, 0);
     // No window was measured, so nothing may be concluded from the silence.
     assert!(
@@ -1373,7 +1443,7 @@ fn a_derived_kind_this_run_could_not_produce_is_named_rather_than_left_silent() 
     );
     // Suppressions are not coverage. Mixing them in would make any threshold
     // over the coverage counters meaningless.
-    assert_eq!(outcome.report.coverage.dropped_events, 0);
+    assert_eq!(outcome.report.coverage.dropped_events, Some(0));
     assert_eq!(outcome.report.coverage.unlinked_events, 0);
 }
 
@@ -1672,7 +1742,7 @@ fn a_call_site_the_running_program_never_reached_is_reported_dormant() {
     );
     // Nothing was lost on the way: this is a clean run, not one whose events
     // the collector could not read.
-    assert_eq!(outcome.report.coverage.dropped_events, 0);
+    assert_eq!(outcome.report.coverage.dropped_events, Some(0));
     assert_eq!(outcome.report.coverage.unlinked_events, 0);
 }
 
@@ -1891,8 +1961,23 @@ fn the_same_tree_without_the_policy_file_derives_nothing_and_says_why() {
         );
 
     let report = scan_json(&fixture, &[]);
+    let parsed: serde_json::Value = serde_json::from_str(&report).expect("report is json");
 
-    assert!(!report.contains("\"volume_anomaly\""), "{report}");
+    // Asked of the finding lists rather than of the whole document. The kind
+    // name legitimately appears elsewhere now: `coverage.suppressed_derived_kinds`
+    // names it as a kind this run could not derive, which is the statement this
+    // test wants made. A substring search over the report could not tell the two
+    // apart, so it would have started failing for the reason it was written to
+    // check.
+    for list in ["findings", "suspect_findings"] {
+        let kinds: Vec<&str> = parsed[list]
+            .as_array()
+            .expect("finding list is an array")
+            .iter()
+            .filter_map(|finding| finding["kind"].as_str())
+            .collect();
+        assert!(!kinds.contains(&"volume_anomaly"), "{list}: {kinds:?}");
+    }
     assert!(report.contains("volume_band_not_declared"), "{report}");
 }
 

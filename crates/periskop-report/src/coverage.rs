@@ -12,7 +12,8 @@ use periskop_core::coverage::UnparsedReason;
 /// Re-exported from the core vocabulary. The scanner produces these and the
 /// report only carries them, so the types live where the producer can reach them.
 pub use periskop_core::coverage::{
-    CoverageLanguage, RuleSetSource, UnresolvedReason, UnresolvedTarget,
+    CoverageLanguage, DerivedKind, RuleSetSource, Suppression, SuppressionReason, UnresolvedReason,
+    UnresolvedTarget,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -58,8 +59,19 @@ pub enum SensorPlatformClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DnsObservation {
+    /// A resolver was watched and its answers were readable.
     Available,
+    /// A resolver was watched and its answers were encrypted. A measured blind
+    /// spot, which is a different fact from not having looked.
     UnavailableEncryptedDns,
+    /// Nothing watched DNS in this run.
+    ///
+    /// The other two both assert an observation. Without this value a static
+    /// only run wrote `available`, claiming name resolution was readable when
+    /// no component looked at it, and a reader downgrading an unnamed
+    /// destination could not tell a resolver that stayed silent from one that
+    /// was never listened to.
+    NotObserved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,7 +107,19 @@ pub struct CoverageStatement {
     pub runtime_coverage: Vec<RuntimeCoverage>,
     pub unrecognized_clients: u64,
     pub unhooked_processes: u64,
-    pub dropped_events: u64,
+    /// Observation records lost before anything could read them, or `None` when
+    /// no source in this run was in a position to count them.
+    ///
+    /// The `None` is the whole reason this is not a `u64`. A run with no runtime
+    /// source used to write `0`, and a kernel ring buffer that declines to report
+    /// its loss counter writes nothing at all, and both landed in the report as
+    /// the strongest claim it can make about capture: nothing was lost. On a
+    /// loaded machine that is exactly backwards. The operator reads a complete
+    /// capture, sees flows that never arrived, and concludes the application
+    /// never made those calls, which is the false negative this product exists to
+    /// prevent. Zero now says one thing only: something counted, and the count
+    /// was zero.
+    pub dropped_events: Option<u64>,
     pub unlinked_events: u64,
     /// Observed calls whose destination the hook could not read.
     ///
@@ -135,6 +159,18 @@ pub struct CoverageStatement {
     /// The run announces this on stderr as well, but stderr is not archived and
     /// the report is.
     pub rule_set_source: RuleSetSource,
+    /// Derived finding kinds this run was not in a position to produce, each
+    /// with the reason it was not.
+    ///
+    /// The engine already computed this per run; until it had a field it was
+    /// flattened into diagnostics free text, where a consumer asking which
+    /// derived kind could not be produced had to parse English and would get it
+    /// wrong the first time the wording changed. An empty list is a real
+    /// statement rather than a placeholder: it says every derived kind was
+    /// reachable, so an empty finding list in the same report means the rules
+    /// ran and found nothing, which is the distinction the whole block exists to
+    /// keep.
+    pub suppressed_derived_kinds: Vec<Suppression>,
 }
 
 impl CoverageStatement {
@@ -163,7 +199,10 @@ impl CoverageStatement {
             runtime_coverage: Vec::new(),
             unrecognized_clients: 0,
             unhooked_processes: 0,
-            dropped_events: 0,
+            // Not zero. No runtime source fed this run, so nothing was in a
+            // position to count a loss, and writing zero here would be the
+            // report claiming a complete capture it never attempted.
+            dropped_events: None,
             unlinked_events: 0,
             unresolved_event_targets: 0,
             unattributed_flows: 0,
@@ -172,10 +211,19 @@ impl CoverageStatement {
             out_of_scope_flows: 0,
             known_benign_flows: 0,
             sensor_platform_class: SensorPlatformClass::None,
-            dns_observation: DnsObservation::Available,
+            // Nothing watched a resolver in a static only run. `Available` here
+            // would claim name resolution was readable when no component looked.
+            dns_observation: DnsObservation::NotObserved,
             observation_window_ms: 0,
             reconciliation_mode: ReconciliationMode::StaticOnly,
             rule_set_source,
+            // Left empty for the caller to fill from the capability evaluation.
+            // An empty list claims every derived kind was reachable, which is
+            // false for a static only run, so a caller that forgets it produces
+            // a statement the schema accepts and a reader should not believe.
+            // The reconciled path always sets it; the static path has no derived
+            // kinds to speak of because it runs no derivation at all.
+            suppressed_derived_kinds: Vec::new(),
         }
     }
 
@@ -193,6 +241,11 @@ impl CoverageStatement {
         self.undetected_libraries.dedup();
         self.runtime_coverage.sort();
         self.runtime_coverage.dedup();
+        // Sorted by the order the two enums declare their values, which is what
+        // the derived `Ord` gives and what the schema fixes. Alphabetical order
+        // would depend on spelling rather than on the contract.
+        self.suppressed_derived_kinds.sort();
+        self.suppressed_derived_kinds.dedup();
     }
 
     /// Share of the code surface that could not be read, in basis points.

@@ -1,0 +1,22 @@
+{
+  "schema_version": "1.0",
+  "egress_event_id": "ee_3dfe316616cd47b4",
+  "process": {
+    "language": "python",
+    "runtime": "cpython/3.12",
+    "entrypoint_hint": "/srv/app/billing-worker.py"
+  },
+  "library": { "module": "openai", "mechanism": "sdk_wrapper" },
+  "operation": "chat.completions.create",
+  "target": {
+    "host_id": "api.openai.com",
+    "port": 443,
+    "path_template": "/v1/chat/completions",
+    "provider_ref": "openai"
+  },
+  "payload_shape": {
+    "field_paths": ["messages[].content", "messages[].role", "model"],
+    "byte_size_estimate": 2048,
+    "truncated_depth": 0
+  }
+}

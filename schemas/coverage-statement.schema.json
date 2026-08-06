@@ -3,7 +3,7 @@
   "$id": "https://periskop.dev/schemas/coverage-statement.schema.json",
   "title": "CoverageStatement",
   "type": "object",
-  "description": "Normative field list for the coverage statement. All 20 fields are required even when empty, because the gap between an absent field and a zero is the easiest way to break the honest coverage principle without anyone noticing. Engine, rule and schema errors do not belong here; they go to the report diagnostics block.",
+  "description": "Normative field list for the coverage statement. All 21 fields are required even when empty, because the gap between an absent field and a zero is the easiest way to break the honest coverage principle without anyone noticing. One field is nullable for the neighbouring reason: dropped_events distinguishes a measured zero from a count nobody could take, and collapsing the two would let a run that never counted claim nothing was lost. Engine, rule and schema errors do not belong here; they go to the report diagnostics block.",
   "required": [
     "parsed_files",
     "unparsed_files",
@@ -24,7 +24,8 @@
     "dns_observation",
     "observation_window_ms",
     "reconciliation_mode",
-    "rule_set_source"
+    "rule_set_source",
+    "suppressed_derived_kinds"
   ],
   "additionalProperties": false,
   "properties": {
@@ -121,7 +122,11 @@
     },
     "unrecognized_clients": { "type": "integer", "minimum": 0 },
     "unhooked_processes": { "type": "integer", "minimum": 0 },
-    "dropped_events": { "type": "integer", "minimum": 0 },
+    "dropped_events": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Observation records that were lost before anything could read them, or null when no source in this run was in a position to count them. The null is the entire point of the field and the one value an integer alone could not carry. Until this admitted null, a run with no runtime source wrote 0, and a kernel ring buffer that declines to report its loss counter wrote 0, and both read as the strongest claim the report can make about capture: nothing was lost. On a machine under load that is exactly backwards. The operator reads a complete capture, sees flows that never arrived, and concludes the application did not make those calls, which is the false negative this product exists to prevent. Zero now means one thing only: something counted, and the count was zero. null means nobody counted, and no completeness claim may be built on the capture in that run. A consumer that treats null as zero has reintroduced the bug; a consumer that cannot represent null must refuse the report rather than coerce it."
+    },
     "unlinked_events": { "type": "integer", "minimum": 0 },
     "unresolved_event_targets": {
       "type": "integer",
@@ -147,7 +152,10 @@
       "enum": ["linux_ebpf", "macos_pcap", "windows_pcap_etw", "none"],
       "description": "none means there was no network observation at all."
     },
-    "dns_observation": { "enum": ["available", "unavailable_encrypted_dns"] },
+    "dns_observation": {
+      "enum": ["available", "unavailable_encrypted_dns", "not_observed"],
+      "description": "What this run could learn about destination names. available means a resolver was watched and its answers were readable. unavailable_encrypted_dns means it was watched and the answers were encrypted, which is a measured blind spot. not_observed means no sensor watched DNS at all, and it exists because the other two both assert an observation that never happened: a static only run used to write available, which claims name resolution was readable when nothing looked at it, and a reader downgrading an unnamed destination could not tell a resolver that stayed silent from one that was never listened to."
+    },
 
     "observation_window_ms": {
       "type": "integer",
@@ -156,11 +164,43 @@
     },
     "reconciliation_mode": {
       "enum": ["full", "static_only", "static_plus_runtime", "static_plus_wire"],
-      "description": "Which sources fed reconciliation. The value partial does not exist."
+      "description": "Which sources fed reconciliation. The value partial does not exist. The mode names the observation sources only, and says nothing about how much any of them saw: full means a static side, a runtime hook and a network sensor all fed the run, not that the run was complete. A hook that watched for one second and a hook that watched for an hour produce the same mode, and so do a sensor that captured every packet and one that lost most of them. How much was seen is what the counters beside this field are for, and reading full as a completeness claim is the single most likely misreading of this block. suppressed_derived_kinds is the field that says what the run could not conclude."
     },
     "rule_set_source": {
       "enum": ["embedded", "directory"],
       "description": "Where the detectors that decided this run came from: the set shipped inside the binary, or a directory the caller named with --rules. Required because the answer changes what a clean report means. rule_set_hash fixes the content of the rule set and says nothing about its origin, and to an auditor reading an archived report, scanned with the detectors we ship is not the same claim as scanned with a local directory that may never have been under version control. A narrow rule set produces a cleaner report, and making that kind of false cleanliness visible is what this whole product is for. No path is written here, ever: an absolute path differs between runs and between machines, which would break byte identical reproducibility. Same rule that makes location fields display only and keeps paths out of finding_id."
+    },
+
+    "suppressed_derived_kinds": {
+      "type": "array",
+      "description": "Derived finding kinds this run was not in a position to produce, each with the reason it was not. Deduplicated, and sorted by kind and then by reason in the order the two enums below list their values rather than alphabetically, so the order is a property of this contract and not of any producer's locale. One kind may appear more than once: a kind can be out of reach for several independent reasons at the same time, and collapsing them to the first would hide the fact that supplying one missing source would still not be enough. An empty array is a real statement and not a placeholder: it says every derived kind was reachable, so an empty finding list in the same report means the rules ran and found nothing. This is the field that separates that from a run where the rules could not run at all, and it is required for the same reason the whole block is. The facts were already produced and had nowhere to go: the engine computes this list per run, and it used to be flattened into diagnostics free text, where a consumer asking which derived kind could not be produced this run had to parse English prose and would silently get it wrong the first time the wording changed. The two vocabularies are closed and shared with the finding contract, so a kind renamed there cannot leave a suppression naming something that no longer exists.",
+      "items": {
+        "type": "object",
+        "required": ["kind", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "enum": [
+              "unmatched_wire_traffic",
+              "dormant_egress_point",
+              "target_drift",
+              "volume_anomaly"
+            ],
+            "description": "The derived finding kind that will not appear in this report. A subset of the finding kind vocabulary: only kinds reconciliation derives can be suppressed by a missing source."
+          },
+          "reason": {
+            "enum": [
+              "declared_source_absent",
+              "runtime_source_absent",
+              "wire_source_absent",
+              "observation_window_too_short",
+              "volume_band_not_declared",
+              "volume_not_measured"
+            ],
+            "description": "Why the kind could not be derived. Every value names something the run did not have rather than something that failed: a source that never fed the run, a window too short for an absence to mean anything, a threshold no policy declared, or a capture that reported connections without counting a byte. A derivation that ran and broke is an engine fault and belongs in the report diagnostics block, not here."
+          }
+        }
+      }
     }
   }
 }

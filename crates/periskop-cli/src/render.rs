@@ -196,6 +196,9 @@ fn network_line(report: &ScanReport) -> String {
     let dns = match coverage.dns_observation {
         DnsObservation::Available => "dns readable",
         DnsObservation::UnavailableEncryptedDns => "dns encrypted, names not readable",
+        // Said in as many words rather than left out. A line that goes quiet
+        // where the other two speak reads as the good case to anyone skimming.
+        DnsObservation::NotObserved => "dns not observed",
     };
     format!(
         "  network    {sensor}, {dns}, {} ms observed\n",

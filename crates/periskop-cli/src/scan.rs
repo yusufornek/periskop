@@ -290,6 +290,11 @@ fn scan(request: ScanRequest<'_>, sources: ScanSources<'_>, policy: ScanPolicy) 
         coverage.unresolved_event_targets = stage.unresolved_event_targets;
         coverage.observation_window_ms = stage.observation_window_ms;
         coverage.reconciliation_mode = stage.reconciliation_mode;
+        // The list the engine already produced, carried into the field that
+        // holds it instead of being flattened into diagnostic prose. The
+        // diagnostics keep their lines as well: one surface is for a person
+        // reading the run, the other is what a consumer can branch on.
+        coverage.suppressed_derived_kinds = stage.suppressed_derived_kinds;
         // Written only when a sensor fed the run. Five zeros left by a static
         // scan would say the sensor watched and the machine stayed quiet, and
         // three of the buckets are the ones that produce no finding: a bucket

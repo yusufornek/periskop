@@ -12,82 +12,20 @@
 //! `reconciliation/spec.md` §7 is explicit that a missing source is never
 //! compensated for quietly.
 
-use serde::Serialize;
-
-use periskop_core::finding::Kind;
-
 use crate::settings::ReconcileSettings;
 use crate::sources::Sources;
 use crate::window::ObservationWindow;
 
-/// The four findings no single source can produce.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DerivedKind {
-    UnmatchedWireTraffic,
-    DormantEgressPoint,
-    TargetDrift,
-    VolumeAnomaly,
-}
-
-impl DerivedKind {
-    pub const ALL: [Self; 4] = [
-        Self::UnmatchedWireTraffic,
-        Self::DormantEgressPoint,
-        Self::TargetDrift,
-        Self::VolumeAnomaly,
-    ];
-
-    /// The finding kind this maps to in the contract vocabulary.
-    ///
-    /// Taken from the shared enum rather than spelled again here, so a rename in
-    /// the contract cannot leave this crate reporting a suppression for a kind
-    /// name that no longer exists.
-    pub fn kind(self) -> Kind {
-        match self {
-            Self::UnmatchedWireTraffic => Kind::UnmatchedWireTraffic,
-            Self::DormantEgressPoint => Kind::DormantEgressPoint,
-            Self::TargetDrift => Kind::TargetDrift,
-            Self::VolumeAnomaly => Kind::VolumeAnomaly,
-        }
-    }
-}
-
-/// Why a derived kind was not produced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SuppressionReason {
-    /// No static scan fed the run, so there is no code side to compare against.
-    DeclaredSourceAbsent,
-    /// No hook was installed. Without it every egress point looks unexecuted,
-    /// which is the compensation §7 forbids.
-    RuntimeSourceAbsent,
-    /// No network sensor ran. This is the one that keeps a two source run from
-    /// making a three source claim.
-    WireSourceAbsent,
-    /// The window was too short for an absence to mean anything.
-    ObservationWindowTooShort,
-    /// No policy declared the band an observed volume is compared against.
-    ///
-    /// The one threshold this crate refuses to invent. Any constant would be
-    /// wrong for most workloads while looking authoritative in every report, so
-    /// a run without a declared band derives nothing and says why.
-    VolumeBandNotDeclared,
-    /// A sensor fed the run and not one of its records counted a byte.
-    ///
-    /// The difference this exists to keep: a rule that ran and found nothing
-    /// reads exactly like a rule that could not look, and a capture mechanism
-    /// that reports connections without volume makes every volume comparison
-    /// impossible while leaving the report looking complete.
-    VolumeNotMeasured,
-}
-
-/// One derived kind that will not appear in this report, and why.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub struct Suppression {
-    pub kind: DerivedKind,
-    pub reason: SuppressionReason,
-}
+/// The suppression vocabulary, owned by the crate the coverage statement also
+/// reads from.
+///
+/// Re-exported rather than defined here because two crates have to agree on it
+/// word for word: this one decides which kinds are out of reach, and
+/// `coverage.suppressed_derived_kinds` carries that decision into the report. A
+/// second copy would drift the first time either side gained a value, and the
+/// drift would surface as a suppression no consumer can match rather than as a
+/// compile error.
+pub use periskop_core::coverage::{DerivedKind, Suppression, SuppressionReason};
 
 /// Everything this run may and may not derive.
 ///

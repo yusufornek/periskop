@@ -225,9 +225,23 @@ pub struct ScanReport {
 /// loses no field; what it cannot do is tell an archived report produced by the
 /// set we ship apart from one produced by a local directory.
 ///
+/// `1.3` widened `unparsed_files[].reason` from eight values to ten, splitting
+/// out text that was never a code surface and bytes that could not be decoded.
+/// The contract recorded that step and this constant did not move with it, which
+/// is the drift a version number exists to prevent: two builds writing different
+/// documents under one number cannot be told apart by a reader. Corrected here.
+///
+/// `1.4` added `suppressed_derived_kinds`, the derived kinds a run was not in a
+/// position to produce, and widened `dropped_events` to accept null for the run
+/// where nobody was in a position to count a loss. The second is the one to read
+/// carefully. It is a MINOR change to the document, since every 1.3 document is
+/// still valid, but it is breaking for a consumer that typed the field as an
+/// unsigned integer, and that consumer should fail rather than coerce: reading
+/// null as zero restores the exact defect the null was added to remove.
+///
 /// Every step here is a MINOR addition, so a reader of an older document keeps
 /// everything it had.
-pub const SCHEMA_VERSION: &str = "1.2";
+pub const SCHEMA_VERSION: &str = "1.4";
 
 /// Collects findings and produces a report.
 ///

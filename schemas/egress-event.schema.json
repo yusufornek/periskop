@@ -35,7 +35,8 @@
         },
         "entrypoint_hint": {
           "type": "string",
-          "description": "Best effort name of what is running. Never an absolute path."
+          "pattern": "^(?![A-Za-z]:)[^/\\\\]+$",
+          "description": "Best effort name of what is running, and a bare name rather than a path: the pattern rejects every path separator, not only a leading one. The sentence \"never an absolute path\" stood here alone for four revisions while nothing enforced it, so a hook launched with PERISKOP_HOOK_ENTRYPOINT=/srv/app/worker.py wrote one machine's deployment layout into every event it recorded, and the validator passed the record. Both hooks already reduce the value to a basename, which means the rule cost them nothing and was upheld only by their courtesy; a third producer had no reason to guess it. Three consequences, each sufficient on its own. An absolute path makes the same run on two machines stop producing byte identical output, which is what the report format rests on. It copies a home or deployment directory into a record that gets archived and shared. And the hint is a display name a reader groups events by, so a rooted one is a distinct group per host for what is one service. Windows drive prefixes are rejected as well, since the process that wrote the record need not have run the operating system of the one reading it."
         }
       }
     },
@@ -98,7 +99,7 @@
         "byte_size_estimate": {
           "type": "integer",
           "minimum": 0,
-          "description": "Approximate size. An estimate rather than a measurement, since materialising a streaming body to measure it would change the behaviour of the program under observation."
+          "description": "Approximate size of the request body, in bytes. An estimate rather than a measurement, since materialising a streaming body to weigh it would change the behaviour of the program under observation. The derivation is normative and no producer may choose its own, because the value is not carried by the identity: two hooks that weighed one call differently would write two records under one egress_event_id, and the collector keeps whichever sorted first, so the number a report shows would depend on which language happened to be observed. Exactly one of three bases is used, in this precedence, and the first that applies wins. (1) A byte count the caller or the transport already stated for this body: a content-length, a declared length, or the length of the buffer the body arrived as. It is preferred over everything else because it is the only basis that reports the bytes that actually left. (2) The summed length of the pieces seen on the way out, when the body left in parts and was counted without being reassembled. (3) A structural estimate over the walked payload, used only when the body has not been serialised yet and no length exists to read: each scalar counts 8 bytes, each null counts 4, each string counts its length in bytes, and sampled sequences are counted over the sampled elements only, with the same ceilings the field path walk uses. A basis 3 number is a lower bound on a body that has not been encoded; it is not comparable with a basis 1 number for the same call, and a consumer comparing sizes across producers must treat a difference as a difference of basis before treating it as a difference of traffic. Zero means the body carried nothing, never that nothing could be weighed: a body that could not be measured at all is declared through the degraded reason vocabulary instead."
         },
         "truncated_depth": {
           "type": "integer",
