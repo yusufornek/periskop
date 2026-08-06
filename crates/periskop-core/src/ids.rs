@@ -80,6 +80,10 @@ macro_rules! define_id {
 define_id!(EgressPointId, "ep_", "egress point");
 define_id!(EgressEventId, "ee_", "egress event");
 define_id!(FlowId, "fl_", "flow");
+// One request and its response as the proxy saw them. Added with the proxy's
+// own finding rather than ahead of it: an identity nothing produces is an
+// identity nothing has to keep working.
+define_id!(ProxyExchangeId, "px_", "proxy exchange");
 define_id!(FindingId, "fnd_", "finding");
 define_id!(ScanRunId, "scan_", "scan run");
 define_id!(ReportId, "rpt_", "report");

@@ -18,7 +18,12 @@ from . import activation, config as config_module, failopen
 
 STATUS_VARIABLE = "PERISKOP_HOOK_STATUS"
 
+# Startup opened the stream and then did not finish. The same token the Node
+# hook uses, because one collector reads both and copies it into one report.
+INSTALL_FAILED = "install_failed"
+
 _installed = False
+_stream_opened = False
 _status = {"hook_status": "disabled", "reason": "not_started", "instrumented": []}
 
 
@@ -31,7 +36,31 @@ def install():
     # caller that runs both the .pth file and sitecustomize.
     _installed = True
     failopen.run("bootstrap.install", _install)
+    _disown_a_stream_nobody_is_filling()
     return status()
+
+
+def _disown_a_stream_nobody_is_filling():
+    """A stream opened by a startup that then failed must not claim to be active.
+
+    `_install` runs behind the fail-open guard, so anything raising after
+    `recorder.activate` leaves an open stream, a sidecar already saying
+    "active", and no instrumentation at all. The collector reads the sidecar and
+    not the dictionary this module keeps, so the run would report a process that
+    was watched and made no calls: the shape of a clean result, produced by a
+    hook that never reached the call path.
+
+    The flag is checked before the import so that the cheap startup stays cheap.
+    A process that switched the hook off, or never named a destination, must not
+    pay for loading the recorder to be told what it already knows.
+    """
+    if not _stream_opened or _status["hook_status"] == "active":
+        return
+    from . import recorder
+
+    writer = recorder.current_writer()
+    if writer is not None:
+        writer.mark_disabled(INSTALL_FAILED)
 
 
 def status():
@@ -64,7 +93,12 @@ def _install():
 
     from . import importer, recorder, wrappers
 
+    global _stream_opened
+
     recorder.activate(settings)
+    # Set the moment the sidecar exists on disk, because from here on a failure
+    # leaves a file making a claim about this process.
+    _stream_opened = True
     importer.install(wrappers.TARGET_MODULES, _instrument)
     _publish("active", activation.ACTIVE)
 

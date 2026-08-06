@@ -26,12 +26,21 @@
 # Restoring `confirmed` needs the receiver proven to be an HTTP client, which is
 # a binding rather than a stronger regex. The libraries in `covers_modules` are
 # the set that binding would have to accept.
+#
+# Why `rule_version` jumped a major without the pattern changing. The rule was
+# called `http-provider-endpoint` in every language while the file it lives in
+# was called `http-literal-endpoint`, so a contributor reading the gap catalogue
+# or the benchmark searched for one name and found the other. `rule_id` is the
+# join key those two use and it also feeds `finding_id`, so correcting it
+# renames every finding this rule has ever produced: a reader diffing a report
+# across the change sees the old ones removed and the new ones added, and the
+# major is what says that in advance.
 
 schema_version = "1.0"
 language = "python"
 provider = "unknown"
-rule_id = "python.static.http-provider-endpoint"
-rule_version = "1.0.0"
+rule_id = "python.static.http-literal-endpoint"
+rule_version = "2.0.0"
 
 # Libraries this rule accounts for. It keys on the destination rather than on a
 # client object, so without this the HTTP clients it covers would be reported as
@@ -57,7 +66,7 @@ capture = "verb"
 one_of = ["post", "get", "put", "request"]
 
 [extract]
-target_url = { from = "url" }
+target_url = { from = "url", role = "destination_url" }
 
 [classify]
 egress_kind = "llm_chat"

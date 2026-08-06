@@ -24,8 +24,8 @@ the same depth ceiling counted from the same starting depth, the same sample
 size, the same path emitted where a walk stops, and the same reading of
 `truncated_depth`. Two hooks that walk differently give one call two shapes, and
 because the call has one identity the collector keeps whichever record sorted
-first. `tests/hook-parity-vectors.json` pins the two implementations against
-each other.
+first. `hooks/shared/hook-parity-vectors.json` pins the two implementations
+against each other, and both suites read that one file.
 
 `truncated_depth` is the *deepest* point at which the walk gave up, not the
 shallowest. The schema explains the field as present "so a shallow record is not
@@ -117,7 +117,15 @@ def _walk_sequence(value, path, depth, walk):
     if total > sampled:
         # Paths repeat across homogeneous elements, so sampling loses little
         # shape. Size does not repeat, so it is scaled and the record says so.
-        walk.size = before + int((walk.size - before) * total / sampled)
+        #
+        # Integer arithmetic throughout. The float form was `int(a * total /
+        # sampled)`, and a float is not the same number on every build: the
+        # division rounds to the nearest representable double before the
+        # truncation runs, so a large enough sampled size could land on either
+        # side of an integer depending on the platform's rounding. Reports are
+        # required to diff byte for byte across runs and machines, and this is
+        # the only floating point step on the whole record path.
+        walk.size = before + (walk.size - before) * total // sampled
         walk.truncate(depth + 1)
 
 
@@ -147,9 +155,27 @@ def _walk(value, path, depth, walk):
 
 
 def describe(payload):
-    """Shape of a keyword argument mapping."""
+    """Shape of a request body: usually a keyword argument mapping.
+
+    A payload that is neither a mapping nor a sequence is not walked, and the
+    stop is declared. Substituting an empty mapping, which is what this used to
+    do, wrote `field_paths: []` with `byte_size_estimate: 0` and no degraded
+    reason: exactly the record the schema reserves for a call that carried
+    nothing. An SDK that takes its body positionally, or hands over an object of
+    its own instead of a dictionary, would then be reported as a call with no
+    payload rather than as one whose payload could not be read, and the schema
+    says in as many words that a thin event must be readable as thin rather than
+    as evidence of a small call.
+    """
     walk = _Walk()
-    _walk_mapping(payload if isinstance(payload, dict) else {}, "", 0, walk)
+    if isinstance(payload, dict):
+        _walk_mapping(payload, "", 0, walk)
+    elif isinstance(payload, (list, tuple)):
+        _walk_sequence(payload, "", 0, walk)
+    else:
+        # Depth zero: the walk stopped at the root, which is the same statement
+        # `opaque` makes about an already serialised body.
+        walk.truncate(0)
     return Shape(
         field_paths=sorted(walk.paths),
         byte_size_estimate=max(0, walk.size),

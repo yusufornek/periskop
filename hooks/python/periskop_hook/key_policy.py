@@ -23,11 +23,16 @@ stream under one identity: the same call recorded by both derives the same
 `egress_event_id`, so the collector keeps one of the two records and discards
 the other. If the vocabularies differ, which shape survives into the report
 depends on nothing more meaningful than which record sorted first. The two lists
-are pinned against each other by `tests/hook-parity-vectors.json`, which both
-test suites read.
+are pinned against each other by `hooks/shared/hook-parity-vectors.json`, which
+both test suites read.
 
-There is no schema file for this vocabulary yet, so the two copies are the
-contract. A request to give it one is filed in `hub/memory/interfaces.md`.
+There is still no schema file for this vocabulary, but the copies are no longer
+answerable to nothing: `hooks/shared/hook-parity-vectors.json` carries the
+admitted list and both suites check theirs against it entry for entry, so
+widening the vocabulary in one hook and not the other fails both. The copies
+themselves stay, and have to: a hook runs inside somebody else's process, where
+no rules directory is on disk and a file read per request is work the budget does
+not have. A request for the schema file is filed in `hub/memory/interfaces.md`.
 """
 
 import re

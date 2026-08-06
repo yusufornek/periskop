@@ -117,6 +117,52 @@ class TraversalLimitTest(unittest.TestCase):
         self.assertEqual(["model"], described.field_paths)
         self.assertIn(shape.TRUNCATED, described.degraded_reasons)
 
+    def test_the_sampled_estimate_uses_no_floating_point(self):
+        # Reports have to diff byte for byte across runs and machines, and this
+        # scaling was the only floating point step on the record path: the
+        # division rounded to the nearest double before the truncation ran, so a
+        # large enough sample could land either side of an integer depending on
+        # the platform. The expectation below is computed the way the code is
+        # required to compute it, in integers.
+        item = "x" * 10
+        payload = {"messages": [item for _ in range(1000)]}
+        described = shape.describe(payload)
+        sampled_bytes = len(item) * shape.MAX_ITEMS
+        self.assertEqual(sampled_bytes * 1000 // shape.MAX_ITEMS,
+                         described.byte_size_estimate)
+        self.assertIsInstance(described.byte_size_estimate, int)
+
+
+class UnwalkableBodyTest(unittest.TestCase):
+    """A body that could not be read is a gap, never an empty call."""
+
+    def test_a_body_that_is_not_a_container_declares_the_stop(self):
+        # Substituting an empty mapping wrote field_paths [] with a size of 0
+        # and no degraded reason, which is the record the schema reserves for a
+        # call that carried nothing. A reader cannot tell the two apart, and the
+        # schema is explicit that a thin event must read as thin rather than as
+        # evidence of a small call.
+        described = shape.describe("a body the hook cannot walk")
+        self.assertEqual([], described.field_paths)
+        self.assertEqual(0, described.byte_size_estimate)
+        self.assertEqual(0, described.truncated_depth)
+        self.assertIn(shape.TRUNCATED, described.degraded_reasons)
+
+    def test_an_empty_mapping_still_reads_as_an_empty_call(self):
+        # The other half of the same statement: a call that really carried
+        # nothing must not be dressed up as a gap.
+        described = shape.describe({})
+        self.assertEqual([], described.field_paths)
+        self.assertIsNone(described.truncated_depth)
+        self.assertEqual([], described.degraded_reasons)
+
+    def test_a_sequence_body_is_walked_the_way_the_other_hook_walks_it(self):
+        # The Node hook walks a root level array; declaring this one unwalkable
+        # would give one call two shapes under one identity.
+        described = shape.describe([{"model": "m"}, {"model": "n"}])
+        self.assertEqual(["[].model"], described.field_paths)
+        self.assertIsNone(described.truncated_depth)
+
 
 if __name__ == "__main__":
     unittest.main()

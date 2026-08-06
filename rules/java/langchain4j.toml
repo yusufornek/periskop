@@ -47,7 +47,7 @@ one_of = ["chat", "generate"]
 
 [extract]
 model = { from = "recv", constructor_keyword = "modelName" }
-base_url = { from = "recv", constructor_keyword = "baseUrl" }
+base_url = { from = "recv", constructor_keyword = "baseUrl", role = "destination_url" }
 
 [classify]
 egress_kind = "llm_chat"

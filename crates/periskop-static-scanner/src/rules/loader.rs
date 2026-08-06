@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::language::Language;
-use crate::rules::model::RuleFile;
+use crate::rules::model::{ExtractRole, MatchSpec, RuleFile};
 
 /// Why a rule file was rejected.
 #[derive(Debug, thiserror::Error)]
@@ -153,7 +153,10 @@ fn validate(path: &Path, rule: &RuleFile) -> Result<(), RuleLoadError> {
         if spec.query.trim().is_empty() {
             return Err(invalid(format!("[[match]] {index}: query is empty")));
         }
+        validate_method_agreement(index, spec).map_err(&invalid)?;
     }
+
+    validate_extract_roles(rule).map_err(&invalid)?;
 
     for downgrade in &rule.classify.downgrade {
         if !downgrade.when.ends_with(".unresolved") {
@@ -171,6 +174,134 @@ fn validate(path: &Path, rule: &RuleFile) -> Result<(), RuleLoadError> {
     }
 
     Ok(())
+}
+
+/// Field names the engine used to read as a destination before roles existed.
+///
+/// Kept only to refuse them. A rule still spelling one of these without saying
+/// what it is for reads as a working rule and is not one: the engine matches on
+/// the role now, so the field would be carried into the report and never
+/// compared against anything.
+const FORMER_DESTINATION_FIELDS: [&str; 2] = ["base_url", "target_url"];
+
+/// Checks that a rule says which of its fields is the destination, and says it once.
+///
+/// `[extract]` used to give a key and a place to read it from, and the engine
+/// made up the rest: it looked for `base_url`, then for `target_url`, and took
+/// whichever it found. A rule whose SDK calls the same thing `endpoint` or
+/// `api_base` produced a finding with no destination, no error and no
+/// diagnostic, so `target_drift` was underivable for that rule and the report
+/// gave no sign of it. `role` is what replaces the guess (ADR-003).
+///
+/// Two failures are refused here rather than at the call site. A rule with two
+/// destination fields has not said where the call goes, it has said two things;
+/// and a rule still using one of the old names without a role is a rule that
+/// silently lost its destination in this change, which is precisely the failure
+/// the change is about.
+fn validate_extract_roles(rule: &RuleFile) -> Result<(), String> {
+    let destinations: Vec<&str> = rule
+        .extract
+        .iter()
+        .filter(|(_, spec)| spec.role == Some(ExtractRole::DestinationUrl))
+        .map(|(field, _)| field.as_str())
+        .collect();
+
+    if destinations.len() > 1 {
+        return Err(format!(
+            "[extract] declares role = \"destination_url\" on more than one field ({}); a call \
+             has one destination, and two claims about it are not a stronger claim",
+            destinations.join(", ")
+        ));
+    }
+
+    for field in FORMER_DESTINATION_FIELDS {
+        let Some(spec) = rule.extract.get(field) else {
+            continue;
+        };
+        if spec.role.is_none() {
+            return Err(format!(
+                "[extract] {field:?} carries no role; the engine reads the destination from \
+                 role = \"destination_url\" rather than from the field name, so this field \
+                 would be reported and never compared. Add the role, or rename the field if \
+                 it is not the destination"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Holds a query's method predicate and its `[match.method]` list to one answer.
+///
+/// Eleven rule files spell the accepted method names twice: once as a
+/// `(#match? @method "^(create|stream)$")` predicate inside the query, and once
+/// as `one_of` beside it. Both copies have to stay because they do different
+/// jobs. The predicate is a filter tree-sitter applies while it walks, so
+/// dropping it turns every attribute call in a file into a candidate the engine
+/// has to build and then discard; `one_of` is what the engine enforces, and it is
+/// the only one of the two a rule can be trusted on, since a query with no
+/// predicate is legal.
+///
+/// What could not stay is the two of them disagreeing silently. Editing the list
+/// and forgetting the predicate narrows the rule with nothing red: the engine
+/// would accept `parse`, and no match carrying it ever reaches the engine. The
+/// copies are still two, and this is what makes the second one a derived claim
+/// rather than an independent one, in the same shape `tests/provider_table.rs`
+/// holds the provider host alternations to `schemas/providers.json`.
+///
+/// A predicate that is not a plain alternation is left alone. A real regular
+/// expression says more than a list can, and comparing the two would either
+/// reject a legitimate pattern or wave a genuine disagreement through.
+fn validate_method_agreement(index: usize, spec: &MatchSpec) -> Result<(), String> {
+    let Some(method) = &spec.method else {
+        return Ok(());
+    };
+    let Some(pinned) = predicate_alternatives(&spec.query, &method.capture) else {
+        return Ok(());
+    };
+
+    let mut declared = method.one_of.clone();
+    declared.sort();
+    declared.dedup();
+    let mut queried = pinned;
+    queried.sort();
+    queried.dedup();
+
+    if declared == queried {
+        return Ok(());
+    }
+    Err(format!(
+        "[[match]] {index}: the query predicate on @{} accepts {queried:?} but [match.method] \
+         one_of accepts {declared:?}; the two are the same list written twice, and a rule whose \
+         copies disagree silently applies the narrower one",
+        method.capture
+    ))
+}
+
+/// The alternatives a `#match?` predicate pins on `capture`, when it pins a set.
+///
+/// Deliberately literal about the shape it reads: `^(a|b|c)$` and nothing else.
+/// Anchors, a character class or a quantifier anywhere in the pattern make it a
+/// regular expression rather than a list, and the answer is then `None` so the
+/// caller does not compare it to one.
+fn predicate_alternatives(query: &str, capture: &str) -> Option<Vec<String>> {
+    let opening = format!("#match? @{capture} \"");
+    let start = query.find(&opening)? + opening.len();
+    let rest = query.get(start..)?;
+    let pattern = rest.get(..rest.find('"')?)?;
+
+    let inner = pattern.strip_prefix("^(")?.strip_suffix(")$")?;
+    let is_plain_name = |name: &str| {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    };
+    let alternatives: Vec<String> = inner.split('|').map(str::to_owned).collect();
+    alternatives
+        .iter()
+        .all(|a| is_plain_name(a))
+        .then_some(alternatives)
 }
 
 /// Checks that a rule agrees with itself and with where it sits about its family.
@@ -404,11 +535,89 @@ default_confidence = "confirmed"
         parse_rule(Path::new("rules/python/openai.toml"), text)
     }
 
+    /// The message of a rejection, so a test can say why a rule was refused
+    /// rather than only that it was. A rule refused for the wrong reason is as
+    /// much a defect as one that loads.
+    fn invalid_detail(outcome: Result<RuleFile, RuleLoadError>) -> String {
+        match outcome {
+            Err(RuleLoadError::Invalid { detail, .. }) => detail,
+            Err(other) => format!("__wrong error variant: {other}"),
+            Ok(_) => "__the rule loaded".to_owned(),
+        }
+    }
+
     #[test]
     fn loads_a_minimal_rule() {
         let rule = parse(MINIMAL).unwrap();
         assert_eq!(rule.rule_id, "python.static.openai-chat-completions");
         assert_eq!(rule.matches.len(), 1);
+    }
+
+    /// A rule spelling its method list in the query and beside it, as the shipped
+    /// rules do. `predicate` is dropped into the query verbatim.
+    fn with_method(predicate: &str, one_of: &str) -> String {
+        format!(
+            r#"
+schema_version = "1.0"
+language = "python"
+provider = "openai"
+rule_id = "python.static.openai-chat-completions"
+rule_version = "1.0.0"
+
+[[match]]
+kind = "call"
+query = '''
+(call
+  function: (attribute attribute: (identifier) @method)
+  {predicate}) @call
+'''
+[match.method]
+capture = "method"
+one_of = {one_of}
+
+[classify]
+egress_kind = "llm_chat"
+default_confidence = "confirmed"
+"#
+        )
+    }
+
+    #[test]
+    fn a_method_list_written_twice_has_to_agree() {
+        // The drift that used to be silent: the list gains `parse`, the
+        // predicate does not, and the rule narrows to what the predicate lets
+        // through while every reader of the file believes the list.
+        let text = with_method(
+            r#"(#match? @method "^(create|stream)$")"#,
+            r#"["create", "stream", "parse"]"#,
+        );
+        let detail = invalid_detail(parse(&text));
+        assert!(detail.contains("one_of"), "{detail}");
+        assert!(detail.contains("parse"), "{detail}");
+    }
+
+    #[test]
+    fn agreeing_copies_load_whatever_order_they_are_written_in() {
+        let text = with_method(
+            r#"(#match? @method "^(stream|create)$")"#,
+            r#"["create", "stream"]"#,
+        );
+        assert!(parse(&text).is_ok());
+    }
+
+    #[test]
+    fn a_predicate_that_is_a_real_regex_is_not_compared_to_a_list() {
+        // `^(create|acreate)$` is a list. `^a.*` is not, and reading it as one
+        // would reject a legitimate pattern for disagreeing with a list it was
+        // never a copy of.
+        let text = with_method(r#"(#match? @method "^create[0-9]+$")"#, r#"["create1"]"#);
+        assert!(parse(&text).is_ok());
+    }
+
+    #[test]
+    fn a_query_with_no_predicate_is_left_to_its_list() {
+        let text = with_method("", r#"["create", "stream"]"#);
+        assert!(parse(&text).is_ok());
     }
 
     #[test]
@@ -467,10 +676,60 @@ default_confidence = "confirmed"
     #[test]
     fn downgrade_accepts_a_declared_field() {
         let text = format!(
-            "{MINIMAL}\n[extract]\nbase_url = {{ from = \"recv\", constructor_keyword = \"base_url\" }}\n\n[[classify.downgrade]]\nwhen = \"base_url.unresolved\"\nto = \"suspect\"\ncoverage_note = \"target_host_unresolved\"\n"
+            "{MINIMAL}\n[extract]\nbase_url = {{ from = \"recv\", constructor_keyword = \"base_url\", role = \"destination_url\" }}\n\n[[classify.downgrade]]\nwhen = \"base_url.unresolved\"\nto = \"suspect\"\ncoverage_note = \"target_host_unresolved\"\n"
         );
         let rule = parse(&text).unwrap();
         assert_eq!(rule.classify.downgrade.len(), 1);
+    }
+
+    #[test]
+    fn a_destination_field_under_a_new_name_is_found_by_its_role() {
+        // The whole point of the role. `endpoint` is not a name the engine ever
+        // knew, and before this the field was carried into the report and never
+        // compared, so the join had nothing to work with and said nothing about
+        // it.
+        let text = format!(
+            "{MINIMAL}\n[extract]\nendpoint = {{ from = \"recv\", constructor_keyword = \"base_url\", role = \"destination_url\" }}\n"
+        );
+        let rule = parse(&text).unwrap();
+        assert_eq!(
+            rule.extract.get("endpoint").and_then(|spec| spec.role),
+            Some(ExtractRole::DestinationUrl)
+        );
+    }
+
+    #[test]
+    fn an_old_style_destination_field_with_no_role_is_refused() {
+        // The migration guard. Left to load, this rule reads as working and
+        // produces findings with no destination at all.
+        let text = format!(
+            "{MINIMAL}\n[extract]\nbase_url = {{ from = \"recv\", constructor_keyword = \"base_url\" }}\n"
+        );
+        let detail = invalid_detail(parse(&text));
+        assert!(detail.contains("destination_url"), "{detail}");
+    }
+
+    #[test]
+    fn two_destination_roles_in_one_rule_are_refused() {
+        let text = format!(
+            "{MINIMAL}\n[extract]\nbase_url = {{ from = \"recv\", role = \"destination_url\" }}\nendpoint = {{ from = \"args\", keyword = \"endpoint\", role = \"destination_url\" }}\n"
+        );
+        assert!(parse(&text).is_err());
+    }
+
+    #[test]
+    fn a_misspelled_role_is_a_load_error_rather_than_a_field_that_does_nothing() {
+        let text = format!(
+            "{MINIMAL}\n[extract]\nendpoint = {{ from = \"url\", role = \"destination\" }}\n"
+        );
+        assert!(parse(&text).is_err());
+    }
+
+    #[test]
+    fn a_field_the_report_only_carries_needs_no_role() {
+        let text =
+            format!("{MINIMAL}\n[extract]\nmodel = {{ from = \"args\", keyword = \"model\" }}\n");
+        assert!(parse(&text).is_ok());
     }
 
     #[test]

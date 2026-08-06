@@ -48,14 +48,35 @@ def _buffer_capacity(raw):
 
 
 def _entrypoint_hint(environ, argv):
-    """Best effort process name. Never an absolute path (event schema)."""
+    """Best effort process name. Never an absolute path (event schema).
+
+    The operator supplied name is reduced to a basename exactly like `argv[0]`.
+    The rule belongs to the field, not to where the value came from: with
+    `PERISKOP_HOOK_ENTRYPOINT=/srv/app/worker.py` every event this process wrote
+    would carry one machine's deployment layout, which makes the report stop
+    diffing against the same run on another host and breaks the rule against
+    absolute paths in output at the one point the pipeline cannot repair. The
+    schema states "never an absolute path" in prose and carries no pattern for
+    it, so nothing downstream would reject the record either.
+
+    Only the directory part is dropped. An extension the operator chose to write
+    is left alone, because the name is theirs; `argv[0]` loses its `.py` because
+    nobody chose that one, the interpreter did.
+    """
     explicit = environ.get("PERISKOP_HOOK_ENTRYPOINT")
     if explicit:
-        return explicit.strip()[:_MAX_ENTRYPOINT_CHARS]
-    argv0 = argv[0] if argv else ""
-    name = os.path.basename(argv0)
-    if name.endswith(".py"):
-        name = name[:-3]
+        # The trailing separator is stripped first because `os.path.basename`
+        # answers "" for `/srv/app/` while the Node hook's `basename` answers
+        # "app". The two hooks have to write the same hint for the same variable,
+        # and "app" is the answer that keeps the operator's word.
+        name = os.path.basename(explicit.strip().rstrip("/"))
+    else:
+        name = os.path.basename(argv[0] if argv else "")
+        if name.endswith(".py"):
+            name = name[:-3]
+    # A hint that reduced to nothing (a value of "/srv/app/", say) has to fall
+    # back rather than write an empty string: the schema types this as a string,
+    # so an empty one is valid and would read as a process that named itself.
     return name[:_MAX_ENTRYPOINT_CHARS] or "python"
 
 

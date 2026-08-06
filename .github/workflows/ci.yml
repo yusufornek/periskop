@@ -802,3 +802,171 @@ jobs:
       - name: Tool surface matches the contract
         working-directory: packages/mcp-server
         run: npm run gate:contract
+
+  # Nothing in this repository has ever asked whether its own dependencies carry
+  # a known vulnerability.
+  #
+  # ADR-015 section 6.1 prints a table of RustSec records and says in the same
+  # breath what that table is: "elle bakılmış bir fotoğraf", read once on
+  # 2026-08-04 and never again. The ADR files the missing automation as work it
+  # created and records that it was not done. This job is that work. It also
+  # decides something the ADR left open on purpose: `ed25519-dalek` 3.0.0 was
+  # rejected "for today" with the note that the move should be reconsidered once
+  # this gate exists.
+  #
+  # Fail closed, like the kernel and latency jobs. There is no `continue-on-error`
+  # and no `|| true` anywhere in it (CLAUDE.md O6b). The gate fails when it finds
+  # a vulnerability, and it also fails when it cannot prove it looked: an empty
+  # advisory database and an unread lockfile both produce "no findings", which is
+  # the exact shape O6b forbids.
+  #
+  # This gate can turn a commit red that changed nothing, because the advisory
+  # database moves on its own. That is the point of it rather than a defect in
+  # it. The remedy is a dependency decision, which CLAUDE.md routes through an
+  # ADR; it is not an ignore line. There is deliberately no `.cargo/audit.toml`
+  # in this tree, so the first exception has to arrive in the same commit as the
+  # reasoning for it rather than into a file that is already sitting there empty.
+  audit:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      # cargo-audit rather than cargo-deny, and the choice is narrower than it
+      # looks. The open work is the advisory check; cargo-deny's other checks
+      # (licenses, bans, sources) are three more policy surfaces that nobody in
+      # this repository has decided yet, and a licence allowlist that does not
+      # exist fails on the first run for a reason unrelated to security. Beyond
+      # that, cargo-deny needs a `deny.toml` whose `[advisories]` schema has
+      # changed shape across releases, and an unknown key there is a hard error;
+      # cargo-audit needs no configuration file at all, so there is nothing here
+      # that can be silently wrong about its own syntax.
+      #
+      # The version is a `^0.21` requirement rather than an exact pin: the newest
+      # patch of a scanner is the one worth having, while the minor is held
+      # because the step below parses this tool's JSON and a shape change under a
+      # floating version would be read as "nothing found". `--locked` so the
+      # tool's own dependencies come from its lockfile.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version "^0.21"
+
+      # Both committed lockfiles. `crates/periskop-ebpf-object` declares an empty
+      # `[workspace]` table and is its own workspace root, so no path from the
+      # root manifest reaches it and the root lockfile does not describe it; it is
+      # the same blind spot the kernel job's formatting and lint step was written
+      # to close (ADR-014 section 8).
+      #
+      # A vulnerability makes cargo-audit itself exit non zero here, before the
+      # step below runs. That is the intended outcome and the reason the JSON is
+      # teed rather than only redirected: the finding is in the job log even
+      # though the reading step never gets to it.
+      - name: Advisories against every committed lockfile
+        run: |
+          set -o pipefail
+          cargo audit --json --file Cargo.lock \
+            | tee /tmp/audit-workspace.json
+          cargo audit --json --file crates/periskop-ebpf-object/Cargo.lock \
+            | tee /tmp/audit-ebpf-object.json
+
+      # A zero exit code is not the claim; the report is.
+      #
+      # Which advisory classes fail this job, and why each answer is what it is:
+      #
+      #   * **vulnerability: fails.** The reason the job exists.
+      #   * **unsound: fails.** A RustSec unsound advisory is a memory safety
+      #     defect reachable from safe code. ADR-002 forbids `unsafe` across this
+      #     workspace and ADR-015 section 6.2 already records that the dependency
+      #     tree's unsafe surface is not zero; accepting an unsound advisory would
+      #     put back exactly the class the lint excluded, one level down where the
+      #     lint cannot see it.
+      #   * **yanked: fails.** The lockfile is committed, so a yanked version is a
+      #     withdrawn artefact this repository is still pinning. The fix is a
+      #     lockfile update: deterministic, available the same day, and visible in
+      #     a diff.
+      #   * **unmaintained: does not fail, is printed.** It describes the
+      #     maintainer rather than the code; the bytes that ship did not change on
+      #     the day the advisory was published. The only remedies available within
+      #     a day are replacing a dependency, which CLAUDE.md makes an ADR
+      #     decision, or writing an ignore line. A gate whose fastest remedy is an
+      #     ignore line teaches people to write ignore lines, and after that it
+      #     reports nothing. So it is surfaced on every run and it is the input to
+      #     that ADR rather than a substitute for it.
+      #   * **notice: does not fail, is printed.** Same reasoning, weaker signal.
+      - name: The audit looked at something and says what it found
+        run: |
+          python3 - <<'CHECK'
+          import json, sys
+
+          # Floors, not counts. They answer "did this run read a lockfile at
+          # all", so they sit far below today's numbers (185 packages in the
+          # workspace lockfile, 31 in the kernel object's) and far above zero. An
+          # ordinary dependency removal does not reach them; a missing, empty or
+          # mistyped path does.
+          LOCKFILES = (("/tmp/audit-workspace.json", "Cargo.lock", 100),
+                       ("/tmp/audit-ebpf-object.json",
+                        "crates/periskop-ebpf-object/Cargo.lock", 10))
+
+          # Read under both spellings. These keys belong to a tool's output
+          # rather than to a contract this repository owns, and a gate that dies
+          # on a renamed key is a gate somebody deletes. A key that is absent
+          # under every spelling still fails, because that is a report this step
+          # cannot read rather than a clean one.
+          def field(document, name, where):
+              for spelling in (name, name.replace("-", "_")):
+                  if spelling in document:
+                      return document[spelling]
+              sys.exit(f"{where}: no {name} field, so this step is reading a report from a different tool")
+
+          for path, lockfile, floor in LOCKFILES:
+              try:
+                  report = json.load(open(path))
+              except Exception as error:
+                  sys.exit(f"{path} was not produced or is not readable: {error}")
+
+              database = field(report, "database", path)
+              advisories = field(database, "advisory-count", f"{path} database")
+              if advisories < 100:
+                  sys.exit(f"{lockfile}: the advisory database holds {advisories} records, so the fetch produced an empty or partial database and every crate would look clean")
+
+              dependencies = field(field(report, "lockfile", path), "dependency-count", f"{path} lockfile")
+              if dependencies < floor:
+                  sys.exit(f"{lockfile}: {dependencies} packages were audited against a floor of {floor}, so this run did not read the lockfile it was pointed at")
+
+              vulnerabilities = field(report, "vulnerabilities", path)
+              found, count = field(vulnerabilities, "found", path), field(vulnerabilities, "count", path)
+              if found or count:
+                  sys.exit(f"{lockfile}: {count} known vulnerabilities: {vulnerabilities.get('list')!r}")
+
+              warnings = field(report, "warnings", path)
+              if not isinstance(warnings, dict):
+                  sys.exit(f"{lockfile}: warnings is {warnings!r} and not a map, so nothing here classified anything")
+
+              # Absent means none of that class, which is why these are read with
+              # a default while the block above is not: `warnings` itself has to
+              # be there, its per class keys do not.
+              for fatal in ("unsound", "yanked"):
+                  entries = warnings.get(fatal, [])
+                  if entries:
+                      sys.exit(f"{lockfile}: {len(entries)} {fatal} advisories: {entries!r}")
+
+              tolerated = {kind: len(warnings.get(kind, [])) for kind in ("unmaintained", "notice")}
+              print(f"{lockfile}: {dependencies} packages audited against {advisories} advisories, "
+                    f"0 vulnerabilities, 0 unsound, 0 yanked, "
+                    f"{tolerated['unmaintained']} unmaintained, {tolerated['notice']} notice")
+              for kind in ("unmaintained", "notice"):
+                  for entry in warnings.get(kind, []):
+                      print(f"  {kind}: {entry!r}")
+          CHECK
+
+      # What this job does not cover, stated rather than left to be discovered.
+      # The two npm lockfiles (packages/mcp-server, hooks/node) carry the only
+      # dependencies this project publishes to somebody else's machine, and
+      # nothing audits them; `npm audit` is the same class of gate and is filed
+      # as open work rather than added here, because it fails on a surface this
+      # task did not decide. Recorded in ADR-015 section 6.1.
+      - name: What this gate does not answer
+        run: |
+          echo "audited: Cargo.lock, crates/periskop-ebpf-object/Cargo.lock"
+          echo "not audited: packages/mcp-server/package-lock.json, hooks/node/package-lock.json, package-lock.json"

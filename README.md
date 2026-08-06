@@ -369,9 +369,20 @@ not consume a context window in one response.
 
 Issues and pull requests are welcome. Two expectations worth stating up front.
 
-Every detector rule ships with three test cases: one that must match, one that must
-not, and one known evasion that the rule cannot catch. The third is not a failure. It
-is documentation of a limit, and it belongs in the known gaps catalogue.
+Detector rules are exercised by fixtures of three kinds: source that must match,
+source that must not, and a known evasion the rule cannot catch. The third is not a
+failure. It is documentation of a limit, and it belongs in the known gaps catalogue.
+
+The three kinds are a property of the suite rather than a count attached to each
+rule. Fixtures are grouped per language, in
+`crates/periskop-static-scanner/fixtures/<language>/{positive,negative,evasion}`, and
+today fifteen rules across four languages are covered by twenty-three positive, nine
+negative and eight evasion files. One rule to one negative file is not the shape, and
+a rule that needs its own negative case is expected to bring one rather than to
+assume it is already there. What is checked automatically is narrower than the three
+kinds suggest: `each_rule_family_is_covered_by_a_fixture` fails when a rule has no
+positive fixture at all, and it runs over the Python rules only. Nothing today fails
+a build for a rule with no negative or evasion case behind it.
 
 Anything that changes a schema starts in `schemas/`, not in the code that reads it.
 

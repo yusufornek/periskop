@@ -90,6 +90,11 @@ const EXPECTED_CONFIDENCE: &[(&str, Confidence)] = &[
     // so this is a structural fact and stays confirmed.
     ("openai_client_field.py", Confidence::Confirmed),
     ("openai_legacy.py", Confidence::Confirmed),
+    // A star import names no symbol, so the package a name came from is read off
+    // the one wildcard in scope rather than off the file. The call is structural
+    // and stays reported; the claim about which package supplied the class is
+    // what weakens.
+    ("openai_wildcard_import.py", Confidence::Suspect),
 ];
 
 #[test]
@@ -423,4 +428,60 @@ fn an_unknown_import_is_reported_as_unclaimed() {
     assert!(result
         .unclaimed_imports
         .contains(&"some_private_ai_sdk".to_owned()));
+}
+
+#[test]
+fn a_star_import_of_a_library_nobody_has_a_rule_for_is_declared() {
+    // The other half of the wildcard fix. When the star import names a package
+    // no rule claims, nothing can be detected and the honest answer is to say
+    // so. The failure this guards against is silence in both directions at
+    // once: no finding because nothing resolved, and no coverage entry because
+    // the module looked accounted for.
+    let (compiled, rules) = python_rules();
+    let source = "from internal_ai_sdk import *\nclient = Client()\nclient.chat.completions.create(model='x')\n";
+    let parsed = parse_as("mystery.py", source, Language::Python).unwrap();
+    let result = detect(&parsed, &compiled, &rules);
+
+    assert!(result.findings.is_empty(), "{:?}", result.findings);
+    assert_eq!(result.unclaimed_imports, ["internal_ai_sdk"]);
+}
+
+#[test]
+fn a_star_import_produces_a_finding_and_says_it_is_assuming() {
+    // `from openai import *` used to produce nothing at all: the module was
+    // recorded, so the openai rule claimed it and it stayed out of
+    // `unclaimed_imports`, while `OpenAI` resolved to nothing so no rule
+    // matched. Zero findings and zero coverage lines for a file that calls the
+    // OpenAI API on line three.
+    let source =
+        "from openai import *\nclient = OpenAI()\nclient.chat.completions.create(model='x')\n";
+    let hits = scan(source, "star.py");
+    assert!(
+        hits.iter().any(
+            |(rule_id, confidence)| rule_id == "python.static.openai-client-call"
+                && *confidence == Confidence::Suspect
+        ),
+        "expected a suspect finding for the star imported client, got {hits:?}"
+    );
+}
+
+#[test]
+fn a_local_class_the_star_import_could_have_named_is_not_reported() {
+    // What holds the wildcard reading in check, named so the reason is not
+    // mistaken for a stronger one. This pass does not know `Store` is defined
+    // three lines down; it attributes the name to `openai` exactly as it would
+    // any other. The match is refused one layer later, because every rule names
+    // the symbols it accepts and `openai.Store` is not one of them.
+    //
+    // Which is also the limit: a local class named `OpenAI` under a star import
+    // of `openai` would satisfy the symbol list and be reported. Catalogued in
+    // `docs/05-quality/known-gaps.md` rather than papered over here.
+    let source = "from openai import *\n\
+                  class Store:\n\
+                  \x20   def create(self, **fields):\n\
+                  \x20       return fields\n\
+                  store = Store()\n\
+                  store.create(model='x')\n";
+    let hits = scan(source, "local_class.py");
+    assert!(hits.is_empty(), "{hits:?}");
 }

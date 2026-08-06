@@ -872,3 +872,79 @@ fn a_report_the_scan_command_wrote_signs_and_verifies_as_written() {
     let verified = verify(&report, &public);
     assert_eq!(verified.code, PASS, "{}", verified.stderr);
 }
+
+/// The seed the shipped example envelope is signed under.
+///
+/// Written as a repeated byte and expanded at runtime rather than pasted in as
+/// base64, so no file in this repository carries a string shaped like a private
+/// key. A reader can regenerate the example from this line alone, which is the
+/// property that makes the example checkable rather than merely present.
+const EXAMPLE_SEED: [u8; 32] = [0x2a; 32];
+
+/// The private key file text for [`EXAMPLE_SEED`], in the format `key.rs` reads.
+fn example_secret_key_file() -> String {
+    format!(
+        "{} {}\n",
+        periskop_report::signature::SECRET_KEY_TAG,
+        periskop_report::signature::base64url::encode(&EXAMPLE_SEED)
+    )
+}
+
+#[test]
+fn the_shipped_signature_example_verifies_against_the_shipped_report() {
+    // `schemas/examples/signature-envelope.valid.json` passed its schema and
+    // nothing else: the `value` was 71 bytes of invented base64, so a reader who
+    // copied the example produced an envelope every verifier refuses. Schema
+    // conformance is not the property an example of a signature has to have.
+    //
+    // Driven through the binary rather than the library, because the binary is
+    // what a reader of the example runs.
+    let scratch = Scratch::new("shipped-example");
+    let root = repo_root();
+
+    let secret = scratch.path("example.secret");
+    std::fs::write(&secret, example_secret_key_file()).unwrap();
+    let signing_key =
+        periskop_report::signature::SigningKey::from_key_file(&example_secret_key_file()).unwrap();
+    let public = scratch.path("example.public");
+    std::fs::write(&public, signing_key.verifying_key().to_key_file()).unwrap();
+
+    let report = root.join("schemas/examples/report.valid.json");
+    let envelope = root.join("schemas/examples/signature-envelope.valid.json");
+
+    let outcome = run(&[
+        "verify",
+        "--report",
+        report.to_str().unwrap(),
+        "--signature",
+        envelope.to_str().unwrap(),
+        "--public-key",
+        public.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        outcome.code, PASS,
+        "the shipped example does not verify: {}{}",
+        outcome.stdout, outcome.stderr
+    );
+
+    // And the other direction, so the assertion above cannot be satisfied by a
+    // verifier that accepts everything. One character of the report changes and
+    // the same envelope has to be refused.
+    let altered = scratch.path("altered.report.json");
+    let original = std::fs::read_to_string(&report).unwrap();
+    std::fs::write(
+        &altered,
+        original.replace("\"verdict\": \"", "\"verdict\": \"X"),
+    )
+    .unwrap();
+    let refused = run(&[
+        "verify",
+        "--report",
+        altered.to_str().unwrap(),
+        "--signature",
+        envelope.to_str().unwrap(),
+        "--public-key",
+        public.to_str().unwrap(),
+    ]);
+    assert_eq!(refused.code, FAIL, "{}{}", refused.stdout, refused.stderr);
+}

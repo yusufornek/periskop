@@ -74,6 +74,27 @@ pub struct BindingTable {
     /// because the useful fact is not which one won: it is that the winner
     /// answers for call sites that never read it.
     contested: BTreeSet<String>,
+    /// Modules a star import pulled names from without naming any of them.
+    ///
+    /// Kept apart from `imported_modules`, which answers "which libraries did
+    /// this file reach for" and needs every import in it. This one answers a
+    /// narrower question, "which package may have supplied a name nothing else
+    /// bound", and only a star import can be an answer to it.
+    ///
+    /// A set rather than a list because the count is what decides the answer,
+    /// and it is read during collection, before [`BindingTable::finish`] has a
+    /// chance to normalise anything. `from x import *` written twice is one
+    /// package, and a list would have made it look like two and resolved
+    /// nothing.
+    wildcard_modules: BTreeSet<String>,
+    /// Names that resolved only by reading them off a star import.
+    ///
+    /// The path is a reading of the file rather than a statement in it, so a
+    /// call site reached through one of these names is reported with a weaker
+    /// claim. Recorded here rather than folded into `contested`: two value
+    /// bindings disagreeing and one import declining to say are different
+    /// facts, and a reader of a downgrade deserves the one that happened.
+    speculative: BTreeSet<String>,
 }
 
 impl BindingTable {
@@ -114,6 +135,41 @@ impl BindingTable {
     /// Records that the file imported a module, whether or not anything bound.
     pub fn record_module(&mut self, module: &str) {
         self.imported_modules.push(module.to_owned());
+    }
+
+    /// Records a star import: a module that may supply names this file uses.
+    pub fn record_wildcard(&mut self, module: &str) {
+        self.wildcard_modules.insert(module.to_owned());
+    }
+
+    /// Binds a name to a path only a star import could have supplied.
+    ///
+    /// Separate from [`Self::bind_import`] because the two carry different
+    /// warrants. An import writes the name down; a star import says a package
+    /// exports something and leaves the reader to assume this is it. Both bind,
+    /// and only one of them is a fact the file states.
+    pub fn bind_speculative(&mut self, local: String, path: String) {
+        self.speculative.insert(local.clone());
+        self.resolved.insert(local, path);
+    }
+
+    /// Whether `name` was resolved by reading it off a star import.
+    pub fn is_speculative(&self, name: &str) -> bool {
+        self.speculative.contains(name)
+    }
+
+    /// The single star import a name may be attributed to, if there is one.
+    ///
+    /// `None` when the file has no star import, and also when it has more than
+    /// one: with two in scope the file itself no longer says which package a
+    /// bare name came from, and a resolver that picks anyway has started
+    /// guessing. This mirrors the rule `bindings_java` applies to Java's
+    /// wildcard imports, for the same reason and with the same failure
+    /// direction: no answer rather than a made up one.
+    pub fn sole_wildcard(&self) -> Option<&str> {
+        (self.wildcard_modules.len() == 1)
+            .then(|| self.wildcard_modules.first().map(String::as_str))
+            .flatten()
     }
 
     /// Normalises the module list. Called once collection is complete.
@@ -247,6 +303,13 @@ fn collect_import_from(node: Node<'_>, source: &str, table: &mut BindingTable) {
                 let symbol = text(name, source);
                 table.bind_import(text(alias, source), format!("{module}.{symbol}"));
             }
+            // `from openai import *`. There is no name here to bind, which is
+            // why this used to fall through every branch and leave the file
+            // with a recorded module and nothing resolved. A rule claims the
+            // module, so it stayed out of `undetected_libraries` as well: the
+            // call was neither detected nor declared, and that combination is
+            // the one this scanner exists to make impossible.
+            "wildcard_import" => table.record_wildcard(&module),
             _ => {}
         }
     }
@@ -276,7 +339,21 @@ fn collect_assignment(node: Node<'_>, source: &str, table: &mut BindingTable) {
 
     let constructed = match function.kind() {
         // `OpenAI()`
-        "identifier" => table.resolve(&text(function, source)).map(str::to_owned),
+        "identifier" => {
+            let name = text(function, source);
+            table
+                .resolve(&name)
+                .map(str::to_owned)
+                // Nothing bound this name, so the last thing left that could
+                // have supplied it is a star import. Attributed to it and
+                // marked, so the finding is produced and the claim about where
+                // the class came from is the part that weakens.
+                .map(Constructed::Stated)
+                .or_else(|| {
+                    let module = table.sole_wildcard()?;
+                    Some(Constructed::Assumed(format!("{module}.{name}")))
+                })
+        }
         // `genai.Client()`
         "attribute" => {
             let (Some(object), Some(attribute)) = (
@@ -291,13 +368,25 @@ fn collect_assignment(node: Node<'_>, source: &str, table: &mut BindingTable) {
             table
                 .resolve(&root)
                 .map(|base| format!("{base}.{}", text(attribute, source)))
+                .map(Constructed::Stated)
         }
         _ => None,
     };
 
-    if let Some(path) = constructed {
-        table.bind_value(target, path);
+    match constructed {
+        Some(Constructed::Stated(path)) => table.bind_value(target, path),
+        Some(Constructed::Assumed(path)) => table.bind_speculative(target, path),
+        None => {}
     }
+}
+
+/// Where a constructor's package came from, which decides how strong the claim is.
+enum Constructed {
+    /// The file names the import the class came from.
+    Stated(String),
+    /// Only a star import could have supplied the name, so the package is read
+    /// off the file rather than written in it.
+    Assumed(String),
 }
 
 /// The table key an assignment target writes, if it is one this pass can key on.
@@ -420,6 +509,41 @@ mod tests {
     fn from_import_binds_module_and_symbol() {
         let t = table_for("from openai import OpenAI\n");
         assert_eq!(t.resolve("OpenAI"), Some("openai.OpenAI"));
+    }
+
+    #[test]
+    fn a_single_star_import_supplies_the_package_and_says_it_is_assuming() {
+        // The defect this closes: the module was recorded, so a rule claimed it
+        // and it never reached `undetected_libraries`, while the name resolved
+        // to nothing and no finding was produced. Neither detected nor declared.
+        let t = table_for("from openai import *\nclient = OpenAI()\n");
+        assert!(t.satisfies("client", "openai", &["OpenAI".to_owned()]));
+        assert!(t.is_speculative("client"));
+        assert_eq!(t.imported_modules(), ["openai"]);
+    }
+
+    #[test]
+    fn an_explicit_import_beats_a_star_import_and_stays_a_stated_fact() {
+        let t =
+            table_for("from openai import *\nfrom vendor.sdk import OpenAI\nclient = OpenAI()\n");
+        assert_eq!(t.resolve("client"), Some("vendor.sdk.OpenAI"));
+        assert!(!t.is_speculative("client"));
+    }
+
+    #[test]
+    fn two_star_imports_leave_the_name_unresolved() {
+        // With two in scope the file no longer says which package supplied the
+        // name. Both modules are still recorded, so the coverage statement can
+        // report what was reached for even though nothing bound.
+        let t = table_for("from openai import *\nfrom anthropic import *\nclient = OpenAI()\n");
+        assert_eq!(t.resolve("client"), None);
+        assert_eq!(t.imported_modules(), ["anthropic", "openai"]);
+    }
+
+    #[test]
+    fn the_same_star_import_twice_is_still_one_package() {
+        let t = table_for("from openai import *\nfrom openai import *\nclient = OpenAI()\n");
+        assert!(t.satisfies("client", "openai", &["OpenAI".to_owned()]));
     }
 
     #[test]

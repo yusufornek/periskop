@@ -54,6 +54,39 @@ test("no destination is chosen from a temporary directory", () => {
   assert.notEqual(config.outputDir, join(tmpdir(), "periskop-events"));
 });
 
+test("an operator supplied entrypoint is reduced to a basename", () => {
+  // The field is a name. Without this every event carries /srv/app, the report
+  // stops diffing against the same run on another host, and the schema's "never
+  // an absolute path" is broken by the hook that writes the field. The schema
+  // has no pattern for it, so no later stage would catch the record. The Python
+  // hook reduces the same variable the same way.
+  const config = readConfig({ PERISKOP_HOOK_ENTRYPOINT: "/srv/app/worker.js" }, ARGV);
+  assert.equal(config.entrypointHint, "worker.js");
+});
+
+test("an extension the operator wrote survives, unlike the one on argv", () => {
+  assert.equal(readConfig({ PERISKOP_HOOK_ENTRYPOINT: "ingest.js" }, ARGV).entrypointHint,
+    "ingest.js");
+  assert.equal(readConfig({}, ARGV).entrypointHint, "server");
+});
+
+test("a trailing separator is read the way the other hook reads it", () => {
+  // Python's os.path.basename answers "" here and this basename answers "app".
+  // One variable, two hooks, one hint: the divergence had to be closed in one
+  // direction, and keeping the operator's last word is that direction.
+  assert.equal(readConfig({ PERISKOP_HOOK_ENTRYPOINT: "/srv/app/" }, ARGV).entrypointHint,
+    "app");
+});
+
+test("an entrypoint that reduces to nothing falls back to the script name", () => {
+  // An empty string is a valid value for this field, so it would be written and
+  // read as a process that named itself.
+  assert.equal(readConfig({ PERISKOP_HOOK_ENTRYPOINT: "/" }, ARGV).entrypointHint,
+    "server");
+  assert.equal(readConfig({ PERISKOP_HOOK_ENTRYPOINT: "   " }, ARGV).entrypointHint,
+    "server");
+});
+
 test("reading configuration creates nothing on disk", () => {
   // Configuration is read at startup in every hooked process. Creating the
   // directory here would be a side effect for processes that record nothing.

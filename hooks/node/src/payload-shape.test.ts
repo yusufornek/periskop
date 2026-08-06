@@ -126,3 +126,24 @@ test("a long array is sampled rather than walked, and the stop is declared", () 
   assert.deepEqual(paths, ["messages[].content", "messages[].role"]);
   assert.equal(truncatedDepth, 2);
 });
+
+test("a body that is not a container declares the stop rather than looking empty", () => {
+  // A JSON body that parses to a string or a number has no field to name, and
+  // saying so is not the same as saying it had none. Returning an empty path
+  // list with nothing declared produced the record the schema reserves for a
+  // call that carried nothing, so describeBody reported it as a call with no
+  // payload rather than one whose shape could not be read.
+  for (const body of ["a body with no fields", 42, true, null]) {
+    const { paths, truncatedDepth } = fieldPaths(body);
+    assert.deepEqual(paths, [], JSON.stringify(body));
+    assert.equal(truncatedDepth, 0, JSON.stringify(body));
+  }
+});
+
+test("an empty object still reads as a call that carried nothing", () => {
+  // The other half of the same statement: a body that really was empty must not
+  // be dressed up as a gap.
+  const { paths, truncatedDepth } = fieldPaths({});
+  assert.deepEqual(paths, []);
+  assert.equal(truncatedDepth, undefined);
+});

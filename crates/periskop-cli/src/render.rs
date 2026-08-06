@@ -343,7 +343,7 @@ mod tests {
             ),
             finding(
                 Confidence::Suspect,
-                "python.static.http-provider-endpoint",
+                "python.static.http-literal-endpoint",
                 200,
             ),
         ]);

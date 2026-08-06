@@ -37,7 +37,7 @@ one_of = ["CreateChatCompletion", "CreateChatCompletionStream"]
 [extract]
 model = { from = "args", keyword = "Model" }
 payload_ref = { from = "args", keyword = "Messages" }
-base_url = { from = "recv", constructor_keyword = "BaseURL" }
+base_url = { from = "recv", constructor_keyword = "BaseURL", role = "destination_url" }
 
 [classify]
 egress_kind = "llm_chat"

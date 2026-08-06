@@ -51,6 +51,12 @@ pub enum Kind {
     ObservedEgressCall,
     ObservedNetworkFlow,
     UnclassifiedEgress,
+    /// Content crossed the boundary without masking and the proxy is saying so.
+    ///
+    /// The only kind no scan can produce. It is a statement about a request the
+    /// proxy forwarded, and it exists because `proxy-api.md` allows the pass
+    /// through and forbids it being silent.
+    UnmaskedPassthrough,
     UnmatchedWireTraffic,
     DormantEgressPoint,
     TargetDrift,
@@ -67,6 +73,10 @@ impl Kind {
             Self::DeclaredEgressPoint => Source::Declared,
             Self::ObservedEgressCall => Source::ObservedApp,
             Self::ObservedNetworkFlow | Self::UnclassifiedEgress => Source::ObservedWire,
+            // The proxy watched an application make the call, which is what
+            // `observed-app` means. Not `observed-wire`: this is the request
+            // itself, not a packet somebody reassembled.
+            Self::UnmaskedPassthrough => Source::ObservedApp,
             Self::UnmatchedWireTraffic
             | Self::DormantEgressPoint
             | Self::TargetDrift
@@ -80,6 +90,7 @@ impl Kind {
             Self::ObservedEgressCall => "observed_egress_call",
             Self::ObservedNetworkFlow => "observed_network_flow",
             Self::UnclassifiedEgress => "unclassified_egress",
+            Self::UnmaskedPassthrough => "unmasked_passthrough",
             Self::UnmatchedWireTraffic => "unmatched_wire_traffic",
             Self::DormantEgressPoint => "dormant_egress_point",
             Self::TargetDrift => "target_drift",
@@ -101,6 +112,8 @@ pub enum RefType {
     EgressPoint,
     EgressEvent,
     Flow,
+    /// One request and its response as the proxy saw them.
+    ProxyExchange,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -122,6 +135,7 @@ impl EntityRef {
             RefType::EgressPoint => crate::ids::EgressPointId::parse(&self.ref_id).map(drop),
             RefType::EgressEvent => crate::ids::EgressEventId::parse(&self.ref_id).map(drop),
             RefType::Flow => crate::ids::FlowId::parse(&self.ref_id).map(drop),
+            RefType::ProxyExchange => crate::ids::ProxyExchangeId::parse(&self.ref_id).map(drop),
         }
     }
 }
@@ -136,6 +150,9 @@ pub enum EvidenceType {
     DnsQuery,
     PcapFlow,
     ReconciliationJoin,
+    /// The exchange itself, referenced as `<exchange id>#<path>`. The path is a
+    /// field name, so it locates the gap without carrying what was in it.
+    ProxyExchange,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -153,6 +170,7 @@ pub enum Component {
     RuntimeHooks,
     NetworkSensor,
     Reconciliation,
+    Proxy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -320,10 +338,21 @@ pub struct Finding {
 
 /// Schema version this build writes.
 ///
-/// 1.1 adds `declared_target` and `operation`, both optional. Under the
-/// versioning policy that is a MINOR step: no field was removed and no meaning
-/// changed, so a 1.0 reader keeps working and simply learns nothing new.
-pub const SCHEMA_VERSION: &str = "1.1";
+/// Every step so far has been MINOR, so a reader of any earlier one keeps
+/// working and simply learns nothing new. 1.1 added `declared_target` and
+/// `operation`, both optional. 1.2 widened four closed vocabularies for the
+/// proxy's finding: `unmasked_passthrough`, the `proxy` component, and
+/// `proxy_exchange` as both a reference and an evidence type. 1.3 turned a
+/// sentence that had been normative since 1.0 into a constraint the validator
+/// applies, by rejecting an absolute `location.path`.
+///
+/// This constant sat at `1.1` while the schema was at `1.3`, which is the one
+/// drift a version field cannot survive: the engine stamped its output with a
+/// version that no longer described it, and a consumer reading the version
+/// before validating would have refused a document that was in fact correct.
+/// `schema_agreement` at the bottom of this file is what now compares the two
+/// rather than a reviewer.
+pub const SCHEMA_VERSION: &str = "1.3";
 
 impl Finding {
     /// Builds a finding, deriving the identity from the fields the contract names.
@@ -625,5 +654,160 @@ mod tests {
             Kind::UnclassifiedEgress.required_source(),
             Kind::ObservedNetworkFlow.required_source()
         );
+    }
+}
+
+/// Holds the Rust enums to the schema file rather than to a second hand copy.
+///
+/// Four closed vocabularies live twice: once in `schemas/finding.schema.json`,
+/// which is the contract, and once here, which is what actually emits. Nothing
+/// compared them, and they drifted: the schema gained the proxy's four values in
+/// 1.2 while this file stayed at 1.1, so the engine declared a version the
+/// schema no longer described and the proxy's own finding could not be
+/// expressed by the type every other component builds.
+///
+/// Reading the schema at test time rather than restating it is the point. A
+/// restated list passes on the day both copies change together, which is the one
+/// change that cannot break, and stays silent on the day only one does.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod schema_agreement {
+    use super::*;
+
+    fn schema() -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../schemas/finding.schema.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        serde_json::from_str(&text).expect("finding.schema.json is not valid JSON")
+    }
+
+    /// The values a `"enum"` at `pointer` lists, sorted.
+    fn schema_values(pointer: &str) -> Vec<String> {
+        let document = schema();
+        let node = document
+            .pointer(pointer)
+            .unwrap_or_else(|| panic!("{pointer} is not in finding.schema.json"));
+        let mut values: Vec<String> = node
+            .as_array()
+            .unwrap_or_else(|| panic!("{pointer} is not an array"))
+            .iter()
+            .map(|v| v.as_str().expect("enum value is not a string").to_owned())
+            .collect();
+        values.sort();
+        values
+    }
+
+    fn emitted<T: Serialize>(values: &[T]) -> Vec<String> {
+        let mut out: Vec<String> = values
+            .iter()
+            .map(|v| {
+                serde_json::to_value(v)
+                    .expect("value does not serialize")
+                    .as_str()
+                    .expect("value does not serialize to a string")
+                    .to_owned()
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn every_kind_the_schema_lists_is_a_kind_this_build_can_emit() {
+        assert_eq!(
+            emitted(&[
+                Kind::DeclaredEgressPoint,
+                Kind::ObservedEgressCall,
+                Kind::ObservedNetworkFlow,
+                Kind::UnclassifiedEgress,
+                Kind::UnmaskedPassthrough,
+                Kind::UnmatchedWireTraffic,
+                Kind::DormantEgressPoint,
+                Kind::TargetDrift,
+                Kind::VolumeAnomaly,
+            ]),
+            schema_values("/properties/kind/enum")
+        );
+    }
+
+    #[test]
+    fn the_component_lists_agree() {
+        let expected = emitted(&[
+            Component::StaticScanner,
+            Component::RuntimeHooks,
+            Component::NetworkSensor,
+            Component::Reconciliation,
+            Component::Proxy,
+        ]);
+        assert_eq!(
+            expected,
+            schema_values("/properties/detector/properties/component/enum")
+        );
+        // Two places in the schema spell the same vocabulary, and a finding
+        // carries both. A component accepted as a detector and refused as a
+        // location would be a finding no producer could write.
+        assert_eq!(
+            expected,
+            schema_values("/properties/location/properties/component/enum")
+        );
+    }
+
+    #[test]
+    fn the_reference_and_evidence_lists_agree() {
+        assert_eq!(
+            emitted(&[
+                RefType::EgressPoint,
+                RefType::EgressEvent,
+                RefType::Flow,
+                RefType::ProxyExchange,
+            ]),
+            schema_values("/properties/refs/items/properties/ref_type/enum")
+        );
+        assert_eq!(
+            emitted(&[
+                EvidenceType::AstNode,
+                EvidenceType::SdkCallTrace,
+                EvidenceType::HttpHeader,
+                EvidenceType::Sni,
+                EvidenceType::DnsQuery,
+                EvidenceType::PcapFlow,
+                EvidenceType::ReconciliationJoin,
+                EvidenceType::ProxyExchange,
+            ]),
+            schema_values("/properties/evidence/items/properties/evidence_type/enum")
+        );
+    }
+
+    #[test]
+    fn every_reference_type_has_an_identity_this_build_can_parse() {
+        // The pattern the schema pins on `ref_id`, read back as the set of
+        // prefixes. A reference type whose identity nothing can parse would be
+        // refused by `EntityRef::validate` at the moment a producer built it.
+        let document = schema();
+        let pattern = document
+            .pointer("/properties/refs/items/properties/ref_id/pattern")
+            .and_then(serde_json::Value::as_str)
+            .expect("refs.ref_id has no pattern");
+        for prefix in ["ep", "ee", "fl", "px"] {
+            assert!(
+                pattern.contains(prefix),
+                "the schema pattern {pattern:?} does not admit {prefix}_"
+            );
+        }
+    }
+
+    #[test]
+    fn the_version_this_build_emits_is_the_one_the_schema_examples_carry() {
+        // `schema_version` is a free `MAJOR.MINOR` string in the schema, so no
+        // enum pins it. The examples do: they are what the validator checks and
+        // what a reader copies, so a build emitting a different version is a
+        // build whose output does not match its own documentation.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../schemas/examples/finding.valid.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let example: serde_json::Value = serde_json::from_str(&text).expect("example is not JSON");
+        assert_eq!(example["schema_version"].as_str(), Some(SCHEMA_VERSION));
     }
 }

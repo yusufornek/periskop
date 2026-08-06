@@ -34,7 +34,7 @@ use crate::engine::{bindings, bindings_go, bindings_java, bindings_ts, BindingTa
 use crate::language::Language;
 use crate::parser::ParsedFile;
 use crate::rules::model::{
-    Confidence as RuleConfidence, ExtractSpec, MatchKind, MatchSpec, RuleFile,
+    Confidence as RuleConfidence, ExtractRole, ExtractSpec, MatchKind, MatchSpec, RuleFile,
 };
 use crate::rules::CompiledRules;
 
@@ -298,11 +298,13 @@ fn evaluate<'a>(
         }
     }
 
-    // Set when the receiver resolves through a name two value bindings in this
-    // file disagreed about. Hoisted out of the block below because it survives
-    // the binding check: the receiver did resolve, it just resolved to one of two
-    // answers and the table cannot say which one this call site reads.
-    let mut receiver_is_contested = false;
+    // Set when the receiver resolved, but to an answer the file does not
+    // actually state. Two shapes reach it: a name two value bindings disagreed
+    // about, and a name only a star import could have supplied. Hoisted out of
+    // the block below because it survives the binding check: the receiver did
+    // resolve, and what is in doubt is whether it resolved to what this call
+    // site reads.
+    let mut receiver_is_uncertain = false;
 
     // A binding that does not resolve is not a weaker finding. It means the
     // receiver came from somewhere else entirely, so there is nothing to report.
@@ -333,7 +335,7 @@ fn evaluate<'a>(
         ) {
             return None;
         }
-        receiver_is_contested = table.is_contested(&root);
+        receiver_is_uncertain = table.is_contested(&root) || table.is_speculative(&root);
     }
 
     // No fallback to the file root. A query that captures neither anchor used to
@@ -360,7 +362,7 @@ fn evaluate<'a>(
     // only the table knows that. A rule that already declared `suspect` stays
     // there, and a reason a downgrade already recorded is not overwritten, since
     // the first one names a concrete field and this one names the receiver.
-    let (confidence, unresolved) = if receiver_is_contested {
+    let (confidence, unresolved) = if receiver_is_uncertain {
         (
             Confidence::Suspect,
             unresolved.or(Some(UnresolvedReason::UnsupportedPattern)),
@@ -389,17 +391,6 @@ fn evaluate<'a>(
     })
 }
 
-/// Rule fields whose value is a destination rather than a request detail.
-///
-/// Recognised by name because the rule schema has no way to say what a field
-/// means: `[extract]` gives a key and a place to read it from, and nothing else.
-/// Every rule set in the repository already uses exactly these two names, so the
-/// convention is described here rather than invented. A rule that spells its
-/// destination field something else loses the destination and keeps the finding,
-/// which is the safe direction; the request for a declared role on `[extract]`
-/// is filed against the rule schema owner in `hub/memory/interfaces.md`.
-const DESTINATION_FIELDS: [&str; 2] = ["base_url", "target_url"];
-
 /// Where the code says this call goes.
 ///
 /// Resolution runs a second time here rather than being threaded out of
@@ -418,10 +409,16 @@ fn declared_target(
     source: &str,
     constructors: &ConstructorIndex<'_>,
 ) -> Option<DeclaredTarget> {
-    for field in DESTINATION_FIELDS {
-        let Some(extract) = rule.extract.get(field) else {
+    // By declared role rather than by field name. The engine used to look for
+    // `base_url` and then `target_url`, so a rule that called its destination
+    // anything else kept its finding and lost its destination, with nothing red
+    // and nothing in the report to say a comparison had gone missing. The loader
+    // now refuses a rule with two destination fields, so the first hit is the
+    // only hit and the iteration order carries no meaning.
+    for extract in rule.extract.values() {
+        if extract.role != Some(ExtractRole::DestinationUrl) {
             continue;
-        };
+        }
         if let FieldResolution::Resolved(Some(written)) =
             resolve_field(extract, m, compiled, source, constructors)
         {

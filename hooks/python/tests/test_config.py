@@ -70,6 +70,50 @@ class LegacyOutputPathTest(unittest.TestCase):
         self.assertIsNone(config.load({}, ["/app/worker.py"]))
 
 
+class EntrypointHintTest(unittest.TestCase):
+    """The field is a name. A path in it is one machine leaking into a report."""
+
+    def _hint(self, environ, argv=("/app/worker.py",)):
+        environ = dict(environ)
+        environ.setdefault(config.EVENT_DIR, "/var/run/periskop")
+        return config.load(environ, list(argv), pid=1).entrypoint_hint
+
+    def test_the_operator_supplied_name_is_reduced_to_a_basename(self):
+        # Without this every event carries /srv/app, the report stops diffing
+        # against the same run on another host, and the schema's "never an
+        # absolute path" is broken by the hook that writes the field. The schema
+        # has no pattern for it, so no later stage would catch it.
+        self.assertEqual(
+            "worker.py",
+            self._hint({"PERISKOP_HOOK_ENTRYPOINT": "/srv/app/worker.py"}))
+
+    def test_an_operator_chosen_extension_survives(self):
+        # The name is theirs. argv[0] loses its .py because the interpreter
+        # chose that one, not the operator.
+        self.assertEqual(
+            "ingest.py", self._hint({"PERISKOP_HOOK_ENTRYPOINT": "ingest.py"}))
+        self.assertEqual("worker", self._hint({}))
+
+    def test_a_trailing_separator_is_read_the_way_the_other_hook_reads_it(self):
+        # os.path.basename answers "" here and Node's basename answers "app".
+        # One variable, two hooks, one hint: the divergence had to be closed in
+        # one direction, and keeping the operator's last word is that direction.
+        self.assertEqual(
+            "app", self._hint({"PERISKOP_HOOK_ENTRYPOINT": "/srv/app/"}))
+
+    def test_a_name_that_reduces_to_nothing_falls_back(self):
+        # An empty string is a valid value for this field, so it would be
+        # written and read as a process that named itself.
+        self.assertEqual(
+            "python", self._hint({"PERISKOP_HOOK_ENTRYPOINT": "/"}))
+        self.assertEqual(
+            "python", self._hint({"PERISKOP_HOOK_ENTRYPOINT": "   "}))
+
+    def test_the_name_is_bounded(self):
+        self.assertEqual(
+            64, len(self._hint({"PERISKOP_HOOK_ENTRYPOINT": "n" * 200})))
+
+
 class StreamNameTest(unittest.TestCase):
     def test_the_name_carries_the_language_the_pid_and_entropy(self):
         self.assertRegex(config.stream_name(1234),

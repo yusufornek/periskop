@@ -68,6 +68,34 @@ class StreamTest(unittest.TestCase):
         self.assertEqual(0, status["dropped_events_count"])
         self.assertEqual(1, status["written_events_count"])
 
+    def test_a_stream_taken_out_of_the_call_path_stops_claiming_to_be_active(self):
+        # The status used to be chosen by the caller, and every caller chose
+        # "active". A startup that opened the stream and then failed therefore
+        # left an "active" sidecar beside an empty stream, which a run reads as a
+        # process that was watched and made no calls: the shape of a clean
+        # result, produced by a hook that never reached the call path.
+        writer = EventWriter(self.path, capacity=16)
+        writer.declare()
+        writer.mark_disabled("install_failed")
+
+        with open(self.path + ".status.json", encoding="utf-8") as stream:
+            status = json.load(stream)
+        self.assertEqual("disabled", status["hook_status"])
+        self.assertEqual("install_failed", status["reason"])
+
+    def test_closing_a_disabled_stream_does_not_restore_the_claim(self):
+        # close() rewrites the sidecar, so the reason has to survive it or the
+        # last write puts "active" back on disk.
+        writer = EventWriter(self.path, capacity=16)
+        writer.declare()
+        writer.mark_disabled("install_failed")
+        writer.close()
+
+        with open(self.path + ".status.json", encoding="utf-8") as stream:
+            status = json.load(stream)
+        self.assertEqual("disabled", status["hook_status"])
+        self.assertEqual("install_failed", status["reason"])
+
     def test_the_status_document_is_the_one_the_collector_reads(self):
         # Property names, not just values. The node hook writes these six and
         # periskop-runtime-collector looks for them; a counter spelled

@@ -32,11 +32,18 @@
 # needs the destination resolved rather than matched, which is the extraction
 # work `target_url` is declared for.
 
+#
+# `rule_version` jumped a major without the pattern changing: the rule was named
+# `http-provider-endpoint` while its file was named `http-literal-endpoint`, and
+# `rule_id` is both the join key the gap catalogue and the benchmark use and an
+# input to `finding_id`. Correcting the name renames every finding this rule has
+# produced, which the major announces. Full reasoning in the python copy.
+
 schema_version = "1.0"
 language = "go"
 provider = "unknown"
-rule_id = "go.static.http-provider-endpoint"
-rule_version = "1.0.0"
+rule_id = "go.static.http-literal-endpoint"
+rule_version = "2.0.0"
 
 # The client library this rule accounts for, stated where a reader looks for the
 # coverage claim rather than left to be inferred from the binding blocks below.
@@ -122,7 +129,7 @@ capture = "fn"
 one_of = ["NewRequestWithContext"]
 
 [extract]
-target_url = { from = "url" }
+target_url = { from = "url", role = "destination_url" }
 
 [classify]
 egress_kind = "llm_chat"

@@ -294,6 +294,71 @@ class InstrumentedProcessTest(unittest.TestCase):
         self.assertEqual(1, len(self._read(legacy)))
 
 
+# Instrumentation fails after the stream has been opened. The import hook is
+# replaced before install() runs, so the failure lands exactly where the fail
+# open guard swallows it and a sidecar already exists on disk.
+_FAILED_INSTALL_SCRIPT = """
+import json, sys
+import periskop_hook
+from periskop_hook import importer
+
+
+def explode(targets, apply):
+    raise RuntimeError("instrumentation could not be installed")
+
+
+importer.install = explode
+sys.stdout.write(json.dumps(periskop_hook.install()))
+"""
+
+# An empty module of the name the hook uses to reach interpreter startup. Placed
+# ahead of the hook on the path, it keeps the startup install from running so
+# that the script below can run it with the failure already in place.
+_QUIET_SITECUSTOMIZE = "# deliberately does nothing\n"
+
+
+class FailedInstallationTest(unittest.TestCase):
+    """A stream nobody is filling must not leave a sidecar claiming otherwise."""
+
+    def setUp(self):
+        self.sandbox = _Sandbox()
+        self.sandbox.write("quiet/sitecustomize.py", _QUIET_SITECUSTOMIZE)
+        self.script = self.sandbox.write("runner.py", _FAILED_INSTALL_SCRIPT)
+        self.event_dir = self.sandbox.path("events")
+
+    def tearDown(self):
+        self.sandbox.remove()
+
+    def _run(self):
+        return _run(
+            self.script,
+            [self.sandbox.path("quiet"), support.HOOKS_PYTHON_DIR],
+            {"PERISKOP_EVENT_DIR": self.event_dir},
+        )
+
+    def test_a_startup_that_failed_leaves_a_disabled_sidecar(self):
+        # The collector reads the sidecar, never the dictionary the hook keeps in
+        # memory. Without this the pair on disk is an "active" status beside an
+        # empty stream, and a run reports a watched process that made no calls:
+        # indistinguishable from a clean result, and produced by a hook that was
+        # never in the call path. Spec section 5 asks for the opposite.
+        result = self._run()
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertNotEqual("active", json.loads(result.stdout)["hook_status"])
+
+        sidecars = glob.glob(os.path.join(self.event_dir, "*.status.json"))
+        self.assertEqual(1, len(sidecars), sidecars)
+        with open(sidecars[0], encoding="utf-8") as stream:
+            document = json.load(stream)
+
+        self.assertEqual("disabled", document["hook_status"])
+        self.assertEqual("install_failed", document["reason"])
+        # A fixed token from the hook's vocabulary, as the contract requires: the
+        # collector copies this value into a report.
+        self.assertEqual([], schema_check.validate(
+            document, support.hook_status_schema()))
+
+
 class PthLineTest(unittest.TestCase):
     """The primary path is one executable line; it has to be safe on its own."""
 

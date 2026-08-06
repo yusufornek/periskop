@@ -49,7 +49,7 @@ const PATTERN_HOSTS: ReadonlyArray<readonly [RegExp, string]> = [
  * against an observed one, so a table that knows `api.groq.com` in one language
  * and not in the other makes "the code says OpenAI, the wire says Groq" a
  * finding that appears in Node processes and never in Python ones. The two are
- * pinned against each other by `hooks/python/tests/hook-parity-vectors.json`.
+ * pinned against each other by `hooks/shared/hook-parity-vectors.json`.
  *
  * The table is copied into each hook rather than read from a shared data file
  * because a hook runs inside somebody else's process, where the rules directory

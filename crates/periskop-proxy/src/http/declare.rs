@@ -42,7 +42,17 @@ use crate::detect::DegradedReason;
 use super::errors::{ProxyError, Refusal};
 
 /// `finding.schema.json`'s own version, as ADR-006 fixes it: `MAJOR.MINOR`.
-const FINDING_SCHEMA_VERSION: &str = "1.2";
+///
+/// A second copy of `periskop_core::finding::SCHEMA_VERSION`, and it has to be
+/// one: this crate does not depend on the core, on purpose, because the record
+/// it writes is a `Value` rather than that crate's type. What it does not have
+/// to be is an independent claim. It said `1.2` while the core said `1.1` and
+/// the schema was at `1.3`, so a reader of a report could not tell which of the
+/// three it had been written against, and nothing anywhere was red.
+/// `the_version_this_crate_stamps_is_the_one_the_shipped_example_carries` holds
+/// this copy to `schemas/examples/finding.proxy.valid.json`, which is the
+/// example this crate's output is documented by.
+const FINDING_SCHEMA_VERSION: &str = "1.3";
 
 /// The version of the two rules below.
 ///

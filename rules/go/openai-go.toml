@@ -69,7 +69,7 @@ one_of = ["New", "NewStreaming"]
 [extract]
 model = { from = "args", keyword = "Model" }
 payload_ref = { from = "args", keyword = "Messages" }
-base_url = { from = "recv", constructor_keyword = "WithBaseURL" }
+base_url = { from = "recv", constructor_keyword = "WithBaseURL", role = "destination_url" }
 
 [classify]
 egress_kind = "llm_chat"

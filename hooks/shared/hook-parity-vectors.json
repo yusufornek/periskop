@@ -1,5 +1,5 @@
 {
-  "note": "Shared between the Python and Node hooks. One file, read by both test suites, because two copies would pin nothing: the failure this guards against is precisely the two implementations drifting apart. The same call recorded by both hooks derives one egress_event_id, so the collector keeps one record and discards the other; if the shapes differ, which one reaches the report is decided by nothing more meaningful than which record sorted first. It lives under hooks/python/tests/ only because that is a directory both hooks may read from today. A request to give it a home of its own, and a schema, is filed in hub/memory/interfaces.md.",
+  "note": "Shared between the Python and Node hooks. One file, read by both test suites, because two copies would pin nothing: the failure this guards against is precisely the two implementations drifting apart. The same call recorded by both hooks derives one egress_event_id, so the collector keeps one record and discards the other; if the shapes differ, which one reaches the report is decided by nothing more meaningful than which record sorted first. It lives in hooks/shared/ because neither side may own the file that measures the two of them: while it sat under hooks/python/tests/, the Node suite reached into the Python hook's test directory, so renaming a Python test directory would have silently taken the Node hook's parity gate with it, and either hook could have relaxed a vector its own suite still passed. hooks/shared/ belongs to neither implementation, and a change to it is visible to both. Adding a vector here is the cheapest way to lock a shared rule: write it once, and both suites fail until both hooks agree.",
   "field_paths": [
     {
       "name": "an ordinary chat completion",
@@ -118,8 +118,47 @@
       "payload": { "tools": [], "metadata": {}, "model": "m" },
       "paths": ["metadata", "model", "tools[]"],
       "truncated_depth": null
+    },
+    {
+      "name": "a body that cannot be walked is a gap, not a call that carried nothing",
+      "payload": "a body the hook cannot walk",
+      "paths": [],
+      "truncated_depth": 0
+    },
+    {
+      "name": "a body that really was empty is not dressed up as a gap",
+      "payload": {},
+      "paths": [],
+      "truncated_depth": null
+    },
+    {
+      "name": "a sequence at the root is walked, not declared unwalkable",
+      "payload": [{ "model": "m" }, { "model": "n" }],
+      "paths": ["[].model"],
+      "truncated_depth": null
     }
   ],
+  "key_vocabulary": {
+    "note": "The closed set of keys either hook may copy into a field path, after its own leak filter has run over the list. Both hooks keep their own copy of this vocabulary in code, and they have to: a hook runs inside somebody else's process, where the rules directory is not on disk and reading a file per request is work the budget does not have. What was missing was any contract the two copies answered to, so a key added to one hook and not the other went unnoticed until a report showed one shape in Node processes and another in Python ones. This list is that contract until schemas/ has a home for it. Widening the vocabulary means editing this list and both hooks in one change, which is the point: the edit that would previously have drifted now fails two suites.",
+    "allowed": [
+      "anthropic_version", "arguments", "betas", "cache_control",
+      "candidateCount", "category", "citations", "content", "contents", "data",
+      "description", "detail", "dimensions", "embedding", "encoding_format",
+      "enum", "extra_body", "extra_headers", "files", "frequency_penalty",
+      "function", "function_call", "functions", "generationConfig", "headers",
+      "image", "image_url", "inline_data", "input", "instructions", "items",
+      "json", "logit_bias", "logprobs", "max_completion_tokens",
+      "max_output_tokens", "max_tokens", "media_type", "message", "messages",
+      "metadata", "method", "mime_type", "modalities", "model", "n", "name",
+      "namespace", "parameters", "params", "parts", "presence_penalty",
+      "prompt", "properties", "required", "response_format", "role",
+      "safetySettings", "seed", "source", "stop", "stop_sequences", "stream",
+      "stream_options", "system", "systemInstruction", "temperature", "text",
+      "thinking", "threshold", "timeout", "tool_call_id", "tool_calls",
+      "tool_choice", "tools", "top_k", "top_k_results", "top_logprobs", "top_p",
+      "type", "url", "user", "vector"
+    ]
+  },
   "provider_ref": [
     { "host": "api.openai.com", "provider": "openai" },
     { "host": "API.OpenAI.COM", "provider": "openai" },

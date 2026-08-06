@@ -354,7 +354,7 @@ fn a_literal_provider_endpoint_produces_a_suspected_finding() {
     let hits = findings(&source, "HttpLiteralEndpoint.java");
     assert!(
         hits.iter().any(
-            |(rule_id, confidence)| rule_id == "java.static.http-provider-endpoint"
+            |(rule_id, confidence)| rule_id == "java.static.http-literal-endpoint"
                 && *confidence == Confidence::Suspect
         ),
         "expected a suspected finding, got {hits:?}"

@@ -28,7 +28,7 @@ one_of = ["create", "stream"]
 [extract]
 model = { from = "args", keyword = "model" }
 payload_ref = { from = "args", keyword = "messages" }
-base_url = { from = "recv", constructor_keyword = "base_url" }
+base_url = { from = "recv", constructor_keyword = "base_url", role = "destination_url" }
 
 [classify]
 egress_kind = "llm_chat"

@@ -24,12 +24,14 @@
 // call recorded by both derives one `egress_event_id`, so the collector keeps a
 // single record and discards the other. If the two produce different shapes,
 // which one reaches the report is decided by which record happened to sort
-// first. `hooks/python/tests/hook-parity-vectors.json` pins them against each
-// other and both test suites read it.
+// first. `hooks/shared/hook-parity-vectors.json` pins them against each other
+// and both test suites read that one file.
 //
-// No schema file describes this vocabulary yet, so these two copies are the
-// contract between them. A request for one is filed in
-// `hub/memory/interfaces.md`.
+// No schema file describes this vocabulary yet, but the two copies are no longer
+// answerable to nothing: `hooks/shared/hook-parity-vectors.json` carries the
+// admitted list and both suites check theirs against it entry for entry, so
+// widening it in one hook and not the other fails both. A request for the schema
+// file is filed in `hub/memory/interfaces.md`.
 
 const DYNAMIC_KEY = "<dyn>";
 
@@ -95,6 +97,21 @@ export interface FieldPathResult {
 function looksLikeContent(key: string): boolean {
   if (key.length === 0) return true;
   return LEAKY_KEY_PATTERNS.some((pattern) => pattern.test(key));
+}
+
+/**
+ * The vocabulary this hook will admit, sorted.
+ *
+ * Exported for the parity gate and for nothing else. The two hooks each hold
+ * their own copy of this list, which they must: a hook runs inside somebody
+ * else's process, where no rules directory is on disk and a file read per
+ * request is work the budget does not have. What the copies lacked was anything
+ * they both answered to, so a key added here and not to the Python hook decided
+ * what a report said by way of a sort order. `hooks/shared/` holds that list now
+ * and both suites check theirs against it.
+ */
+export function admittedKeys(): readonly string[] {
+  return [...SCHEMA_KEYS].filter((key) => maskKey(key) === key).sort();
 }
 
 /** Mask a key that is not part of a known request schema, or that looks like data. */
@@ -179,6 +196,17 @@ export function fieldPaths(body: unknown): FieldPathResult {
     emit(prefix);
   };
 
-  walk(body, "", 0);
+  if (Array.isArray(body) || isPlainObject(body)) {
+    walk(body, "", 0);
+  } else {
+    // A body that is neither a mapping nor a sequence has no field to name, and
+    // saying so is not the same as saying it had none. Returning an empty path
+    // list with nothing declared produced the record the schema reserves for a
+    // call that carried nothing, so a JSON body that parsed to a string or a
+    // number was reported as a call with no payload rather than as one whose
+    // shape could not be read. Depth zero is the stop `describeBody` already
+    // uses for every other body it could not walk.
+    stopAt(0);
+  }
   return { paths: [...paths].sort(), truncatedDepth };
 }

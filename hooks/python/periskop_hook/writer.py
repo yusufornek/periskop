@@ -61,6 +61,10 @@ class EventWriter(object):
         # watched for an hour; timing from the first event would report a minute
         # and turn fifty-nine minutes of evidence into nothing.
         self._observation_started_at = time.monotonic()
+        # None while the hook is in the call path. A fixed token once it is not,
+        # which is what `write_status` reads to decide what this process is
+        # allowed to claim about itself.
+        self._disabled_reason = None
         self.dropped_events_count = 0
         self.written_events_count = 0
 
@@ -97,7 +101,7 @@ class EventWriter(object):
         if directory:
             os.makedirs(directory, exist_ok=True)
         self._register_close()
-        self.write_status(ACTIVE, "")
+        self.write_status()
 
     def _register_close(self):
         """Arrange for the final flush and status write, exactly once."""
@@ -185,7 +189,7 @@ class EventWriter(object):
         # window nobody measured, which suppresses every claim those events were
         # collected to support. What the sidecar then holds is the window as of
         # the last flush: a lower bound, which can only understate the run.
-        failopen.run("writer.status", self.write_status, ACTIVE, "")
+        failopen.run("writer.status", self.write_status)
 
     def close(self):
         """Flush what is left and declare the run. Safe to call twice."""
@@ -196,18 +200,41 @@ class EventWriter(object):
         if thread is not None and thread.is_alive():
             thread.join(_JOIN_TIMEOUT_SECONDS)
         failopen.run("writer.close", self._drain_once)
-        failopen.run("writer.status", self.write_status, ACTIVE, "")
+        failopen.run("writer.status", self.write_status)
 
-    def write_status(self, status, reason):
+    def mark_disabled(self, reason):
+        """Take this stream out of the call path and say so on disk.
+
+        `reason` is a fixed token from the hook's own vocabulary, never free
+        text: the collector copies it into a report, and the status contract
+        pins the character set for exactly that reason.
+
+        Without this the sidecar was written as `active` from every call site,
+        so a startup that opened the stream and then failed before instrumenting
+        anything left an `active` document beside an empty stream. A run reading
+        that pair sees a process that was watched and made no calls, which is
+        the shape of a clean result and the one reading spec section 5 forbids.
+        The Node hook has derived its status from a disable reason since it was
+        written; this is the same statement in this language.
+        """
+        self._disabled_reason = reason
+        failopen.run("writer.status", self.write_status)
+
+    def write_status(self):
         """Sidecar declaring what this process observed, and what it lost.
 
         Contract: `schemas/hook-status.schema.json`. The property names are read
         back by `periskop-runtime-collector`; a counter spelled differently here
         is a counter that reaches nobody.
+
+        The status is derived rather than passed in. A caller that could choose
+        it could claim a hook was active while it was not, and every caller did
+        choose `active`.
         """
+        disabled = self._disabled_reason
         document = {
-            "hook_status": status,
-            "reason": reason,
+            "hook_status": ACTIVE if disabled is None else DISABLED,
+            "reason": "" if disabled is None else disabled,
             "dropped_events_count": self.dropped_events_count,
             "written_events_count": self.written_events_count,
             "failures": list(failopen.failures()),

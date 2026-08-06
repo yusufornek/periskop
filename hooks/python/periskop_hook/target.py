@@ -17,7 +17,8 @@ The classification table is identical to the one in
 compares a declared provider against an observed one, so a table that knows
 `api.groq.com` in one language and not in the other makes "the code says OpenAI,
 the wire says Groq" a finding that appears in Node processes and never in Python
-ones. `tests/hook-parity-vectors.json` pins the two tables against each other.
+ones. `hooks/shared/hook-parity-vectors.json` pins the two tables against each
+other.
 
 The table lives in each hook rather than in a shared data file because a hook
 runs inside somebody else's process, where the rules directory is not on disk

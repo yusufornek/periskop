@@ -66,6 +66,17 @@ pub struct DiscoveryOptions {
     pub max_file_bytes: u64,
     /// Honour `.gitignore`, `.ignore` and `.periskopignore`.
     pub respect_ignore_files: bool,
+    /// Directory names dropped from the walk whatever the ignore files say.
+    ///
+    /// Defaults to [`ALWAYS_EXCLUDED_DIRS`] and is a field rather than a
+    /// constant because the default is a guess about what a name means. `build`
+    /// and `dist` are output directories in most repositories and ordinary
+    /// source packages in some, so `src/build/pipeline.py` was dropped by name
+    /// alone with nothing anywhere saying it had been; `vendor` is third party
+    /// code that a Go binary actually ships, which is a different question from
+    /// "did the user write it". A caller who knows their own layout can now say
+    /// so instead of being overruled by a list compiled from other people's.
+    pub excluded_dirs: Vec<String>,
 }
 
 impl Default for DiscoveryOptions {
@@ -73,16 +84,26 @@ impl Default for DiscoveryOptions {
         Self {
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             respect_ignore_files: true,
+            excluded_dirs: ALWAYS_EXCLUDED_DIRS
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
         }
     }
 }
 
-/// Directories excluded regardless of ignore files.
+/// Directories excluded unless the caller says otherwise.
 ///
-/// These are not code the user wrote. Reporting a call site inside a vendored
-/// dependency as if it were the user's own is a false positive that erodes trust
-/// in every other finding in the report.
-const ALWAYS_EXCLUDED_DIRS: &[&str] = &[
+/// These are usually not code the user wrote. Reporting a call site inside a
+/// vendored dependency as if it were the user's own is a false positive that
+/// erodes trust in every other finding in the report.
+///
+/// "Usually" is the whole reason this is a default rather than a law, and why
+/// [`DiscoveryOptions::excluded_dirs`] exists: the list matches on a name, and a
+/// name is not a fact about what is inside. A tree excluded here leaves no trace
+/// in any coverage counter, so the caller who disagrees with the guess has to be
+/// able to say so.
+pub const ALWAYS_EXCLUDED_DIRS: &[&str] = &[
     ".git",
     ".hg",
     ".svn",
@@ -126,11 +147,14 @@ pub fn discover(root: &Path, options: &DiscoveryOptions) -> Discovery {
         builder.add_custom_ignore_filename(".periskopignore");
     }
 
-    builder.filter_entry(|entry| {
+    // Cloned because the walker keeps the predicate for the length of the walk
+    // and will not borrow from this frame.
+    let excluded: Vec<String> = options.excluded_dirs.clone();
+    builder.filter_entry(move |entry| {
         !entry
             .file_name()
             .to_str()
-            .is_some_and(|name| ALWAYS_EXCLUDED_DIRS.contains(&name))
+            .is_some_and(|name| excluded.iter().any(|e| e == name))
     });
 
     let mut discovery = Discovery::default();
@@ -457,6 +481,44 @@ mod tests {
             found.skipped.is_empty(),
             "excluded paths must not inflate the coverage statement"
         );
+    }
+
+    #[test]
+    fn a_source_package_named_like_an_output_directory_is_dropped_by_default() {
+        // The defect this records rather than hides. `build` is an output
+        // directory in most repositories and a package name in some, and the
+        // default list cannot tell them apart: the call in `src/build/` leaves
+        // no finding, no skipped entry and no counter, so a reader of the report
+        // sees a clean scan of a tree that was never opened.
+        let tree = TempTree::new("named-build");
+        tree.write("src/build/pipeline.py", b"pass\n");
+
+        let found = discover(tree.path(), &DiscoveryOptions::default());
+
+        assert!(found.files.is_empty());
+        assert!(found.skipped.is_empty());
+    }
+
+    #[test]
+    fn a_caller_can_narrow_the_exclusions_and_get_its_own_source_back() {
+        // The half of the defect that is fixable here: the list is a default,
+        // so a project that keeps sources under `build/` can say so.
+        let tree = TempTree::new("narrowed");
+        tree.write("src/build/pipeline.py", b"pass\n");
+        tree.write("node_modules/pkg/index.js", b"module.exports = 1;\n");
+
+        let options = DiscoveryOptions {
+            excluded_dirs: ALWAYS_EXCLUDED_DIRS
+                .iter()
+                .filter(|name| **name != "build")
+                .map(|name| (*name).to_owned())
+                .collect(),
+            ..DiscoveryOptions::default()
+        };
+        let found = discover(tree.path(), &options);
+
+        let paths: Vec<_> = found.files.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(paths, [PathBuf::from("src/build/pipeline.py")]);
     }
 
     #[test]

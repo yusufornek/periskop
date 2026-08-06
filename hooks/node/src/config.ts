@@ -5,6 +5,8 @@
 // into the image. A config file would add a read, a parse and a failure mode to
 // process startup for no gain.
 
+import { basename } from "node:path";
+
 import { entrypointName } from "./process-gate";
 
 /**
@@ -67,6 +69,28 @@ function firstNonEmpty(...values: ReadonlyArray<string | undefined>): string | u
   return undefined;
 }
 
+/**
+ * The name an operator gave this process, reduced to a basename.
+ *
+ * The rule belongs to the field rather than to where the value came from. The
+ * event schema says `entrypoint_hint` is never an absolute path and carries no
+ * pattern to enforce it, so `PERISKOP_HOOK_ENTRYPOINT=/srv/app/worker.js` would
+ * put one machine's deployment layout into every event this process writes, and
+ * nothing further down the pipeline would reject the record. The Python hook
+ * applies the same reduction to the same variable.
+ *
+ * The extension survives, unlike in `entrypointName`: an operator who wrote one
+ * chose it, while the one on `argv[1]` was chosen by whoever named the file.
+ */
+function explicitEntrypoint(env: NodeJS.ProcessEnv): string | undefined {
+  const raw = env["PERISKOP_HOOK_ENTRYPOINT"]?.trim();
+  if (raw === undefined || raw.length === 0) return undefined;
+  const name = basename(raw);
+  // A value of "/srv/app/" reduces to nothing, which would be written as an
+  // empty string and read as a process that named itself. Fall through instead.
+  return name.length === 0 ? undefined : name;
+}
+
 function positiveInteger(raw: string | undefined, fallback: number): number {
   if (raw === undefined) return fallback;
   const value = Number.parseInt(raw, 10);
@@ -80,8 +104,9 @@ export function readConfig(
   return {
     outputDir: firstNonEmpty(env[EVENT_DIR], env[LEGACY_EVENT_DIR]),
     // An operator can name the process; otherwise the script names itself. The
-    // event schema rejects absolute paths here, so only a basename is ever used.
-    entrypointHint: env["PERISKOP_HOOK_ENTRYPOINT"] ?? entrypointName(argv),
+    // event schema rejects absolute paths here, so only a basename is ever used,
+    // whichever of the two the name came from.
+    entrypointHint: explicitEntrypoint(env) ?? entrypointName(argv),
     bodyParseLimitBytes: positiveInteger(
       env["PERISKOP_HOOK_BODY_LIMIT"],
       DEFAULT_BODY_PARSE_LIMIT,

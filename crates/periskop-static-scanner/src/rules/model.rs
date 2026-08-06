@@ -128,6 +128,30 @@ pub struct ExtractSpec {
     pub keyword: Option<String>,
     #[serde(default)]
     pub constructor_keyword: Option<String>,
+    /// What the engine is to do with this field, as opposed to what to call it.
+    ///
+    /// Absent for every field the report only carries through. Present on the
+    /// one field the reconciliation join reads as a destination, because that
+    /// one the engine has to find, and until now it found it by looking for two
+    /// hardcoded names. A rule that spelled its destination `endpoint` or
+    /// `api_base` produced a finding with no destination and no error: the join
+    /// then had nothing to compare and `target_drift` could not be derived, all
+    /// because a rule author picked a different word.
+    #[serde(default)]
+    pub role: Option<ExtractRole>,
+}
+
+/// The jobs a rule can hand a field, as opposed to the names it can give one.
+///
+/// One member today. Kept as a closed enum rather than an open string so that a
+/// misspelled role is a load error instead of a field that quietly does nothing,
+/// which is the failure this whole mechanism exists to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractRole {
+    /// Where the call goes. Read into `declared_target`, which the
+    /// reconciliation join compares against what a hook or the wire observed.
+    DestinationUrl,
 }
 
 #[derive(Debug, Clone, Deserialize)]
