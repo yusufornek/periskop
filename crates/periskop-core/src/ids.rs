@@ -8,8 +8,14 @@
 //! Two consequences follow, and both are enforced here rather than left to
 //! convention. Line and column numbers never enter a hash input. Wall clock values
 //! never do either, so the same tree scanned twice produces the same identities.
+//!
+//! A third follows from the same principle and is enforced here too: a hash input
+//! is the composed (NFC) form of the text, never the bytes as they happened to
+//! arrive. See [`short_hash`].
 
 use std::fmt;
+
+use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
 
 use crate::error::{Error, Result};
 
@@ -78,16 +84,51 @@ define_id!(FindingId, "fnd_", "finding");
 define_id!(ScanRunId, "scan_", "scan run");
 define_id!(ReportId, "rpt_", "report");
 
+/// Feeds one field into the hasher in its canonical composed form.
+///
+/// `data-model.md` section 2 fixes the canonical serialisation of identity inputs
+/// as UTF-8 NFC, and this is the single place the whole workspace honours it. The
+/// reason is not tidiness: Unicode lets one visible string be written as several
+/// byte sequences, so a symbol name spelled with a composed `é` and the same name
+/// spelled as `e` plus a combining accent would produce two identities for one
+/// thing. That failure is silent. Nothing rejects either spelling; the report
+/// simply carries two entries where one call exists, or a declared point and its
+/// observation never join, and the coverage statement has nothing to report
+/// because nothing failed. macOS is the concrete source: paths read back from the
+/// filesystem arrive decomposed, so a path that enters an identity on a Mac and
+/// the same path typed into a rule file already differ today.
+///
+/// The quick check is not an optimisation detour: it is the common case. Every
+/// ASCII input, which is nearly all of them, is already NFC and is hashed without
+/// allocating. Only text that is not certainly normalised pays for a rewrite.
+fn update_normalized(hasher: &mut blake3::Hasher, field: &str) {
+    match is_nfc_quick(field.chars()) {
+        IsNormalized::Yes => {
+            hasher.update(field.as_bytes());
+        }
+        // `Maybe` means the quick check cannot decide from character properties
+        // alone, so it is treated exactly like `No`: compose and hash that.
+        IsNormalized::No | IsNormalized::Maybe => {
+            let composed: String = field.nfc().collect();
+            hasher.update(composed.as_bytes());
+        }
+    }
+}
+
 /// Hashes a domain tag together with an ordered list of fields.
 ///
 /// The tag keeps identity spaces apart: two different kinds of thing that happen
 /// to carry the same field values must not collide.
+///
+/// Fields are normalised to NFC on the way in (see [`update_normalized`]). The
+/// domain tag is not, because it is a literal fixed in this file and in the
+/// contract, never text that reached us from a filesystem or a payload.
 pub fn short_hash(domain_tag: &str, fields: &[&str]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(domain_tag.as_bytes());
     for field in fields {
         hasher.update(&[FIELD_SEPARATOR]);
-        hasher.update(field.as_bytes());
+        update_normalized(&mut hasher, field);
     }
     let digest = hasher.finalize();
     let mut out = String::with_capacity(SHORT_HASH_CHARS);
@@ -160,6 +201,79 @@ mod tests {
         assert_ne!(
             short_hash("fi/v1", &same_fields),
             short_hash("ep/v1", &same_fields)
+        );
+    }
+
+    /// The same symbol name in the two spellings Unicode allows for it.
+    ///
+    /// Composed: U+00E9. Decomposed: `e` followed by U+0301 COMBINING ACUTE
+    /// ACCENT. They render identically and a reader cannot tell them apart, which
+    /// is why an identity that distinguishes them fails silently.
+    const COMPOSED_SYMBOL: &str = "hesapla_ödeme_bilgisi_é";
+    const DECOMPOSED_SYMBOL: &str = "hesapla_o\u{0308}deme_bilgisi_e\u{0301}";
+
+    #[test]
+    fn two_spellings_of_one_name_derive_one_identity() {
+        // The bytes really do differ; without that this test would pass for the
+        // wrong reason and prove nothing about normalisation.
+        assert_ne!(COMPOSED_SYMBOL.as_bytes(), DECOMPOSED_SYMBOL.as_bytes());
+        assert_eq!(
+            short_hash("ep/v1", &["src/billing.py", COMPOSED_SYMBOL, "shape", "0"]),
+            short_hash(
+                "ep/v1",
+                &["src/billing.py", DECOMPOSED_SYMBOL, "shape", "0"]
+            ),
+        );
+    }
+
+    #[test]
+    fn a_decomposed_path_and_a_composed_one_join() {
+        // The macOS case: the scanner reads the path back from the filesystem
+        // decomposed while a rule file or a hook carries it composed. If these
+        // two derived different identities, a declared point and its observation
+        // would never reconcile and nothing would report the miss.
+        let composed =
+            derive_finding_id("declared_egress_point", "declared", "ödeme/v.py", "r").unwrap();
+        let decomposed = derive_finding_id(
+            "declared_egress_point",
+            "declared",
+            "o\u{0308}deme/v.py",
+            "r",
+        )
+        .unwrap();
+        assert_eq!(composed, decomposed);
+    }
+
+    #[test]
+    fn normalisation_does_not_merge_genuinely_different_text() {
+        // NFC composes; it does not fold case, strip accents or collapse
+        // lookalikes. A guard against reaching for NFKC or a casefold later,
+        // which would merge two different symbols into one identity.
+        assert_ne!(
+            short_hash("fi/v1", &["ödeme"]),
+            short_hash("fi/v1", &["odeme"]),
+        );
+        assert_ne!(
+            short_hash("fi/v1", &["Ödeme"]),
+            short_hash("fi/v1", &["ödeme"]),
+        );
+    }
+
+    #[test]
+    fn ascii_identities_are_unchanged_by_normalisation() {
+        // Pins the blast radius of the change that introduced NFC. ASCII is
+        // already NFC, so every identity derived from ASCII inputs, which is
+        // nearly all of them, keeps the value it had before.
+        assert_eq!(
+            derive_finding_id(
+                "declared_egress_point",
+                "declared",
+                "ep_3f0a91c7d4e28b56",
+                "python.static.openai-chat-completions",
+            )
+            .unwrap()
+            .as_str(),
+            "fnd_eec43f700d0666e0",
         );
     }
 

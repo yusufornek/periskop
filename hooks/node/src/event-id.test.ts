@@ -17,6 +17,17 @@ import { join } from "node:path";
 
 import { egressEventId, type CallShape } from "./event-id";
 
+// A non-ASCII module name, written composed. Pinned so that a hook which stops
+// composing to NFC, or composes to something else, goes red here instead of
+// quietly deriving a second identity for one call.
+const COMPOSED_SPELLING = [
+  "\u00f6neri_istemcisi",
+  "sohbet.olustur",
+  "api.openai.com",
+  "/v1/sohbet/tamamlama",
+  "ee_a4863895e4a520cd",
+] as const;
+
 /** module, operation, host_id, path_template, expected identity. */
 const CROSS_LANGUAGE_VECTORS: ReadonlyArray<
   readonly [string, string, string, string, string]
@@ -32,7 +43,18 @@ const CROSS_LANGUAGE_VECTORS: ReadonlyArray<
   ["node:https", "post", "api.openai.com", "/v1/embeddings", "ee_2918520a58b33a3c"],
   ["httpx", "http.post", "api.cohere.com", "", "ee_c896832e544738fd"],
   ["requests", "http.get", "unknown", "", "ee_be40919f69bdf6d4"],
+  COMPOSED_SPELLING,
 ];
+
+// The same four fields as the last vector above, with the module written in the
+// decomposed spelling: `o` plus U+0308 COMBINING DIAERESIS instead of U+00F6.
+// The two render identically and a reader cannot tell them apart.
+const DECOMPOSED_SPELLING: CallShape = {
+  module: "o\u0308neri_istemcisi",
+  operation: "sohbet.olustur",
+  hostId: "api.openai.com",
+  pathTemplate: "/v1/sohbet/tamamlama",
+};
 
 const BASE: CallShape = {
   module: "openai",
@@ -106,6 +128,29 @@ test("every named field changes the identity", () => {
   for (const candidate of changed) {
     assert.notEqual(egressEventId(BASE), egressEventId(candidate), JSON.stringify(candidate));
   }
+});
+
+test("two spellings of one name derive one identity", () => {
+  // The failure this guards is silent. Nothing rejects either spelling;
+  // reconciliation simply never joins the two records, the call is reported
+  // twice, and no coverage entry says so.
+  const composed = shapeOf(COMPOSED_SPELLING);
+  assert.notEqual(
+    composed.module,
+    DECOMPOSED_SPELLING.module,
+    "the two spellings must really differ in bytes",
+  );
+  assert.equal(egressEventId(composed), egressEventId(DECOMPOSED_SPELLING));
+});
+
+test("composition does not merge genuinely different names", () => {
+  // NFC composes; it does not fold case or strip accents. A guard against
+  // reaching for NFKC or a casefold later, which would give two different
+  // modules one identity.
+  assert.notEqual(
+    egressEventId({ module: "öneri", operation: "op", hostId: "host", pathTemplate: "/p" }),
+    egressEventId({ module: "oneri", operation: "op", hostId: "host", pathTemplate: "/p" }),
+  );
 });
 
 test("the separator keeps field boundaries unambiguous", () => {

@@ -427,15 +427,12 @@ mod tests {
     use super::*;
 
     /// The contract example from `schemas/examples/egress-event.valid.json`,
-    /// with the identity corrected.
+    /// copied verbatim.
     ///
-    /// The example carries `ee_5b18c30af7924de6`, which is not what the
-    /// derivation the schema calls normative produces for these fields. The
-    /// example was written by hand before any implementation existed, and the
-    /// mismatch went unnoticed for as long as nothing recomputed the identity.
-    /// This crate cannot edit `schemas/`, so the correction is filed as a
-    /// contract request in `hub/memory/interfaces.md`; the value below is what
-    /// all three implementations of the derivation agree on.
+    /// It once carried a hand written identity that the normative derivation did
+    /// not reproduce, and the mismatch survived for as long as nothing recomputed
+    /// it. The example has since been corrected, so this copy and the file agree;
+    /// `the_contract_example_round_trips` is what keeps them agreeing.
     const CONTRACT_EXAMPLE: &str = r#"{
       "schema_version": "1.0",
       "egress_event_id": "ee_3dfe316616cd47b4",
@@ -584,6 +581,64 @@ mod tests {
             base.egress_event_id,
             sample_with("api.openai.com", "embeddings.create").egress_event_id
         );
+    }
+
+    /// The cross language vector for a non-ASCII call shape.
+    ///
+    /// Duplicated verbatim in `hooks/python/tests/test_event_id.py` and
+    /// `hooks/node/src/event-id.test.ts`. The duplication is the point: the
+    /// collector and the two hooks each hardcode this string and each compute
+    /// it, so a side that stops composing to NFC goes red here instead of
+    /// deriving a second identity for one call and letting reconciliation report
+    /// that call twice.
+    const COMPOSED_MODULE: &str = "öneri_istemcisi";
+    const DECOMPOSED_MODULE: &str = "o\u{0308}neri_istemcisi";
+    const NON_ASCII_IDENTITY: &str = "ee_a4863895e4a520cd";
+
+    #[test]
+    fn the_non_ascii_cross_language_vector_is_reproduced() {
+        let id = derive_egress_event_id(
+            COMPOSED_MODULE,
+            "sohbet.olustur",
+            "api.openai.com",
+            Some("/v1/sohbet/tamamlama"),
+        )
+        .unwrap();
+        assert_eq!(id.as_str(), NON_ASCII_IDENTITY);
+    }
+
+    #[test]
+    fn two_spellings_of_one_module_name_derive_one_identity() {
+        assert_ne!(COMPOSED_MODULE.as_bytes(), DECOMPOSED_MODULE.as_bytes());
+        let composed = derive_egress_event_id(
+            COMPOSED_MODULE,
+            "sohbet.olustur",
+            "api.openai.com",
+            Some("/v1/sohbet/tamamlama"),
+        )
+        .unwrap();
+        let decomposed = derive_egress_event_id(
+            DECOMPOSED_MODULE,
+            "sohbet.olustur",
+            "api.openai.com",
+            Some("/v1/sohbet/tamamlama"),
+        )
+        .unwrap();
+        assert_eq!(composed, decomposed);
+    }
+
+    #[test]
+    fn a_record_written_in_the_decomposed_spelling_is_accepted() {
+        // The case that matters at the boundary: a hook that did not compose
+        // writes the decomposed name and the composed identity. Validation
+        // re-derives, so the record is accepted and joins the composed one
+        // rather than becoming a second observation of the same call.
+        let mut event = sample();
+        event.library.module = DECOMPOSED_MODULE.to_owned();
+        event.operation = "sohbet.olustur".to_owned();
+        event.target.path_template = Some("/v1/sohbet/tamamlama".to_owned());
+        event.egress_event_id = NON_ASCII_IDENTITY.to_owned();
+        assert!(event.validate().is_ok());
     }
 
     #[test]

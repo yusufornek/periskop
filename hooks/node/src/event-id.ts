@@ -16,11 +16,19 @@
 // periskop-runtime-collector all produce the same bytes for the same call, and
 // event-id.test.ts pins that with a vector shared across the languages.
 //
-// Deliberately not normalised to NFC. data-model.md mentions NFC for the general
-// canonical serialisation, but the collector that reads these files hashes the
-// UTF-8 bytes as given, and matching the reader byte for byte is what the
-// identity is for. Every field that takes part is ASCII in practice: a module
-// name, a lower cased operation, a host and a path template.
+// Fields are composed to NFC before they are hashed, which data-model.md section
+// 2 fixes for every identity input and which periskop_core::ids applies on the
+// Rust side. Unicode lets one visible string be written as several byte
+// sequences, so a module or host spelled with a composed accent and the same name
+// spelled with a combining one would give one call two identities. That
+// divergence is silent: neither record is rejected, reconciliation simply never
+// joins them, and the coverage statement has nothing to report because nothing
+// failed. The fields are usually ASCII, where NFC is a no-op, but "usually" is
+// not an invariant a deduplication key can rest on, and the hook cannot see which
+// spelling the module that called it was written with.
+//
+// String.prototype.normalize is part of the language, so this costs the hook no
+// dependency.
 
 import { blake3Short } from "./blake3";
 
@@ -43,7 +51,7 @@ export function egressEventId(shape: CallShape): string {
   const fields = [shape.module, shape.operation, shape.hostId, shape.pathTemplate ?? ""];
   const chunks = [Buffer.from(DOMAIN_TAG, "utf8")];
   for (const field of fields) {
-    chunks.push(FIELD_SEPARATOR, Buffer.from(field, "utf8"));
+    chunks.push(FIELD_SEPARATOR, Buffer.from(field.normalize("NFC"), "utf8"));
   }
   return `${ID_PREFIX}${blake3Short(Buffer.concat(chunks))}`;
 }

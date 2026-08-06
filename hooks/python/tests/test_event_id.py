@@ -28,7 +28,18 @@ CROSS_LANGUAGE_VECTORS = (
      "/v1/embeddings", "ee_2918520a58b33a3c"),
     ("httpx", "http.post", "api.cohere.com", "", "ee_c896832e544738fd"),
     ("requests", "http.get", "unknown", "", "ee_be40919f69bdf6d4"),
+    # A non-ASCII module name, written composed. Pinned so that a hook which
+    # stops composing to NFC, or composes to something else, goes red here
+    # instead of quietly deriving a second identity for one call.
+    ("öneri_istemcisi", "sohbet.olustur", "api.openai.com",
+     "/v1/sohbet/tamamlama", "ee_a4863895e4a520cd"),
 )
+
+# The same four fields as the last vector above, with the module written in the
+# decomposed spelling: `o` plus U+0308 COMBINING DIAERESIS instead of U+00F6.
+# The two render identically and a reader cannot tell them apart.
+DECOMPOSED_SPELLING = ("o\u0308neri_istemcisi", "sohbet.olustur",
+                       "api.openai.com", "/v1/sohbet/tamamlama")
 
 
 class DerivationTest(unittest.TestCase):
@@ -72,6 +83,27 @@ class DerivationTest(unittest.TestCase):
         for candidate in changed:
             self.assertNotEqual(
                 event_id.derive(*base), event_id.derive(*candidate), candidate)
+
+    def test_two_spellings_of_one_name_derive_one_identity(self):
+        """The failure this guards is silent, which is why it is pinned here.
+
+        Nothing rejects either spelling. Reconciliation simply never joins the
+        two records, the call is reported twice, and no coverage entry says so.
+        """
+        composed = CROSS_LANGUAGE_VECTORS[-1][:4]
+        self.assertNotEqual(composed[0], DECOMPOSED_SPELLING[0],
+                            "the two spellings must really differ in bytes")
+        self.assertEqual(
+            event_id.derive(*composed), event_id.derive(*DECOMPOSED_SPELLING))
+
+    def test_composition_does_not_merge_genuinely_different_names(self):
+        # NFC composes; it does not fold case or strip accents. A guard against
+        # reaching for NFKC or a casefold later, which would give two different
+        # modules one identity.
+        self.assertNotEqual(
+            event_id.derive("öneri", "op", "host", "/p"),
+            event_id.derive("oneri", "op", "host", "/p"),
+        )
 
     def test_the_separator_keeps_field_boundaries_unambiguous(self):
         # Without a separator these two would serialise to the same bytes.

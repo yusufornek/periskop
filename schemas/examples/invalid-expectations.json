@@ -9,6 +9,13 @@
       "rationale": "kind is declared_egress_point, which forces source to be declared. This exercises the conditional block, not just field presence."
     },
     {
+      "file": "finding.absolute-path.invalid.json",
+      "schema": "finding.schema.json",
+      "violates": "location.path must be relative to the repository root",
+      "expected_error_contains": "/location/path",
+      "rationale": "The field carried the sentence \"Absolute paths are rejected\" from 1.0 and nothing rejected them, so a producer writing /Users/ada/projects/billing/services/customer.py validated. Three consequences, each one enough on its own. The same tree scanned on two machines stops producing byte identical reports, which is the determinism the whole report format rests on. A home directory name is copied into a document that gets archived and shared with people who were never meant to learn it. And path is the key a reader follows back into the repository, so a rooted one resolves on exactly one machine and is noise everywhere else. The example uses a POSIX root; the pattern also rejects backslash roots and Windows drive letters, because the producer need not have run the operating system the reader is on."
+    },
+    {
       "file": "finding.operation-case.invalid.json",
       "schema": "finding.schema.json",
       "violates": "operation spelling is fixed by the event contract",

@@ -178,7 +178,9 @@
         },
         "path": {
           "type": "string",
-          "description": "Relative to the repository root. Absolute paths are rejected."
+          "minLength": 1,
+          "pattern": "^(?![\\\\/])(?![A-Za-z]:)",
+          "description": "Relative to the repository root. Absolute paths are rejected, and the pattern is what does the rejecting: the sentence alone was here for four revisions while every producer was free to write /Users/ada/proj/services/customer.py. Three reasons, and each one is enough. A report is meant to be byte identical for the same tree on two machines, and an absolute path makes that impossible. It names somebody home directory in a document that gets archived and shared. And the path is the join key a reader follows back into the repository, so a rooted one resolves on exactly one machine. The pattern rejects POSIX roots, backslash roots and Windows drive letters, because the process that produced the finding need not have run the same operating system as the one reading it."
         },
         "span": {
           "type": "object",

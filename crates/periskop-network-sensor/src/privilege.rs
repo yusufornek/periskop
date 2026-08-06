@@ -57,9 +57,28 @@ pub enum SensorUnavailable {
     MissingCapability,
     /// The kernel cannot host the programs, for example with no BTF. Remedy: a
     /// newer kernel, or the pcap path once it exists.
+    ///
+    /// Strictly about what the kernel *can* do. It never covers a question this
+    /// build failed to ask; see [`Self::PrivilegeStateUnreadable`].
     KernelUnsupported,
     /// The privileges were there and this build carries no loader to use them.
     LoaderNotBuilt,
+    /// The machine could not be asked what this process holds.
+    ///
+    /// `/proc/self/status` was missing, unreadable, or carried no capability
+    /// line this build recognises. Remedy: mount procfs, or run somewhere the
+    /// process can read its own status; granting capabilities does not help,
+    /// and neither does a newer kernel.
+    ///
+    /// A separate value rather than a shade of one of the four above, because
+    /// each of those names a remedy and all three plausible substitutes send the
+    /// operator somewhere useless. `missing_capability` says grant `CAP_BPF` to a
+    /// process that may already hold it. `kernel_unsupported` says the kernel is
+    /// too old, when a perfectly capable kernel is simply not being asked. An
+    /// unreadable privilege state is not a kernel limit; it is our own blind
+    /// spot, and a report that cannot tell the two apart sends somebody to
+    /// upgrade a kernel that was never the problem.
+    PrivilegeStateUnreadable,
 }
 
 impl SensorUnavailable {
@@ -70,6 +89,7 @@ impl SensorUnavailable {
             Self::MissingCapability => "missing_capability",
             Self::KernelUnsupported => "kernel_unsupported",
             Self::LoaderNotBuilt => "loader_not_built",
+            Self::PrivilegeStateUnreadable => "privilege_state_unreadable",
         }
     }
 }
@@ -190,15 +210,15 @@ pub struct Grant {
 /// support. A machine can fail more than one at once, and an operator reading
 /// the report needs the same answer every time.
 ///
-/// **Why an unreadable status is not `missing_capability`.** That label names a
-/// permission the operator can grant, and this build used to write it whenever
-/// `/proc/self/status` could not be read: on a Linux host with no procfs
-/// mounted, the report told an operator to grant `CAP_BPF` to a process that
-/// may well have held it already, and no amount of granting would have changed
-/// the outcome. The vocabulary is closed at four values by ADR-014, so this
-/// build picks the one whose remedy is not wrong rather than inventing a fifth;
-/// the request for a value that names the cause exactly is filed in
-/// `hub/memory/interfaces.md`.
+/// **Why an unreadable status has a value of its own.** It used to be reported
+/// as `missing_capability`, which told an operator on a host with no procfs to
+/// grant `CAP_BPF` to a process that may well have held it already. It was then
+/// reported as `kernel_unsupported`, which is wrong in the other direction: a
+/// perfectly capable kernel gets blamed for a question this build could not ask,
+/// and the remedy that label implies is a kernel upgrade that changes nothing.
+/// The vocabulary now carries [`SensorUnavailable::PrivilegeStateUnreadable`]
+/// (ADR-014 section 8.6a), and `kernel_unsupported` keeps its narrow meaning:
+/// what the kernel cannot do, never what we failed to read.
 pub fn evaluate(
     platform: SensorPlatformClass,
     privileges: &Privileges,
@@ -208,7 +228,7 @@ pub fn evaluate(
     }
 
     if privileges.statement == PrivilegeStatement::Unreadable {
-        return Err(SensorUnavailable::KernelUnsupported);
+        return Err(SensorUnavailable::PrivilegeStateUnreadable);
     }
 
     let by_capability = privileges.cap_bpf && privileges.cap_perfmon;
@@ -340,13 +360,17 @@ mod tests {
         // not recognise) used to answer `missing_capability`, which sends the
         // operator to grant `CAP_BPF` and `CAP_PERFMON`. The process may hold
         // both already; nothing about granting them makes the file readable, so
-        // the remedy the report names cannot work.
+        // the remedy the report names cannot work. It then answered
+        // `kernel_unsupported`, which names a remedy that is wrong in the other
+        // direction: upgrading a kernel that was never the obstacle. BTF is
+        // present here precisely so that a `kernel_unsupported` answer cannot be
+        // explained away as a kernel limit.
         let unreadable = Privileges::from_proc_status("", true);
         assert_eq!(unreadable.statement, PrivilegeStatement::Unreadable);
         assert_eq!(
             evaluate(SensorPlatformClass::LinuxEbpf, &unreadable),
-            Err(SensorUnavailable::KernelUnsupported),
-            "an unreadable privilege statement was reported as a permission the operator can grant"
+            Err(SensorUnavailable::PrivilegeStateUnreadable),
+            "an unreadable privilege statement was reported as something an operator can act on"
         );
     }
 
@@ -394,6 +418,27 @@ mod tests {
         assert_eq!(privileges.effective_uid, None);
         assert_eq!(
             evaluate(SensorPlatformClass::LinuxEbpf, &privileges),
+            Err(SensorUnavailable::PrivilegeStateUnreadable)
+        );
+    }
+
+    #[test]
+    fn an_unreadable_privilege_state_is_not_a_kernel_limit() {
+        // The two conditions are separable and the labels must separate them. A
+        // machine with BTF and no readable status is not the same machine as one
+        // with a readable status and no BTF, and an operator handed one label for
+        // both would fix whichever of the two the label happened to name.
+        let no_statement = Privileges::from_proc_status("", true);
+        let no_btf = Privileges {
+            btf_available: false,
+            ..capable()
+        };
+        assert_eq!(
+            evaluate(SensorPlatformClass::LinuxEbpf, &no_statement),
+            Err(SensorUnavailable::PrivilegeStateUnreadable)
+        );
+        assert_eq!(
+            evaluate(SensorPlatformClass::LinuxEbpf, &no_btf),
             Err(SensorUnavailable::KernelUnsupported)
         );
     }
@@ -416,6 +461,7 @@ mod tests {
             SensorUnavailable::MissingCapability,
             SensorUnavailable::KernelUnsupported,
             SensorUnavailable::LoaderNotBuilt,
+            SensorUnavailable::PrivilegeStateUnreadable,
         ];
         let labels: std::collections::BTreeSet<&str> = reasons.iter().map(|r| r.as_str()).collect();
         assert_eq!(labels.len(), reasons.len());

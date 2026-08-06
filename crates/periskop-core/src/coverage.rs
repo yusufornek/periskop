@@ -14,13 +14,34 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnparsedReason {
-    /// Not a code surface at all. The only reason excluded from the unparsed ratio.
+    /// Bytes that are not text at all: an image, an archive, a compiled object.
+    /// Excluded from the unparsed ratio.
     SkippedBinary,
+    /// Text, and not a code surface: a lock file, a minified vendor bundle, a
+    /// generated artifact, a `.md` next to the source.
+    ///
+    /// Split from [`Self::SkippedBinary`] because the two are not the same fact
+    /// and an operator reading a coverage statement acts on them differently. It
+    /// is also not [`Self::UnknownLanguage`], which is the dangerous confusion in
+    /// the other direction: a file in a language this build does not recognise
+    /// may well hold the call the scan was meant to find, and it stays in the
+    /// ratio. This one never held one, so it does not. Excluded from the ratio.
+    SkippedNonCode,
     SkippedTooLarge,
     UnknownLanguage,
     /// Language recognised, no grammar bound. This is where a phase boundary
     /// becomes visible to the user instead of disappearing.
     NoGrammar,
+    /// The bytes could not be decoded as text: not valid UTF-8, or a byte order
+    /// mark for an encoding this build does not read.
+    ///
+    /// Separate from [`Self::IoError`], which says the file could not be reached,
+    /// and from [`Self::ParseError`], which says the grammar saw the text and
+    /// rejected it. Folding it into either would send the operator to the wrong
+    /// remedy: a permissions fix for a file that reads fine, or a grammar bug
+    /// report for text no grammar ever saw. Counted in the ratio, because a file
+    /// this build could not decode is a file whose calls it did not see.
+    EncodingError,
     ParseError,
     PartialParse,
     ParseTimeout,
@@ -30,12 +51,19 @@ pub enum UnparsedReason {
 impl UnparsedReason {
     /// Whether this reason counts toward the unparsed ratio.
     ///
-    /// Binary files are excluded on purpose. Counting them would turn the ratio
-    /// into a function of how many images a repository happens to contain: adding
-    /// a hundred screenshots would cross a policy threshold without a single line
-    /// of code becoming less visible.
+    /// Only the two reasons that name a file which was never a code surface are
+    /// excluded. Counting them would turn the ratio into a function of how many
+    /// images and lock files a repository happens to contain: adding a hundred
+    /// screenshots would cross a policy threshold without a single line of code
+    /// becoming less visible.
+    ///
+    /// The line is drawn at "was there ever code here", not at "did we manage to
+    /// read it". A file in an unrecognised language is counted, because it may
+    /// hold exactly the call the scan exists to find; excluding it would let the
+    /// blind spot grow while the ratio stayed clean, which is the failure this
+    /// whole block exists to prevent.
     pub fn counts_toward_ratio(self) -> bool {
-        !matches!(self, Self::SkippedBinary)
+        !matches!(self, Self::SkippedBinary | Self::SkippedNonCode)
     }
 }
 
@@ -178,10 +206,12 @@ mod tests {
     #[test]
     fn binary_files_stay_out_of_the_ratio() {
         assert!(!UnparsedReason::SkippedBinary.counts_toward_ratio());
+        assert!(!UnparsedReason::SkippedNonCode.counts_toward_ratio());
         for reason in [
             UnparsedReason::SkippedTooLarge,
             UnparsedReason::UnknownLanguage,
             UnparsedReason::NoGrammar,
+            UnparsedReason::EncodingError,
             UnparsedReason::ParseError,
             UnparsedReason::PartialParse,
             UnparsedReason::ParseTimeout,

@@ -35,7 +35,7 @@
     },
     "unparsed_files": {
       "type": "array",
-      "description": "Sorted by path ascending, at build time rather than at serialization time.",
+      "description": "Sorted by path ascending, at build time rather than at serialization time. Two of the reasons are excluded from the unparsed ratio and the rest are counted: skipped_binary and skipped_non_code name files that were never a code surface, so counting them would make the ratio a function of how many images or lock files a repository happens to contain, and a policy threshold over it would trip on a hundred added screenshots without one line of code becoming less visible. Everything else is counted, including unknown_language: a file in a language this build does not recognise may well contain a call this scan was supposed to find, and excluding it would let the blind spot grow while the ratio stayed clean.",
       "items": {
         "type": "object",
         "required": ["path", "reason"],
@@ -45,9 +45,11 @@
           "reason": {
             "enum": [
               "skipped_binary",
+              "skipped_non_code",
               "skipped_too_large",
               "unknown_language",
               "no_grammar",
+              "encoding_error",
               "parse_error",
               "partial_parse",
               "parse_timeout",

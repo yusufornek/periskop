@@ -16,12 +16,21 @@ reports one call as two observations. The python hook, the node hook and
 `periskop-runtime-collector` all produce the same bytes for the same call, and
 `tests/test_event_id.py` pins that with a vector shared across the languages.
 
-Deliberately not normalised to NFC. `data-model.md` mentions NFC for the general
-canonical serialisation, but the collector that reads these files hashes the
-UTF-8 bytes as given, and matching the reader byte for byte is what the identity
-is for. Every field that takes part is ASCII in practice: a module name, a lower
-cased operation, a host and a path template.
+Fields are composed to NFC before they are hashed, which `data-model.md` section 2
+fixes for every identity input and which `periskop_core::ids` applies on the Rust
+side. Unicode lets one visible string be written as several byte sequences, so a
+module or host spelled with a composed accent and the same name spelled with a
+combining one would give one call two identities. That divergence is silent:
+neither record is rejected, reconciliation simply never joins them, and the
+coverage statement has nothing to report because nothing failed. The fields are
+usually ASCII, where NFC is a no-op, but "usually" is not an invariant a
+deduplication key can rest on, and the hook cannot see which spelling the module
+that called it was written with.
+
+`unicodedata` is in the standard library, so this costs the hook no dependency.
 """
+
+import unicodedata
 
 from .blake3 import blake3_short
 
@@ -36,8 +45,14 @@ _FIELD_SEPARATOR = b"\x1f"
 
 
 def _field(value):
-    """An absent or null field hashes as the empty string, as the schema says."""
-    return b"" if value is None else str(value).encode("utf-8")
+    """An absent or null field hashes as the empty string, as the schema says.
+
+    Present values are composed to NFC first, so two spellings of one name reach
+    the hasher as the same bytes.
+    """
+    if value is None:
+        return b""
+    return unicodedata.normalize("NFC", str(value)).encode("utf-8")
 
 
 def derive(module, operation, host_id, path_template):

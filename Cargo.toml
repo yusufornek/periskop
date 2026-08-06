@@ -161,6 +161,16 @@ tokio = { version = "1.41", default-features = false, features = [
 ] }
 toml = "0.9"
 streaming-iterator = "0.1"
+# Canonical composition of identity inputs (ADR-017, `data-model.md` section 2).
+# Two spellings of the same text must not become two identities: a Turkish symbol
+# name written as composed `é` and as `e` plus a combining accent looks identical
+# on screen and hashes differently, so a call declared in one file and observed by
+# a hook would fail to reconcile with nothing in the report to say why. Hand
+# writing NFC is not the cheaper option: it needs the Unicode composition and
+# canonical ordering tables, which is a data set that has to track every Unicode
+# release, and getting it subtly wrong reintroduces exactly the divergence the
+# normalisation exists to remove.
+unicode-normalization = "0.1"
 # Clears private key bytes from the buffers this workspace owns. The signing key
 # type from `ed25519-dalek` clears itself on drop; the seed and the text form of
 # a key file are ours, so clearing them is ours too.
