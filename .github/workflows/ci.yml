@@ -844,22 +844,31 @@ jobs:
       # cargo-audit needs no configuration file at all, so there is nothing here
       # that can be silently wrong about its own syntax.
       #
-      # The version is a `^0.21` requirement rather than an exact pin: the newest
-      # patch of a scanner is the one worth having, while the minor is held
-      # because the step below parses this tool's JSON and a shape change under a
-      # floating version would be read as "nothing found".
+      # A prebuilt binary rather than `cargo install`, and the first two runs of
+      # this job are the argument.
       #
-      # `--locked` is deliberately absent, and the first run of this job is why.
-      # It failed with "unsupported CVSS version: 4.0" while loading the advisory
-      # database, which is not a finding about this repository at all: the
-      # database had published an advisory in a format the `rustsec` version
-      # pinned in cargo-audit's own lockfile could not parse, so every advisory
-      # became unreadable and the job reported a failure that says nothing about
-      # our dependencies. A scanner has to track the data it reads. Resolving the
-      # tool's dependencies fresh keeps the parser current while the version
-      # requirement keeps the output shape the step below depends on.
+      # Built from source with `--locked`, the tool loads the advisory database
+      # through the `rustsec` version pinned in its own lockfile, and that
+      # version failed on "unsupported CVSS version: 4.0". The database had
+      # published an advisory in a format the pinned parser does not read, so
+      # every advisory became unreadable at once and the job failed while saying
+      # nothing at all about this repository. That is the worse half of a red
+      # gate: it carries no information, and the cheapest way to make it green is
+      # to stop believing it.
+      #
+      # Built from source without `--locked`, the resolver picks current
+      # dependencies and one of them wants a newer rustc than the toolchain this
+      # workspace pins. Both failures come from compiling the scanner against our
+      # toolchain, so the scanner is not compiled here at all.
+      #
+      # The version floats because a scanner has to track the data it reads. What
+      # a floating version could break is the JSON the next step parses, and that
+      # is why the step after this one refuses a report whose shape it does not
+      # recognise instead of reading an unfamiliar document as "nothing found".
       - name: Install cargo-audit
-        run: cargo install cargo-audit --version "^0.21"
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
 
       # Both committed lockfiles. `crates/periskop-ebpf-object` declares an empty
       # `[workspace]` table and is its own workspace root, so no path from the
