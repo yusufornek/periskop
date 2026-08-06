@@ -897,3 +897,84 @@ fn walk(value: &serde_json::Value, keys: &mut Vec<String>, strings: &mut Vec<Str
         _ => {}
     }
 }
+
+/// Three connections opened back to back to one destination by one process.
+///
+/// The fixture the `D-24/T15` (b) spike is written around. Each connection gets
+/// its own ephemeral source port, which is what the kernel does and what puts a
+/// different `flow_id` on every one of them.
+fn three_connections(host: &str, provider: &str) -> Vec<Flow> {
+    vec![
+        connection(host, provider, FlowScope::InScope, 54_321),
+        connection(host, provider, FlowScope::InScope, 54_322),
+        connection(host, provider, FlowScope::InScope, 54_323),
+    ]
+}
+
+#[test]
+fn measures_whether_reconciliation_joins_per_flow_or_per_conversation() {
+    // `D-24/T15` (b). The question is not a preference, it is a fact readable
+    // off this code, and the two answers lead to two different contract changes:
+    // per flow means `flow_id` is a unit of evidence and what is missing is a
+    // second identity for the conversation; per conversation means the ephemeral
+    // port in the `flow_id` hash is already surplus and removing it is a MAJOR
+    // change. Three counters answer it together, so all three are read here.
+    let unexplained_flows = vec![
+        unexplained(FlowScope::InScope, 54_321),
+        unexplained(FlowScope::InScope, 54_322),
+        unexplained(FlowScope::InScope, 54_323),
+    ];
+    let outcome = run_full(
+        vec![point(EP_ONE, "api.openai.com", "chat.completions.create")],
+        the_declared_call(),
+        unexplained_flows,
+        ReconcileSettings::default(),
+    );
+
+    // (i) One finding, not three. The three records are folded into one episode
+    // by destination and process, so the accusation is made once about the
+    // conversation rather than once per socket.
+    let unmatched: Vec<&Finding> = outcome
+        .findings
+        .iter()
+        .filter(|f| f.kind == Kind::UnmatchedWireTraffic)
+        .collect();
+    assert_eq!(unmatched.len(), 1, "{:?}", kinds_of(&outcome));
+
+    // (iii) The denominator still counts every socket. The join folding three
+    // into one does not make two of them disappear from the coverage statement,
+    // and a reader comparing the finding count against this number is reading
+    // two different units on purpose.
+    let wire = outcome
+        .wire
+        .expect("a run with a sensor states its buckets");
+    assert_eq!(wire.in_scope_flows, 3);
+    assert_eq!(wire.total(), 3);
+}
+
+#[test]
+fn measures_whether_the_volume_counter_reads_three_connections_as_one() {
+    // `D-24/T15` (b), second counter. If the volume rule summed per flow it
+    // would compare 2048 bytes against the calls three times; if it sums per
+    // conversation it compares 6144 once. The two produce different findings
+    // from identical traffic, so the answer decides whether the ephemeral port
+    // has any part in what a reader is shown.
+    let outcome = run_full(
+        vec![point(EP_ONE, "api.openai.com", "chat.completions.create")],
+        the_declared_call(),
+        three_connections("api.openai.com", "openai"),
+        ReconcileSettings::default().with_volume_band(VolumeBand::declared(5_000, 30_000).unwrap()),
+    );
+
+    let anomalies: Vec<&Finding> = outcome
+        .findings
+        .iter()
+        .filter(|f| f.kind == Kind::VolumeAnomaly)
+        .collect();
+    assert_eq!(anomalies.len(), 1, "{:?}", kinds_of(&outcome));
+
+    let wire = outcome
+        .wire
+        .expect("a run with a sensor states its buckets");
+    assert_eq!(wire.in_scope_flows, 3);
+}

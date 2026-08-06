@@ -298,6 +298,12 @@ fn evaluate<'a>(
         }
     }
 
+    // Set when the receiver resolves through a name two value bindings in this
+    // file disagreed about. Hoisted out of the block below because it survives
+    // the binding check: the receiver did resolve, it just resolved to one of two
+    // answers and the table cannot say which one this call site reads.
+    let mut receiver_is_contested = false;
+
     // A binding that does not resolve is not a weaker finding. It means the
     // receiver came from somewhere else entirely, so there is nothing to report.
     if let Some(binding) = &spec.binding {
@@ -327,6 +333,7 @@ fn evaluate<'a>(
         ) {
             return None;
         }
+        receiver_is_contested = table.is_contested(&root);
     }
 
     // No fallback to the file root. A query that captures neither anchor used to
@@ -346,6 +353,21 @@ fn evaluate<'a>(
     let start = anchor.start_position();
     let end = anchor.end_position();
     let (confidence, unresolved) = classify(rule, m, compiled, source, constructors, faults);
+    // Applied after the rule's own downgrades and independently of them, because
+    // this is not something a rule can declare. The rule matched correctly: the
+    // name it asked about does resolve into the package it named. What is in
+    // doubt is whether the winning binding is the one this call site reads, and
+    // only the table knows that. A rule that already declared `suspect` stays
+    // there, and a reason a downgrade already recorded is not overwritten, since
+    // the first one names a concrete field and this one names the receiver.
+    let (confidence, unresolved) = if receiver_is_contested {
+        (
+            Confidence::Suspect,
+            unresolved.or(Some(UnresolvedReason::UnsupportedPattern)),
+        )
+    } else {
+        (confidence, unresolved)
+    };
 
     Some(CallSite {
         range: anchor.byte_range(),

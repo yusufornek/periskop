@@ -301,7 +301,7 @@ fn shared_identities(flows: &[Flow]) -> u64 {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::flow::tests::{five_tuple, process};
+    use crate::flow::fixtures::{five_tuple, process};
     use crate::flow::{
         FiveTuple, Mechanism, ProcessAttribution, ProcessRecord, Proto, ResolvedHostSource,
         SniSource,

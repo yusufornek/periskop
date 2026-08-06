@@ -65,10 +65,10 @@ fn collect_import(node: Node<'_>, source: &str, table: &mut BindingTable) {
 
     match node.child_by_field_name("name") {
         Some(name) if name.kind() == "package_identifier" => {
-            table.bind(text(name, source), module);
+            table.bind_import(text(name, source), module);
         }
         Some(_) => {}
-        None => table.bind(package_name(&module), module),
+        None => table.bind_import(package_name(&module), module),
     }
 }
 
@@ -171,7 +171,7 @@ fn bind_constructed(name: Node<'_>, value: Node<'_>, source: &str, table: &mut B
     let Some(module) = table.resolve(&text(operand, source)).map(str::to_owned) else {
         return;
     };
-    table.bind(
+    table.bind_value(
         text(name, source),
         format!("{module}.{}", text(field, source)),
     );

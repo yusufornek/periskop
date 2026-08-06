@@ -329,6 +329,90 @@ fn scanning_the_same_source_twice_gives_the_same_result() {
     assert_eq!(scan(source, "a.py"), scan(source, "a.py"));
 }
 
+/// Two classes in one file, each holding a different provider in `self.client`.
+///
+/// The shape KG-013 names in its last sentence. Every real service package has
+/// it: one class talks to one vendor, the class beside it talks to another, and
+/// both spell the field the way every Python class spells it.
+const TWO_CLASSES_ONE_FIELD_NAME: &str = "import anthropic\n\
+                                          import openai\n\
+                                          \n\
+                                          class Summarizer:\n\
+                                          \x20   def __init__(self):\n\
+                                          \x20       self.client = anthropic.Anthropic()\n\
+                                          \x20   def run(self, text):\n\
+                                          \x20       return self.client.messages.create(model='m', messages=text)\n\
+                                          \n\
+                                          class Translator:\n\
+                                          \x20   def __init__(self):\n\
+                                          \x20       self.client = openai.OpenAI()\n\
+                                          \x20   def run(self, text):\n\
+                                          \x20       return self.client.chat.completions.create(model='m', messages=text)\n";
+
+#[test]
+fn a_field_name_two_classes_disagree_about_is_never_reported_as_confirmed() {
+    // FIX-9/04c. The binding table is one flat namespace per file, so `self.client`
+    // holds one path however many classes write it, and whichever assignment the
+    // walk reached last answers for both call sites. The failure is not a missed
+    // finding: both calls are reported, one of them names a vendor the class it
+    // sits in never talks to, and it says `confirmed` while doing it. A confident
+    // wrong provider is worse than silence, because silence is countable.
+    //
+    // The engine cannot tell which of the two the call site reads without a scope
+    // it does not carry, so neither may claim a structural fact.
+    let hits = scan(TWO_CLASSES_ONE_FIELD_NAME, "service.py");
+    let confirmed: Vec<&(String, Confidence)> = hits
+        .iter()
+        .filter(|(_, c)| *c == Confidence::Confirmed)
+        .collect();
+    assert!(
+        confirmed.is_empty(),
+        "two classes bind self.client to different providers, so no finding on that \
+         name can name a provider as fact; got {confirmed:?} out of {hits:?}"
+    );
+}
+
+#[test]
+fn a_field_name_two_classes_disagree_about_reaches_the_coverage_statement() {
+    // The other half, and the reason a downgrade alone is not enough. `suspect`
+    // tells a reader the claim is weak; it does not tell them which claim or why,
+    // and the coverage statement is the one channel that does. Without this the
+    // ambiguity is legible only to someone who already read the source.
+    let (compiled, rules) = python_rules();
+    let parsed = parse_as("service.py", TWO_CLASSES_ONE_FIELD_NAME, Language::Python).unwrap();
+    let result = detect(&parsed, &compiled, &rules);
+
+    assert!(!result.findings.is_empty(), "the calls are still reported");
+    let recorded: Vec<&String> = result
+        .unresolved_targets
+        .iter()
+        .map(|t| &t.egress_point_id)
+        .collect();
+    for finding in &result.findings {
+        let reference = finding.refs.first().expect("a finding carries a reference");
+        assert!(
+            recorded.contains(&&reference.ref_id),
+            "{} rests on a contested name and is missing from unresolved_targets {recorded:?}",
+            finding.finding_id
+        );
+    }
+}
+
+#[test]
+fn a_field_name_only_one_class_binds_stays_confirmed() {
+    // The negative case that keeps the downgrade from swallowing the ordinary
+    // file. Two classes, two field names, nothing contested: both findings are
+    // structural facts and neither weakens.
+    let source = TWO_CLASSES_ONE_FIELD_NAME.replace("self.client = openai", "self.llm = openai");
+    let source = source.replace("self.client.chat", "self.llm.chat");
+    let hits = scan(&source, "service.py");
+    assert_eq!(hits.len(), 2, "both calls are still found: {hits:?}");
+    assert!(
+        hits.iter().all(|(_, c)| *c == Confidence::Confirmed),
+        "distinct field names are not contested: {hits:?}"
+    );
+}
+
 #[test]
 fn an_unknown_import_is_reported_as_unclaimed() {
     // "We have no detector for this" and "there is nothing here" are different

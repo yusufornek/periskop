@@ -69,7 +69,7 @@ fn collect_import(node: Node<'_>, source: &str, table: &mut BindingTable) {
             // `import OpenAI from 'openai'`: the default export.
             "identifier" => {
                 let local = text(child, source);
-                table.bind(local, format!("{module}.default"));
+                table.bind_import(local, format!("{module}.default"));
             }
             // `import { OpenAI as Client } from 'openai'`
             "import_specifier" => {
@@ -81,7 +81,7 @@ fn collect_import(node: Node<'_>, source: &str, table: &mut BindingTable) {
                     .child_by_field_name("alias")
                     .map(|a| text(a, source))
                     .unwrap_or_else(|| symbol.clone());
-                table.bind(local, format!("{module}.{symbol}"));
+                table.bind_import(local, format!("{module}.{symbol}"));
             }
             // `import * as openai from 'openai'`
             "namespace_import" => {
@@ -89,7 +89,7 @@ fn collect_import(node: Node<'_>, source: &str, table: &mut BindingTable) {
                     .children(&mut inner)
                     .find(|n| n.kind() == "identifier")
                 {
-                    table.bind(text(name, source), module.clone());
+                    table.bind_import(text(name, source), module.clone());
                 }
             }
             _ => {
@@ -125,7 +125,11 @@ fn collect_declaration(node: Node<'_>, source: &str, table: &mut BindingTable) {
         };
         let module = string_literal_text(literal, source);
         table.record_module(&module);
-        table.bind(text(name, source), module);
+        // A value binding rather than an import one, even though what it carries
+        // is a module. `require` sits in a declaration, so the name belongs to
+        // whichever scope wrote it, and two scopes requiring different modules
+        // into one name is the same collision an instantiation makes.
+        table.bind_value(text(name, source), module);
     }
 }
 
@@ -211,7 +215,7 @@ fn bind_instantiation(key: String, value: Node<'_>, source: &str, table: &mut Bi
         _ => None,
     };
     if let Some(path) = resolved {
-        table.bind(key, path);
+        table.bind_value(key, path);
     }
 }
 

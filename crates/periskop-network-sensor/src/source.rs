@@ -408,7 +408,7 @@ impl KernelEvents for ScriptedKernel {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::flow::tests::five_tuple;
+    use crate::flow::fixtures::five_tuple;
     use crate::flow::{ProcessAttribution, SniSource};
     use crate::kernel::event::{ConnectEvent, KernelBatch, KernelEvent, KernelProcess};
     use crate::kernel::key::tests::key;

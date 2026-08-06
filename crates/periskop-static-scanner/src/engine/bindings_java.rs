@@ -99,7 +99,7 @@ fn collect_import(
     // coverage it does not need to: both answer "which library did this file
     // reach for".
     table.record_module(container);
-    table.bind(member.to_owned(), path);
+    table.bind_import(member.to_owned(), path);
 }
 
 /// `OpenAIClient client = ...`, and the field form of the same statement.
@@ -133,7 +133,7 @@ fn bind_declaration(node: Node<'_>, source: &str, table: &mut BindingTable, wild
                 resolve_type_name(&root, table, wildcards)
             });
         if let Some(path) = resolved {
-            table.bind(text(name, source), path);
+            table.bind_value(text(name, source), path);
         }
     }
 }
@@ -154,7 +154,7 @@ fn bind_parameter(node: Node<'_>, source: &str, table: &mut BindingTable, wildca
         return;
     };
     if let Some(path) = resolve_type_name(&declared, table, wildcards) {
-        table.bind(text(name, source), path);
+        table.bind_value(text(name, source), path);
     }
 }
 
@@ -173,7 +173,10 @@ fn bind_qualified_receiver(node: Node<'_>, source: &str, table: &mut BindingTabl
     if let Some((container, _)) = path.rsplit_once('.') {
         table.record_module(container);
     }
-    table.bind(path.clone(), path);
+    // Bound under the path it is written as, so the key and the value are always
+    // the same string and two occurrences can never disagree. It is file level
+    // knowledge in the same sense an import is: the spelling carries the package.
+    table.bind_import(path.clone(), path);
 }
 
 /// Turns a type name as written into the path it came from.

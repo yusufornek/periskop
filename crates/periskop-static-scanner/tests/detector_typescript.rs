@@ -242,3 +242,23 @@ fn renaming_the_client_does_not_change_the_finding_identity() {
     assert!(!original.is_empty());
     assert_eq!(original, renamed);
 }
+
+#[test]
+fn two_classes_disagreeing_about_a_field_name_lose_the_confirmed_claim() {
+    // The JavaScript half of FIX-9/04c. `this.client` is one key per file, so the
+    // class that talks to OpenAI and the class that talks to Anthropic share it,
+    // and whichever the walk bound last answered for both. The calls are real and
+    // stay reported; what they may no longer do is name a vendor as fact.
+    let source = "import Anthropic from '@anthropic-ai/sdk';\n\
+                  import OpenAI from 'openai';\n\
+                  class Summarizer {\n  private client = new Anthropic();\n\
+                  \x20 run(t: unknown) { return this.client.messages.create({ model: 'm', messages: t }); }\n}\n\
+                  class Translator {\n  private client = new OpenAI();\n\
+                  \x20 run(t: unknown) { return this.client.chat.completions.create({ model: 'm', messages: t }); }\n}\n";
+    let hits = scan(source, "service.ts", Language::TypeScript);
+    assert!(!hits.is_empty(), "both calls are still reported");
+    assert!(
+        hits.iter().all(|(_, c)| *c == Confidence::Suspect),
+        "a contested receiver cannot carry a confirmed provider: {hits:?}"
+    );
+}

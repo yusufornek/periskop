@@ -116,7 +116,7 @@ pub fn derive_flow_id(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::flow::tests::{five_tuple, full_observation};
+    use crate::flow::fixtures::{five_tuple, full_observation};
     use crate::flow::{Flow, Mechanism};
     use crate::flow::{Proto, SniSource};
     use crate::observation::Observation;

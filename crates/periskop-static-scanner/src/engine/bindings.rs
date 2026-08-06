@@ -20,8 +20,19 @@
 //! never answer for each other. The file boundary still holds: a field assigned
 //! in another file or inherited from a base class is out of reach, and that
 //! remains catalogued rather than guessed at.
+//!
+//! The table is one namespace per file, and that is where the last honest thing
+//! it can say lives. Imports belong to the file, so a flat key is the right model
+//! for them. A value binding does not: `self.client` written in one class and
+//! `self.client` written in the class below it are two different names that
+//! happen to be spelled alike, and a table with no scope to hang them on keeps
+//! whichever it saw last. What follows from that is not a missed call, it is a
+//! reported call carrying another vendor's name, at `confirmed`. Silence is
+//! countable and a confident wrong answer is not, so the table remembers which
+//! names two value bindings disagreed about and the engine refuses to state a
+//! provider as fact for any receiver rooted at one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tree_sitter::Node;
 
@@ -57,12 +68,47 @@ pub struct BindingTable {
     /// Modules the file imported, whether or not anything was bound from them.
     /// Used to report a library nobody has a detector for.
     imported_modules: Vec<String>,
+    /// Names that two value bindings in this file gave different paths.
+    ///
+    /// The entry survives even though `resolved` keeps only one of the paths,
+    /// because the useful fact is not which one won: it is that the winner
+    /// answers for call sites that never read it.
+    contested: BTreeSet<String>,
 }
 
 impl BindingTable {
-    /// Binds a local name to a fully qualified path.
-    pub fn bind(&mut self, local: String, path: String) {
+    /// Binds a name an import introduced.
+    ///
+    /// Module scope is file scope in every grammar this engine parses, so the
+    /// flat key is the correct model here and a second import writing the same
+    /// name is not a disagreement about scope. `import a.b` and `import a.c`
+    /// both bind the root `a` and neither is wrong about it.
+    pub fn bind_import(&mut self, local: String, path: String) {
         self.resolved.insert(local, path);
+    }
+
+    /// Binds a name to the value an assignment, declaration or parameter gave it.
+    ///
+    /// Separate from [`Self::bind_import`] because this is the kind of binding a
+    /// file wide table gets wrong. A value binding belongs to the function or
+    /// class it was written in; this table has no scope to key it on, so two of
+    /// them writing one name collapse into one entry. Recording the collision is
+    /// what turns that from an invisible wrong answer into a stated limit.
+    pub fn bind_value(&mut self, local: String, path: String) {
+        if self.resolved.get(&local).is_some_and(|held| *held != path) {
+            self.contested.insert(local.clone());
+        }
+        self.resolved.insert(local, path);
+    }
+
+    /// Whether more than one value binding wrote `name`, with different answers.
+    ///
+    /// A caller that resolves through a contested name got an answer this table
+    /// cannot stand behind, and the only correct response is to weaken the claim
+    /// and say so rather than to drop it: the call is real, its destination is
+    /// one of two, and the reader needs both of those facts.
+    pub fn is_contested(&self, name: &str) -> bool {
+        self.contested.contains(name)
     }
 
     /// Records that the file imported a module, whether or not anything bound.
@@ -150,8 +196,8 @@ fn collect_import(node: Node<'_>, source: &str, table: &mut BindingTable) {
                 let path = text(child, source);
                 // `import a.b.c` binds the root name, matching Python semantics.
                 let local = path.split('.').next().unwrap_or(&path).to_owned();
-                table.imported_modules.push(path.clone());
-                table.resolved.insert(local, path);
+                table.record_module(&path);
+                table.bind_import(local, path);
             }
             "aliased_import" => {
                 let (Some(name), Some(alias)) = (
@@ -161,8 +207,8 @@ fn collect_import(node: Node<'_>, source: &str, table: &mut BindingTable) {
                     continue;
                 };
                 let path = text(name, source);
-                table.imported_modules.push(path.clone());
-                table.resolved.insert(text(alias, source), path);
+                table.record_module(&path);
+                table.bind_import(text(alias, source), path);
             }
             _ => {}
         }
@@ -179,7 +225,7 @@ fn collect_import_from(node: Node<'_>, source: &str, table: &mut BindingTable) {
         return;
     };
     let module = text(module_node, source);
-    table.imported_modules.push(module.clone());
+    table.record_module(&module);
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -189,9 +235,7 @@ fn collect_import_from(node: Node<'_>, source: &str, table: &mut BindingTable) {
         match child.kind() {
             "dotted_name" => {
                 let symbol = text(child, source);
-                table
-                    .resolved
-                    .insert(symbol.clone(), format!("{module}.{symbol}"));
+                table.bind_import(symbol.clone(), format!("{module}.{symbol}"));
             }
             "aliased_import" => {
                 let (Some(name), Some(alias)) = (
@@ -201,9 +245,7 @@ fn collect_import_from(node: Node<'_>, source: &str, table: &mut BindingTable) {
                     continue;
                 };
                 let symbol = text(name, source);
-                table
-                    .resolved
-                    .insert(text(alias, source), format!("{module}.{symbol}"));
+                table.bind_import(text(alias, source), format!("{module}.{symbol}"));
             }
             _ => {}
         }
@@ -254,7 +296,7 @@ fn collect_assignment(node: Node<'_>, source: &str, table: &mut BindingTable) {
     };
 
     if let Some(path) = constructed {
-        table.resolved.insert(target, path);
+        table.bind_value(target, path);
     }
 }
 
@@ -470,6 +512,49 @@ mod tests {
         );
         assert_eq!(t.resolve("client"), None);
         assert!(t.satisfies("self.client", "openai", &["OpenAI".to_owned()]));
+    }
+
+    #[test]
+    fn two_classes_writing_one_field_name_leave_it_contested() {
+        // The flat namespace, seen from inside. One of the two paths is kept and
+        // the other is gone; what this records is that the survivor is not the
+        // only answer, which is the part a call site needs to be told.
+        let t = table_for(
+            "import anthropic\nimport openai\n\
+             class A:\n    def __init__(self):\n        self.client = anthropic.Anthropic()\n\
+             class B:\n    def __init__(self):\n        self.client = openai.OpenAI()\n",
+        );
+        assert!(t.is_contested("self.client"));
+    }
+
+    #[test]
+    fn one_binding_is_never_contested() {
+        let t = table_for("from openai import OpenAI\nclient = OpenAI()\n");
+        assert!(!t.is_contested("client"));
+        assert!(!t.is_contested("OpenAI"));
+    }
+
+    #[test]
+    fn rebinding_a_name_to_the_same_path_is_not_a_disagreement() {
+        // Two classes constructing the same client is the ordinary shape of a
+        // service module. Nothing about it is ambiguous, and treating repetition
+        // as conflict would weaken half the findings in such a file for nothing.
+        let t = table_for(
+            "from openai import OpenAI\n\
+             class A:\n    def __init__(self):\n        self.client = OpenAI()\n\
+             class B:\n    def __init__(self):\n        self.client = OpenAI()\n",
+        );
+        assert!(!t.is_contested("self.client"));
+    }
+
+    #[test]
+    fn two_imports_writing_one_root_name_are_not_contested() {
+        // `import a.b` and `import a.c` both bind the root `a`, and neither is
+        // wrong about what `a` means. Module scope is file scope, so the flat key
+        // is the right model here and the collision is an artefact of storing the
+        // dotted path under the root rather than a disagreement in the source.
+        let t = table_for("import openai.types\nimport openai.resources\n");
+        assert!(!t.is_contested("openai"));
     }
 
     /// The receiver chain a call site hands to the resolver, resolved to a key.

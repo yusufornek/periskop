@@ -208,7 +208,7 @@ impl ScopeTally {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::flow::tests::{five_tuple, process};
+    use crate::flow::fixtures::{five_tuple, process};
     use crate::flow::{ProcessRecord, ResolvedHostSource, SniSource};
 
     fn policy() -> ScopePolicy {
