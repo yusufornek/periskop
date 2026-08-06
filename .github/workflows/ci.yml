@@ -847,10 +847,19 @@ jobs:
       # The version is a `^0.21` requirement rather than an exact pin: the newest
       # patch of a scanner is the one worth having, while the minor is held
       # because the step below parses this tool's JSON and a shape change under a
-      # floating version would be read as "nothing found". `--locked` so the
-      # tool's own dependencies come from its lockfile.
+      # floating version would be read as "nothing found".
+      #
+      # `--locked` is deliberately absent, and the first run of this job is why.
+      # It failed with "unsupported CVSS version: 4.0" while loading the advisory
+      # database, which is not a finding about this repository at all: the
+      # database had published an advisory in a format the `rustsec` version
+      # pinned in cargo-audit's own lockfile could not parse, so every advisory
+      # became unreadable and the job reported a failure that says nothing about
+      # our dependencies. A scanner has to track the data it reads. Resolving the
+      # tool's dependencies fresh keeps the parser current while the version
+      # requirement keeps the output shape the step below depends on.
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked --version "^0.21"
+        run: cargo install cargo-audit --version "^0.21"
 
       # Both committed lockfiles. `crates/periskop-ebpf-object` declares an empty
       # `[workspace]` table and is its own workspace root, so no path from the
